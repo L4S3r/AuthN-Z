@@ -222,6 +222,7 @@ class TaskRepository:
 
             dept = metadata.get("department", "General") if isinstance(metadata, dict) else "General"
             name = metadata.get("name", u["username"]) if isinstance(metadata, dict) else u["username"]
+            avatar_url = metadata.get("avatar_url") if isinstance(metadata, dict) else None
 
             members_map[u["email"].lower()] = {
                 "id": u["id"],
@@ -229,6 +230,7 @@ class TaskRepository:
                 "name": name,
                 "role": role,
                 "department": dept,
+                "avatar_url": avatar_url,
                 "status": "active",
                 "invited_at": u["created_at"],
             }
@@ -242,12 +244,14 @@ class TaskRepository:
                     "name": inv["name"] or email.split("@")[0],
                     "role": inv["role"],
                     "department": inv["department"],
+                    "avatar_url": None,
                     "status": inv["status"],
                     "invited_at": inv["invited_at"],
                     "expires_at": inv["expires_at"] if "expires_at" in inv.keys() else None,
                 }
 
         return list(members_map.values())
+
 
     def invite_member(
         self,
