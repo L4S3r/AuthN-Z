@@ -5,9 +5,10 @@ Persistent SQLite storage for team tasks, sprints, members, and invitations.
 Uses WAL mode for high-concurrency multi-process read/write operations.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
+import secrets
 import sqlite3
 from typing import Any, Dict, List, Optional
 import uuid
@@ -28,7 +29,7 @@ class TaskRepository:
         return conn
 
     def _init_db(self) -> None:
-        """Initialize tasks and team_invitations database tables."""
+        """Initialize tasks and team_members database tables with migration checks."""
         with self._get_connection() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -56,9 +57,21 @@ class TaskRepository:
                     department TEXT NOT NULL DEFAULT 'General',
                     status TEXT NOT NULL DEFAULT 'active',
                     invited_by TEXT,
+                    invite_token TEXT,
+                    expires_at TEXT,
                     invited_at TEXT NOT NULL
                 );
             """)
+
+            # Column migrations for existing databases
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(team_members);")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if "invite_token" not in columns:
+                cursor.execute("ALTER TABLE team_members ADD COLUMN invite_token TEXT;")
+            if "expires_at" not in columns:
+                cursor.execute("ALTER TABLE team_members ADD COLUMN expires_at TEXT;")
+
             conn.commit()
 
     # =========================================================================
@@ -183,17 +196,14 @@ class TaskRepository:
         """List all team members and registered users combined."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            # 1. Fetch registered users from users table
             cursor.execute("SELECT id, username, email, roles, metadata, created_at FROM users")
             users = cursor.fetchall()
 
-            # 2. Fetch pending invitations from team_members table
             cursor.execute("SELECT * FROM team_members")
             invites = cursor.fetchall()
 
         members_map: Dict[str, Dict[str, Any]] = {}
 
-        # Add registered users
         for u in users:
             roles = u["roles"]
             if isinstance(roles, str):
@@ -223,7 +233,6 @@ class TaskRepository:
                 "invited_at": u["created_at"],
             }
 
-        # Overlay pending invitations
         for inv in invites:
             email = inv["email"].lower()
             if email not in members_map:
@@ -235,6 +244,7 @@ class TaskRepository:
                     "department": inv["department"],
                     "status": inv["status"],
                     "invited_at": inv["invited_at"],
+                    "expires_at": inv["expires_at"] if "expires_at" in inv.keys() else None,
                 }
 
         return list(members_map.values())
@@ -246,22 +256,28 @@ class TaskRepository:
         role: str = "viewer",
         department: str = "General",
         invited_by: str = "admin",
+        expires_days: int = 7,
     ) -> Dict[str, Any]:
-        """Record an invitation for a new team member."""
+        """Record a secure invitation token for a new team member."""
         member_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc).isoformat()
+        invite_token = secrets.token_urlsafe(32)
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(days=expires_days)).isoformat()
+        now_str = now.isoformat()
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO team_members (id, email, name, role, department, status, invited_by, invited_at)
-                VALUES (?, ?, ?, ?, ?, 'invited', ?, ?)
+                INSERT INTO team_members (id, email, name, role, department, status, invited_by, invite_token, expires_at, invited_at)
+                VALUES (?, ?, ?, ?, ?, 'invited', ?, ?, ?, ?)
                 ON CONFLICT(email) DO UPDATE SET
                     name=excluded.name,
                     role=excluded.role,
                     department=excluded.department,
+                    invite_token=excluded.invite_token,
+                    expires_at=excluded.expires_at,
                     invited_at=excluded.invited_at
-            """, (member_id, email.strip().lower(), name.strip(), role, department, invited_by, now))
+            """, (member_id, email.strip().lower(), name.strip(), role, department, invited_by, invite_token, expires_at, now_str))
             conn.commit()
 
         return {
@@ -271,8 +287,51 @@ class TaskRepository:
             "role": role,
             "department": department,
             "status": "invited",
-            "invited_at": now,
+            "invited_by": invited_by,
+            "invite_token": invite_token,
+            "expires_at": expires_at,
+            "invited_at": now_str,
         }
+
+    def get_invitation_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Resolve and validate an invitation by token."""
+        if not token:
+            return None
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM team_members WHERE invite_token = ?", (token.strip(),))
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            data = dict(row)
+            expires_at = data.get("expires_at")
+            if expires_at:
+                try:
+                    exp_dt = datetime.fromisoformat(expires_at)
+                    if datetime.now(timezone.utc) > exp_dt:
+                        data["is_expired"] = True
+                    else:
+                        data["is_expired"] = False
+                except Exception:
+                    data["is_expired"] = False
+            else:
+                data["is_expired"] = False
+
+            return data
+
+    def accept_invitation(self, token: str) -> bool:
+        """Mark invitation as accepted and active."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE team_members
+                SET status = 'active', invite_token = NULL
+                WHERE invite_token = ?
+            """, (token.strip(),))
+            conn.commit()
+            return cursor.rowcount > 0
 
     def remove_member(self, email: str) -> bool:
         """Remove a team member or cancel an invitation."""

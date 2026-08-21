@@ -103,6 +103,7 @@ app.add_middleware(
 
 from oauth_provider import OAuthManager, generate_pkce_pair, generate_oauth_state
 from task_repository import TaskRepository
+from email_service import EmailService
 
 # Core Component Singletons
 hasher = concretePasswordHasher()
@@ -113,6 +114,7 @@ mfa_prov = concreteMFAProvider()
 audit_log = AuditLogger(db_file="DATABASE.db")
 oauth_mgr = OAuthManager(redis_client=sess_store.r)
 task_repo = TaskRepository(db_file="DATABASE.db")
+email_svc = EmailService()
 
 auth = Authenticator(
     user_repo=repo,
@@ -173,6 +175,13 @@ class TeamInviteRequest(BaseModel):
     role: Optional[str] = "viewer"
     department: Optional[str] = "General"
     provision_password: Optional[str] = None
+
+
+class TeamAcceptInviteRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+    password: str = Field(..., min_length=8)
+    name: Optional[str] = None
+
 
 
 
@@ -1063,30 +1072,22 @@ async def invite_team_member(
     admin_user = repo.get_by_id(current_user["user_id"])
     invited_by_name = admin_user["username"] if admin_user else "Admin"
 
-    # Auto-provision backend user account if temporary password was provided
-    if req.provision_password and len(req.provision_password) >= 8:
-        existing = repo.get_by_identifier(req.email)
-        if not existing:
-            clearance_levels = {"admin": 3, "editor": 2, "viewer": 1}
-            hashed_pw = hasher.hash(req.provision_password)
-            repo.create_user({
-                "username": req.email.split("@")[0].lower(),
-                "email": req.email.strip().lower(),
-                "hashed_password": hashed_pw,
-                "roles": [req.role or "viewer"],
-                "metadata": {
-                    "department": req.department or "General",
-                    "clearance": clearance_levels.get(req.role or "viewer", 1),
-                    "name": req.name or req.email.split("@")[0],
-                },
-            })
-
     invitation = task_repo.invite_member(
         email=req.email,
         name=req.name or req.email.split("@")[0],
         role=req.role or "viewer",
         department=req.department or "General",
         invited_by=invited_by_name,
+    )
+
+    # Dispatch branded invitation email
+    email_res = email_svc.send_invitation_email(
+        recipient_email=invitation["email"],
+        recipient_name=invitation["name"],
+        role=invitation["role"],
+        department=invitation["department"],
+        invited_by=invited_by_name,
+        invite_token=invitation["invite_token"],
     )
 
     audit_log.record_security_event(
@@ -1097,13 +1098,167 @@ async def invite_team_member(
             "role": req.role,
             "department": req.department,
             "invited_by": invited_by_name,
+            "invite_token": invitation["invite_token"],
+            "email_dispatched": email_res.get("delivered", False),
         },
     )
 
     return {
         "status": "SUCCESS",
-        "message": f"Invitation email notification dispatched to {req.email}.",
+        "message": f"Invitation notification dispatched to {req.email}.",
+        "invite_url": email_res.get("invite_url"),
         "member": invitation,
+    }
+
+
+@app.get("/team/invite/verify", tags=["Team Management"])
+async def verify_team_invitation(token: str):
+    """Verify an invitation token for a new user landing on the accept-invite page."""
+    invite = task_repo.get_invitation_by_token(token)
+    if not invite:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invitation token not found or already consumed.",
+        )
+
+    if invite.get("is_expired"):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This invitation link has expired. Please request a new invitation.",
+        )
+
+    return {
+        "status": "SUCCESS",
+        "email": invite["email"],
+        "name": invite["name"],
+        "role": invite["role"],
+        "department": invite["department"],
+        "invited_by": invite.get("invited_by", "Workspace Admin"),
+        "expires_at": invite.get("expires_at"),
+    }
+
+
+@app.post("/team/invite/accept", tags=["Team Management"])
+async def accept_team_invitation(
+    req: TeamAcceptInviteRequest,
+    request: Request,
+):
+    """Accept an invitation, register credentials, activate workspace clearance, and log in."""
+    invite = task_repo.get_invitation_by_token(req.token)
+    if not invite:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invitation token not found or already consumed.",
+        )
+
+    if invite.get("is_expired"):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This invitation link has expired. Please request a new invitation.",
+        )
+
+    email = invite["email"].strip().lower()
+    client_ip = request.client.host if request.client else "unknown"
+    clearance_levels = {"admin": 3, "editor": 2, "viewer": 1}
+    clearance = clearance_levels.get(invite["role"], 1)
+
+    existing_user = repo.get_by_identifier(email)
+    hashed_pw = hasher.hash(req.password)
+
+    if existing_user:
+        # Update existing user role & credentials
+        user_id = existing_user["id"]
+        roles = existing_user.get("roles", [])
+        if isinstance(roles, str):
+            try:
+                roles = json.loads(roles)
+            except Exception:
+                roles = []
+        if invite["role"] not in roles:
+            roles.append(invite["role"])
+
+        metadata = existing_user.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        metadata["department"] = invite["department"]
+        metadata["clearance"] = max(metadata.get("clearance", 1), clearance)
+        if req.name:
+            metadata["name"] = req.name.strip()
+
+        repo.update_user(user_id, {
+            "hashed_password": hashed_pw,
+            "roles": roles,
+            "metadata": metadata,
+            "is_active": 1,
+        })
+        user = repo.get_by_id(user_id)
+    else:
+        # Provision new user account
+        base_username = email.split("@")[0].lower()
+        clean_username = "".join(c for c in base_username if c.isalnum() or c in ("_", "-"))
+        if len(clean_username) < 3 or repo.get_by_identifier(clean_username):
+            clean_username = f"{clean_username}_{secrets.token_hex(3)}"
+
+        user = repo.create_user({
+            "username": clean_username,
+            "email": email,
+            "hashed_password": hashed_pw,
+            "roles": [invite["role"]],
+            "metadata": {
+                "department": invite["department"],
+                "clearance": clearance,
+                "name": req.name.strip() if req.name else invite["name"],
+            },
+        })
+        user_id = user["id"]
+        roles = [invite["role"]]
+
+    # Mark invitation as accepted in SQLite
+    task_repo.accept_invitation(req.token)
+
+    # Generate JWT tokens and active session
+    access_token = token_svc.create_access_token(user_id, claims={"roles": roles})
+    refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles})
+    session_id = sess_store.create_session(user_id, session_data={"roles": roles})
+
+    safe_meta = user.get("metadata", {})
+    if isinstance(safe_meta, str):
+        try:
+            safe_meta = json.loads(safe_meta)
+        except Exception:
+            safe_meta = {}
+    safe_meta.pop("mfa_secret", None)
+    safe_meta.pop("backup_codes", None)
+
+    audit_log.record_security_event(
+        event_name="TEAM_INVITE_ACCEPTED",
+        severity="INFO",
+        details={
+            "user_id": user_id,
+            "email": email,
+            "role": invite["role"],
+            "department": invite["department"],
+            "ip_address": client_ip,
+        },
+    )
+
+    return {
+        "status": "SUCCESS",
+        "message": "Invitation accepted. Welcome to the workspace!",
+        "user_id": user_id,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "session_id": session_id,
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "email": user["email"],
+            "roles": roles,
+            "metadata": safe_meta,
+        },
     }
 
 
@@ -1112,14 +1267,46 @@ async def remove_team_member(
     member_email: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Remove a member or cancel an invitation. Requires admin role."""
-    if not perm_eval.has_role(current_user["user_id"], "admin"):
+    """Remove a member, delete their registered user account, and revoke sessions. Requires admin role."""
+    caller_id = current_user["user_id"]
+    if not perm_eval.has_role(caller_id, "admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin role required to remove team members.",
         )
 
-    removed = task_repo.remove_member(member_email)
-    return {"status": "SUCCESS", "removed_email": member_email}
+    clean_email = member_email.strip().lower()
+
+    # 1. Check if user is in users table
+    user = repo.get_by_identifier(clean_email)
+    if user:
+        if user["id"] == caller_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot remove your own administrator account.",
+            )
+        # Invalidate sessions & delete user
+        sess_store.delete_all_user_sessions(user["id"])
+        repo.delete_user(user["id"])
+
+    # 2. Also remove from team_members table
+    task_repo.remove_member(clean_email)
+
+    audit_log.record_security_event(
+        event_name="TEAM_MEMBER_REMOVED",
+        severity="WARNING",
+        details={
+            "removed_email": clean_email,
+            "removed_by": caller_id,
+        },
+    )
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Member {clean_email} has been removed.",
+        "removed_email": clean_email,
+    }
+
+
 
 
