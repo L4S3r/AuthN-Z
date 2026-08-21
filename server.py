@@ -998,21 +998,38 @@ async def create_task(
     req: TaskCreateRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Create and assign a new team task card."""
+    """Create and assign a new team task card, dispatching email notification to assignee."""
     user = repo.get_by_id(current_user["user_id"])
     creator_email = user["email"] if user else current_user["user_id"]
+    assigned_by_name = user["username"] if user else "Workspace Admin"
+
+    assignee_email = (req.assignee_email or creator_email).strip().lower()
+    assignee_name = req.assignee_name or (user["username"] if user else "Member")
 
     new_task = task_repo.create_task({
-        "title": req.title,
-        "description": req.description or "",
+        "title": req.title.strip(),
+        "description": (req.description or "").strip(),
         "status": req.status or "todo",
         "priority": req.priority or "medium",
-        "assignee_email": req.assignee_email or creator_email,
-        "assignee_name": req.assignee_name or (user["username"] if user else "Member"),
+        "assignee_email": assignee_email,
+        "assignee_name": assignee_name,
         "created_by": creator_email,
         "tags": req.tags or [],
         "due_date": req.due_date,
     })
+
+    # Dispatch assignment email notification to assignee
+    if assignee_email and "@" in assignee_email:
+        email_svc.send_task_assignment_email(
+            recipient_email=assignee_email,
+            recipient_name=assignee_name,
+            task_title=new_task["title"],
+            task_description=new_task.get("description"),
+            priority=new_task.get("priority", "medium"),
+            due_date=new_task.get("due_date"),
+            assigned_by=assigned_by_name,
+            task_id=new_task["id"],
+        )
 
     return {"status": "SUCCESS", "task": new_task}
 
@@ -1023,7 +1040,7 @@ async def update_task(
     req: TaskUpdateRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Update task card status (Kanban movement), priority, or assignee."""
+    """Update task card status (Kanban movement), priority, deadline, or assignee."""
     existing = task_repo.get_task(task_id)
     if not existing:
         raise HTTPException(
@@ -1033,7 +1050,28 @@ async def update_task(
 
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     updated = task_repo.update_task(task_id, updates)
+
+    # If assigned to a new assignee, dispatch notification
+    if req.assignee_email and req.assignee_email.strip().lower() != (existing.get("assignee_email") or "").lower():
+        user = repo.get_by_id(current_user["user_id"])
+        assigned_by_name = user["username"] if user else "Workspace Admin"
+        new_assignee_email = req.assignee_email.strip().lower()
+        new_assignee_name = req.assignee_name or new_assignee_email.split("@")[0]
+
+        if "@" in new_assignee_email:
+            email_svc.send_task_assignment_email(
+                recipient_email=new_assignee_email,
+                recipient_name=new_assignee_name,
+                task_title=updated.get("title", existing["title"]),
+                task_description=updated.get("description", existing.get("description")),
+                priority=updated.get("priority", existing.get("priority", "medium")),
+                due_date=updated.get("due_date", existing.get("due_date")),
+                assigned_by=assigned_by_name,
+                task_id=task_id,
+            )
+
     return {"status": "SUCCESS", "task": updated}
+
 
 
 @app.delete("/tasks/{task_id}", tags=["Task Tracker"])

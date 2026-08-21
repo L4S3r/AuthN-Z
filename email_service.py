@@ -1,8 +1,8 @@
 """
 Auth N&Z - Email Notification Service (email_service.py)
 --------------------------------------------------------
-Dispatches transactional emails for workspace invitations, security alerts,
-and credential recovery. Supports production SMTP and development logging fallback.
+Dispatches transactional emails for workspace invitations, task assignments,
+deadline reminders, and security alerts. Supports production SMTP with development logging fallback.
 """
 
 from email.mime.multipart import MIMEMultipart
@@ -20,18 +20,12 @@ load_dotenv()
 logger = logging.getLogger("auth_nz.email_service")
 
 
-
 class EmailService:
     def __init__(self):
-        self.smtp_host = os.getenv("SMTP_HOST")
-        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
-        self.smtp_user = os.getenv("SMTP_USER")
-        self.smtp_password = os.getenv("SMTP_PASSWORD")
-        self.smtp_from = os.getenv("SMTP_FROM", "TaskTracker Security <no-reply@l4s3r.site>")
-        self.frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+        self.reload_config()
 
     def reload_config(self) -> None:
-        """Reload configuration from environment variables."""
+        """Reload configuration dynamically from environment variables."""
         load_dotenv(override=True)
         self.smtp_host = os.getenv("SMTP_HOST")
         self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
@@ -39,6 +33,67 @@ class EmailService:
         self.smtp_password = os.getenv("SMTP_PASSWORD")
         self.smtp_from = os.getenv("SMTP_FROM", "TaskTracker Security <no-reply@l4s3r.site>")
         self.frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+
+    def _dispatch_mime_email(
+        self,
+        recipient_email: str,
+        subject: str,
+        text_content: str,
+        html_content: str,
+    ) -> Dict[str, Any]:
+        """Internal helper to assemble RFC 5322 MIME messages and transmit via SMTP."""
+        self.reload_config()
+        sent_via_smtp = False
+        error_detail = None
+
+        if self.smtp_host and self.smtp_user and self.smtp_password:
+            try:
+                # Derive sender domain for SPF/DKIM header alignment
+                sender_domain = "l4s3r.site"
+                if "@" in self.smtp_from:
+                    sender_domain = self.smtp_from.split("@")[-1].rstrip(">").strip()
+                elif self.smtp_user and "@" in self.smtp_user:
+                    sender_domain = self.smtp_user.split("@")[-1].strip()
+
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject
+                msg["From"] = self.smtp_from
+                msg["To"] = recipient_email
+                msg["Date"] = formatdate(localtime=True)
+                msg["Message-ID"] = make_msgid(domain=sender_domain)
+                msg["Reply-To"] = self.smtp_from
+                msg["X-Mailer"] = "AuthNZ-Gateway/1.0"
+                msg.attach(MIMEText(text_content, "plain", "utf-8"))
+                msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+                if self.smtp_port == 465:
+                    server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=12.0)
+                else:
+                    server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=12.0)
+                    server.starttls()
+
+                server.login(self.smtp_user, self.smtp_password)
+                server.sendmail(self.smtp_from, [recipient_email], msg.as_string())
+                server.quit()
+                sent_via_smtp = True
+                logger.info("Successfully dispatched email via SMTP to %s (Subject: %s)", recipient_email, subject)
+            except Exception as e:
+                error_detail = str(e)
+                logger.warning("SMTP delivery failed (%s). Falling back to console logging.", e)
+        else:
+            error_detail = "SMTP credentials (SMTP_HOST, SMTP_USER, SMTP_PASSWORD) not configured in .env"
+
+        if not sent_via_smtp:
+            logger.info("--- TRANSACTIONAL EMAIL LOG (FALLBACK) ---")
+            logger.info("TO: %s | SUBJECT: %s", recipient_email, subject)
+            logger.info("SMTP STATUS: %s", error_detail)
+            logger.info("------------------------------------------")
+
+        return {
+            "delivered": sent_via_smtp,
+            "recipient": recipient_email,
+            "error": error_detail if not sent_via_smtp else None,
+        }
 
     def send_invitation_email(
         self,
@@ -50,7 +105,6 @@ class EmailService:
         invite_token: str,
     ) -> Dict[str, Any]:
         """Dispatch a branded workspace team invitation email."""
-        self.reload_config()
         invite_url = f"{self.frontend_url}/invite/accept?token={invite_token}"
         subject = f"You've been invited to join TaskTracker by {invited_by}"
 
@@ -81,14 +135,12 @@ https://l4s3r.site
     <tr>
       <td align="center">
         <table width="560" border="0" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
-          <!-- Header -->
           <tr>
             <td style="padding: 32px 32px 20px; text-align: center; background-color: #0f172a;">
               <h1 style="color: #ffffff; font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.5px;">TaskTracker Workspace</h1>
               <p style="color: #94a3b8; font-size: 12px; margin: 4px 0 0;">Zero-Trust Access & Identity Gateway</p>
             </td>
           </tr>
-          <!-- Body -->
           <tr>
             <td style="padding: 32px;">
               <h2 style="font-size: 18px; font-weight: 700; color: #0f172a; margin: 0 0 12px;">You've been invited to join the team!</h2>
@@ -96,8 +148,6 @@ https://l4s3r.site
                 Hello <strong>{recipient_name}</strong>,<br>
                 <strong>{invited_by}</strong> has invited you to collaborate on the TaskTracker workspace with the following security clearance:
               </p>
-              
-              <!-- Role Box -->
               <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f1f5f9; border-radius: 10px; margin-bottom: 24px;">
                 <tr>
                   <td style="padding: 16px;">
@@ -106,8 +156,6 @@ https://l4s3r.site
                   </td>
                 </tr>
               </table>
-
-              <!-- CTA Button -->
               <table width="100%" border="0" cellspacing="0" cellpadding="0">
                 <tr>
                   <td align="center" style="padding: 10px 0 24px;">
@@ -117,18 +165,15 @@ https://l4s3r.site
                   </td>
                 </tr>
               </table>
-
               <p style="font-size: 12px; line-height: 1.5; color: #64748b; margin: 0;">
                 Or copy and paste this link into your browser:<br>
                 <a href="{invite_url}" style="color: #2563eb; word-break: break-all;">{invite_url}</a>
               </p>
             </td>
           </tr>
-          <!-- Footer -->
           <tr>
             <td style="padding: 20px 32px; background-color: #f8fafc; border-top: 1px solid #e2e8f0; font-size: 11px; color: #94a3b8; text-align: center;">
-              This invitation link is valid for 7 days. If you did not request this, you can ignore this message.<br>
-              Powered by Auth N&Z Security Gateway.
+              This invitation link is valid for 7 days. Powered by Auth N&Z Security Gateway.
             </td>
           </tr>
         </table>
@@ -138,59 +183,124 @@ https://l4s3r.site
 </body>
 </html>
 """
+        res = self._dispatch_mime_email(recipient_email, subject, text_content, html_content)
+        res["invite_url"] = invite_url
+        return res
 
-        sent_via_smtp = False
-        error_detail = None
+    def send_task_assignment_email(
+        self,
+        recipient_email: str,
+        recipient_name: str,
+        task_title: str,
+        task_description: Optional[str],
+        priority: str,
+        due_date: Optional[str],
+        assigned_by: str,
+        task_id: str,
+    ) -> Dict[str, Any]:
+        """Dispatch a notification email when a user is assigned a new task or deliverable."""
+        board_url = f"{self.frontend_url}/"
+        subject = f"New Task Assigned: {task_title}"
 
-        if self.smtp_host and self.smtp_user and self.smtp_password:
-            try:
-                # Derive sender domain dynamically to ensure SPF/DKIM header alignment
-                sender_domain = "l4s3r.site"
-                if "@" in self.smtp_from:
-                    sender_domain = self.smtp_from.split("@")[-1].rstrip(">").strip()
-                elif self.smtp_user and "@" in self.smtp_user:
-                    sender_domain = self.smtp_user.split("@")[-1].strip()
-
-                msg = MIMEMultipart("alternative")
-                msg["Subject"] = subject
-                msg["From"] = self.smtp_from
-                msg["To"] = recipient_email
-                msg["Date"] = formatdate(localtime=True)
-                msg["Message-ID"] = make_msgid(domain=sender_domain)
-                msg["Reply-To"] = self.smtp_from
-                msg["X-Mailer"] = "AuthNZ-Gateway/1.0"
-                msg.attach(MIMEText(text_content, "plain", "utf-8"))
-                msg.attach(MIMEText(html_content, "html", "utf-8"))
-
-
-
-                if self.smtp_port == 465:
-                    server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=12.0)
-                else:
-                    server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=12.0)
-                    server.starttls()
-
-                server.login(self.smtp_user, self.smtp_password)
-                server.sendmail(self.smtp_from, [recipient_email], msg.as_string())
-                server.quit()
-                sent_via_smtp = True
-                logger.info("Successfully dispatched invitation email via SMTP to %s", recipient_email)
-            except Exception as e:
-                error_detail = str(e)
-                logger.warning("SMTP delivery failed (%s). Falling back to console logging.", e)
-        else:
-            error_detail = "SMTP credentials (SMTP_HOST, SMTP_USER, SMTP_PASSWORD) not configured in .env"
-
-        if not sent_via_smtp:
-            logger.info("--- TRANSACTIONAL INVITATION EMAIL LOG ---")
-            logger.info("TO: %s | SUBJECT: %s", recipient_email, subject)
-            logger.info("INVITATION LINK: %s", invite_url)
-            logger.info("SMTP STATUS: %s", error_detail)
-            logger.info("------------------------------------------")
-
-        return {
-            "delivered": sent_via_smtp,
-            "recipient": recipient_email,
-            "invite_url": invite_url,
-            "error": error_detail if not sent_via_smtp else None,
+        priority_colors = {
+            "urgent": "#ef4444",
+            "high": "#f97316",
+            "medium": "#3b82f6",
+            "low": "#64748b",
         }
+        priority_color = priority_colors.get(priority.lower(), "#3b82f6")
+
+        deadline_text = f"Due: {due_date}" if due_date else "No deadline set"
+
+        text_content = f"""Hello {recipient_name},
+
+{assigned_by} assigned you a new deliverable on TaskTracker:
+
+Task: {task_title}
+Priority: {priority.upper()}
+Deadline: {deadline_text}
+
+Description:
+{task_description or 'No description provided.'}
+
+View and update this task on your board:
+{board_url}
+
+---
+TaskTracker Workspace Gateway
+https://l4s3r.site
+"""
+
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{subject}</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f8fafc; margin: 0; padding: 30px 15px; color: #0f172a;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td align="center">
+        <table width="560" border="0" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
+          <!-- Header -->
+          <tr>
+            <td style="padding: 28px 32px 20px; background-color: #0f172a; text-align: left;">
+              <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: #94a3b8; margin-bottom: 4px;">TaskTracker Notification</div>
+              <h1 style="color: #ffffff; font-size: 18px; font-weight: 700; margin: 0;">New Task Assigned</h1>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding: 32px;">
+              <p style="font-size: 14px; line-height: 1.5; color: #334155; margin: 0 0 16px;">
+                Hello <strong>{recipient_name}</strong>,<br>
+                <strong>{assigned_by}</strong> assigned you to a new workspace task:
+              </p>
+
+              <!-- Task Card -->
+              <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; margin-bottom: 24px;">
+                <tr>
+                  <td style="padding: 20px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+                      <span style="background-color: {priority_color}; color: #ffffff; font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 3px 8px; border-radius: 6px;">
+                        {priority.upper()} PRIORITY
+                      </span>
+                      {f'<span style="font-size: 12px; font-weight: 600; color: #dc2626;">Deadline: {due_date}</span>' if due_date else '<span style="font-size: 12px; color: #64748b;">No deadline</span>'}
+                    </div>
+
+                    <h2 style="font-size: 16px; font-weight: 700; color: #0f172a; margin: 10px 0 6px;">{task_title}</h2>
+                    <p style="font-size: 13px; line-height: 1.6; color: #475569; margin: 0;">
+                      {task_description if task_description else '<em>No description provided.</em>'}
+                    </p>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- CTA Button -->
+              <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td align="center" style="padding: 6px 0 20px;">
+                    <a href="{board_url}" style="background-color: #2563eb; color: #ffffff; text-decoration: none; padding: 12px 28px; border-radius: 10px; font-size: 13px; font-weight: 600; display: inline-block; box-shadow: 0 2px 6px rgba(37,99,235,0.3);">
+                      Open Task on Board &rarr;
+                    </a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 16px 32px; background-color: #f8fafc; border-top: 1px solid #e2e8f0; font-size: 11px; color: #94a3b8; text-align: center;">
+              You received this automated notification because you were assigned to this task on TaskTracker.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+        return self._dispatch_mime_email(recipient_email, subject, text_content, html_content)
