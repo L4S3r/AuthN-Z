@@ -5,3 +5,4 @@
 *demo.py
 __pycache__/
 *.json
+test_*.py

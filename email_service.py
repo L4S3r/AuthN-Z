@@ -11,12 +11,25 @@ import logging
 import os
 import smtplib
 from typing import Any, Dict, Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger("auth_nz.email_service")
 
 
 class EmailService:
     def __init__(self):
+        self.smtp_host = os.getenv("SMTP_HOST")
+        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        self.smtp_user = os.getenv("SMTP_USER")
+        self.smtp_password = os.getenv("SMTP_PASSWORD")
+        self.smtp_from = os.getenv("SMTP_FROM", "TaskTracker Security <no-reply@l4s3r.site>")
+        self.frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+
+    def reload_config(self) -> None:
+        """Reload configuration from environment variables."""
+        load_dotenv(override=True)
         self.smtp_host = os.getenv("SMTP_HOST")
         self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
         self.smtp_user = os.getenv("SMTP_USER")
@@ -34,6 +47,7 @@ class EmailService:
         invite_token: str,
     ) -> Dict[str, Any]:
         """Dispatch a branded workspace team invitation email."""
+        self.reload_config()
         invite_url = f"{self.frontend_url}/invite/accept?token={invite_token}"
         subject = f"You've been invited to join TaskTracker by {invited_by}"
 
@@ -123,6 +137,8 @@ https://l4s3r.site
 """
 
         sent_via_smtp = False
+        error_detail = None
+
         if self.smtp_host and self.smtp_user and self.smtp_password:
             try:
                 msg = MIMEMultipart("alternative")
@@ -132,23 +148,33 @@ https://l4s3r.site
                 msg.attach(MIMEText(text_content, "plain"))
                 msg.attach(MIMEText(html_content, "html"))
 
-                with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10.0) as server:
+                if self.smtp_port == 465:
+                    server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=12.0)
+                else:
+                    server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=12.0)
                     server.starttls()
-                    server.login(self.smtp_user, self.smtp_password)
-                    server.sendmail(self.smtp_from, [recipient_email], msg.as_string())
+
+                server.login(self.smtp_user, self.smtp_password)
+                server.sendmail(self.smtp_from, [recipient_email], msg.as_string())
+                server.quit()
                 sent_via_smtp = True
                 logger.info("Successfully dispatched invitation email via SMTP to %s", recipient_email)
             except Exception as e:
+                error_detail = str(e)
                 logger.warning("SMTP delivery failed (%s). Falling back to console logging.", e)
+        else:
+            error_detail = "SMTP credentials (SMTP_HOST, SMTP_USER, SMTP_PASSWORD) not configured in .env"
 
         if not sent_via_smtp:
             logger.info("--- TRANSACTIONAL INVITATION EMAIL LOG ---")
             logger.info("TO: %s | SUBJECT: %s", recipient_email, subject)
             logger.info("INVITATION LINK: %s", invite_url)
+            logger.info("SMTP STATUS: %s", error_detail)
             logger.info("------------------------------------------")
 
         return {
             "delivered": sent_via_smtp,
             "recipient": recipient_email,
             "invite_url": invite_url,
+            "error": error_detail if not sent_via_smtp else None,
         }
