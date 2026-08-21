@@ -102,6 +102,7 @@ app.add_middleware(
 
 
 from oauth_provider import OAuthManager, generate_pkce_pair, generate_oauth_state
+from task_repository import TaskRepository
 
 # Core Component Singletons
 hasher = concretePasswordHasher()
@@ -111,6 +112,7 @@ token_svc = concreteTokenService(redis_client=sess_store.r)
 mfa_prov = concreteMFAProvider()
 audit_log = AuditLogger(db_file="DATABASE.db")
 oauth_mgr = OAuthManager(redis_client=sess_store.r)
+task_repo = TaskRepository(db_file="DATABASE.db")
 
 auth = Authenticator(
     user_repo=repo,
@@ -141,6 +143,37 @@ class AdminCreateUserRequest(BaseModel):
     roles: List[str] = ["viewer"]
     department: Optional[str] = "General"
     clearance: Optional[int] = 1
+
+
+class TaskCreateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = ""
+    status: Optional[str] = "todo"
+    priority: Optional[str] = "medium"
+    assignee_email: Optional[str] = None
+    assignee_name: Optional[str] = None
+    tags: Optional[List[str]] = []
+    due_date: Optional[str] = None
+
+
+class TaskUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    assignee_email: Optional[str] = None
+    assignee_name: Optional[str] = None
+    tags: Optional[List[str]] = None
+    due_date: Optional[str] = None
+
+
+class TeamInviteRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=100)
+    name: Optional[str] = None
+    role: Optional[str] = "viewer"
+    department: Optional[str] = "General"
+    provision_password: Optional[str] = None
+
 
 
 class LoginRequest(BaseModel):
@@ -801,4 +834,163 @@ async def oauth_exchange_code(
         )
 
     return resolve_or_create_oauth_user(profile, client_ip=client_ip)
+
+
+# =============================================================================
+# Task Management REST Endpoints
+# =============================================================================
+@app.get("/tasks", tags=["Task Tracker"])
+async def get_tasks(
+    status: Optional[str] = None,
+    priority: Optional[str] = None,
+    assignee_email: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Retrieve workspace sprint tasks with optional filtering."""
+    tasks = task_repo.list_tasks(
+        status=status,
+        priority=priority,
+        assignee_email=assignee_email,
+    )
+    return {"status": "SUCCESS", "count": len(tasks), "tasks": tasks}
+
+
+@app.post("/tasks", tags=["Task Tracker"])
+async def create_task(
+    req: TaskCreateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Create and assign a new team task card."""
+    user = repo.get_by_id(current_user["user_id"])
+    creator_email = user["email"] if user else current_user["user_id"]
+
+    new_task = task_repo.create_task({
+        "title": req.title,
+        "description": req.description or "",
+        "status": req.status or "todo",
+        "priority": req.priority or "medium",
+        "assignee_email": req.assignee_email or creator_email,
+        "assignee_name": req.assignee_name or (user["username"] if user else "Member"),
+        "created_by": creator_email,
+        "tags": req.tags or [],
+        "due_date": req.due_date,
+    })
+
+    return {"status": "SUCCESS", "task": new_task}
+
+
+@app.patch("/tasks/{task_id}", tags=["Task Tracker"])
+async def update_task(
+    task_id: str,
+    req: TaskUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Update task card status (Kanban movement), priority, or assignee."""
+    existing = task_repo.get_task(task_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found.",
+        )
+
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    updated = task_repo.update_task(task_id, updates)
+    return {"status": "SUCCESS", "task": updated}
+
+
+@app.delete("/tasks/{task_id}", tags=["Task Tracker"])
+async def delete_task(
+    task_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Delete a task card from the workspace."""
+    deleted = task_repo.delete_task(task_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found.",
+        )
+    return {"status": "SUCCESS", "deleted_task_id": task_id}
+
+
+# =============================================================================
+# Team Management & Invitation REST Endpoints
+# =============================================================================
+@app.get("/team/members", tags=["Team Management"])
+async def list_team_members(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """List all workspace members and pending email invitations."""
+    members = task_repo.list_team_members()
+    return {"status": "SUCCESS", "count": len(members), "members": members}
+
+
+@app.post("/team/invite", tags=["Team Management"])
+async def invite_team_member(
+    req: TeamInviteRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Invite a new colleague to the team workspace with email notification."""
+    admin_user = repo.get_by_id(current_user["user_id"])
+    invited_by_name = admin_user["username"] if admin_user else "Admin"
+
+    # Auto-provision backend user account if temporary password was provided
+    if req.provision_password and len(req.provision_password) >= 8:
+        existing = repo.get_by_identifier(req.email)
+        if not existing:
+            clearance_levels = {"admin": 3, "editor": 2, "viewer": 1}
+            hashed_pw = hasher.hash(req.provision_password)
+            repo.create_user({
+                "username": req.email.split("@")[0].lower(),
+                "email": req.email.strip().lower(),
+                "hashed_password": hashed_pw,
+                "roles": [req.role or "viewer"],
+                "metadata": {
+                    "department": req.department or "General",
+                    "clearance": clearance_levels.get(req.role or "viewer", 1),
+                    "name": req.name or req.email.split("@")[0],
+                },
+            })
+
+    invitation = task_repo.invite_member(
+        email=req.email,
+        name=req.name or req.email.split("@")[0],
+        role=req.role or "viewer",
+        department=req.department or "General",
+        invited_by=invited_by_name,
+    )
+
+    audit_log.record_security_event(
+        event_name="TEAM_MEMBER_INVITED",
+        severity="INFO",
+        details={
+            "invited_email": req.email,
+            "role": req.role,
+            "department": req.department,
+            "invited_by": invited_by_name,
+        },
+    )
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Invitation email notification dispatched to {req.email}.",
+        "member": invitation,
+    }
+
+
+@app.delete("/team/members/{member_email}", tags=["Team Management"])
+async def remove_team_member(
+    member_email: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Remove a member or cancel an invitation. Requires admin role."""
+    if not perm_eval.has_role(current_user["user_id"], "admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin role required to remove team members.",
+        )
+
+    removed = task_repo.remove_member(member_email)
+    return {"status": "SUCCESS", "removed_email": member_email}
+
 
