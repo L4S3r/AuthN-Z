@@ -144,17 +144,24 @@ https://l4s3r.site
 
         if self.smtp_host and self.smtp_user and self.smtp_password:
             try:
+                # Derive sender domain dynamically to ensure SPF/DKIM header alignment
+                sender_domain = "l4s3r.site"
+                if "@" in self.smtp_from:
+                    sender_domain = self.smtp_from.split("@")[-1].rstrip(">").strip()
+                elif self.smtp_user and "@" in self.smtp_user:
+                    sender_domain = self.smtp_user.split("@")[-1].strip()
+
                 msg = MIMEMultipart("alternative")
                 msg["Subject"] = subject
                 msg["From"] = self.smtp_from
                 msg["To"] = recipient_email
                 msg["Date"] = formatdate(localtime=True)
-                msg["Message-ID"] = make_msgid(domain="l4s3r.site")
+                msg["Message-ID"] = make_msgid(domain=sender_domain)
                 msg["Reply-To"] = self.smtp_from
-                msg["Auto-Submitted"] = "auto-generated"
                 msg["X-Mailer"] = "AuthNZ-Gateway/1.0"
                 msg.attach(MIMEText(text_content, "plain", "utf-8"))
                 msg.attach(MIMEText(html_content, "html", "utf-8"))
+
 
 
                 if self.smtp_port == 465:
