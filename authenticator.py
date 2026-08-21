@@ -264,6 +264,11 @@ class Authenticator(abstractAuthenticator):
         refresh_token = self.token_service.create_refresh_token(user["id"], claims={"roles": roles})
         session_id = self.session_store.create_session(user["id"], session_data={"roles": roles})
 
+        # Sanitize metadata for response
+        safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        safe_metadata.pop("mfa_secret", None)
+        safe_metadata.pop("backup_codes", None)
+
         return {
             "status": "SUCCESS",
             "user_id": user["id"],
@@ -275,8 +280,10 @@ class Authenticator(abstractAuthenticator):
                 "username": user["username"],
                 "email": user["email"],
                 "roles": roles,
+                "metadata": safe_metadata,
             },
         }
+
 
     def authenticate_token(self, token: str) -> Dict[str, Any]:
         """Validate a bearer token and produce the authenticated subject's execution context."""
@@ -509,6 +516,11 @@ class Authenticator(abstractAuthenticator):
         refresh_token = self.token_service.create_refresh_token(user["id"], claims={"roles": roles})
         session_id = self.session_store.create_session(user["id"], session_data={"roles": roles})
 
+        # Sanitize metadata for response
+        safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        safe_metadata.pop("mfa_secret", None)
+        safe_metadata.pop("backup_codes", None)
+
         return {
             "status": "SUCCESS",
             "user_id": user["id"],
@@ -520,6 +532,8 @@ class Authenticator(abstractAuthenticator):
                 "username": user["username"],
                 "email": user["email"],
                 "roles": roles,
+                "metadata": safe_metadata,
             },
         }
+
         

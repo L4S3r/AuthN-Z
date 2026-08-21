@@ -555,7 +555,36 @@ async def complete_mfa(req: MFACompleteRequest, request: Request):
 async def get_my_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Retrieve identity context of the authenticated user."""
     user = repo.get_by_id(current_user["user_id"])
-    return {"status": "SUCCESS", "user": user, "claims": current_user.get("claims", {})}
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    meta = user.get("metadata", {})
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    safe_meta = dict(meta) if isinstance(meta, dict) else {}
+    safe_meta.pop("mfa_secret", None)
+    safe_meta.pop("backup_codes", None)
+
+    roles = user.get("roles", [])
+    if isinstance(roles, str):
+        try:
+            roles = json.loads(roles)
+        except Exception:
+            roles = []
+
+    safe_user = {
+        "id": user["id"],
+        "username": user["username"],
+        "email": user["email"],
+        "roles": roles,
+        "metadata": safe_meta,
+        "created_at": user.get("created_at"),
+    }
+    return {"status": "SUCCESS", "user": safe_user, "claims": current_user.get("claims", {})}
+
 
 
 @app.get("/documents/{doc_id}", tags=["Protected Resources"])
@@ -705,6 +734,10 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
     refresh_token = token_svc.create_refresh_token(user["id"], claims={"roles": roles})
     session_id = sess_store.create_session(user["id"], session_data={"roles": roles})
 
+    safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    safe_metadata.pop("mfa_secret", None)
+    safe_metadata.pop("backup_codes", None)
+
     audit_log.record_auth_success(user["id"], f"oauth_{provider}", ip_address=client_ip)
 
     return {
@@ -718,8 +751,10 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
             "username": user["username"],
             "email": user["email"],
             "roles": roles,
+            "metadata": safe_metadata,
         },
     }
+
 
 
 @app.get("/auth/oauth/providers", tags=["OAuth2 / Social Login"])
