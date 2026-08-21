@@ -117,10 +117,18 @@ def list_audit_logs(limit: int = 15) -> None:
         return
 
     for r in rows:
-        print(f"[{r['timestamp']}] ({r['event_type']}) User: {r['user_id']} | Outcome: {r['status']}")
-        if r["details"]:
-            print(f"  Details: {r['details']}")
+        subject = r["subject_id"] or "system"
+        action = r["action"] or r["reason"] or "-"
+        ip = r["ip_address"] or "-"
+        meta = r["metadata"]
+        print(f"[{r['timestamp']}] ({r['severity']}) {r['event_type']}")
+        print(f"  Subject ID:  {subject}")
+        print(f"  Action/Info: {action}")
+        print(f"  IP Address:  {ip}")
+        if meta and meta != "{}":
+            print(f"  Metadata:    {meta}")
         print("-" * 50)
+
 
 
 def purge_tasks() -> None:
