@@ -507,6 +507,29 @@ async def setup_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
     }
 
 
+@app.post("/auth/mfa/disable", tags=["MFA Enrollment"])
+async def disable_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Disable two-factor authentication for the authenticated user."""
+    user_id = current_user["user_id"]
+    user = repo.get_by_id(user_id)
+    metadata = user.get("metadata", {})
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+
+    metadata["mfa_enabled"] = False
+    metadata.pop("mfa_secret", None)
+    metadata.pop("backup_codes", None)
+    repo.update_user(user_id, {"metadata": metadata})
+
+    audit_log.record_security_event(
+        event_name="MFA_DISABLED",
+        severity="WARNING",
+        details={"user_id": user_id},
+    )
+    return {"status": "SUCCESS", "message": "Two-factor authentication has been disabled."}
+
+
+
 @app.post("/auth/mfa/complete", tags=["MFA Verification"])
 async def complete_mfa(req: MFACompleteRequest, request: Request):
     """Validate a TOTP code or emergency backup code to finalize an MFA challenge."""
