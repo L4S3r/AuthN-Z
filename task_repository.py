@@ -40,6 +40,7 @@ class TaskRepository:
                     priority TEXT NOT NULL DEFAULT 'medium',
                     assignee_email TEXT,
                     assignee_name TEXT,
+                    assignees TEXT DEFAULT '[]',
                     created_by TEXT NOT NULL,
                     tags TEXT DEFAULT '[]',
                     due_date TEXT,
@@ -66,11 +67,16 @@ class TaskRepository:
             # Column migrations for existing databases
             cursor = conn.cursor()
             cursor.execute("PRAGMA table_info(team_members);")
-            columns = [row["name"] for row in cursor.fetchall()]
-            if "invite_token" not in columns:
+            tm_columns = [row["name"] for row in cursor.fetchall()]
+            if "invite_token" not in tm_columns:
                 cursor.execute("ALTER TABLE team_members ADD COLUMN invite_token TEXT;")
-            if "expires_at" not in columns:
+            if "expires_at" not in tm_columns:
                 cursor.execute("ALTER TABLE team_members ADD COLUMN expires_at TEXT;")
+
+            cursor.execute("PRAGMA table_info(tasks);")
+            task_columns = [row["name"] for row in cursor.fetchall()]
+            if "assignees" not in task_columns:
+                cursor.execute("ALTER TABLE tasks ADD COLUMN assignees TEXT DEFAULT '[]';")
 
             conn.commit()
 
@@ -95,8 +101,9 @@ class TaskRepository:
             query += " AND priority = ?"
             params.append(priority)
         if assignee_email:
-            query += " AND assignee_email = ?"
+            query += " AND (assignee_email = ? OR assignees LIKE ?)"
             params.append(assignee_email)
+            params.append(f'%"{assignee_email}"%')
 
         query += " ORDER BY datetime(created_at) DESC"
 
@@ -118,22 +125,35 @@ class TaskRepository:
         now = datetime.now(timezone.utc).isoformat()
         tags_json = json.dumps(data.get("tags", []))
 
+        assignees = data.get("assignees") or []
+        if not assignees and data.get("assignee_email"):
+            assignees = [{
+                "email": data["assignee_email"],
+                "name": data.get("assignee_name") or data["assignee_email"].split("@")[0],
+                "avatar_url": data.get("assignee_avatar"),
+            }]
+
+        primary_email = data.get("assignee_email") or (assignees[0]["email"] if assignees else None)
+        primary_name = data.get("assignee_name") or (assignees[0]["name"] if assignees else None)
+        assignees_json = json.dumps(assignees)
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO tasks (
                     id, title, description, status, priority,
-                    assignee_email, assignee_name, created_by,
+                    assignee_email, assignee_name, assignees, created_by,
                     tags, due_date, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_id,
                 data.get("title", "").strip(),
                 data.get("description", "").strip(),
                 data.get("status", "todo"),
                 data.get("priority", "medium"),
-                data.get("assignee_email"),
-                data.get("assignee_name"),
+                primary_email,
+                primary_name,
+                assignees_json,
                 data.get("created_by", "system"),
                 tags_json,
                 data.get("due_date"),
@@ -156,6 +176,18 @@ class TaskRepository:
         if "tags" in updates:
             fields.append("tags = ?")
             params.append(json.dumps(updates["tags"]))
+
+        if "assignees" in updates:
+            fields.append("assignees = ?")
+            assignees_data = updates["assignees"]
+            params.append(json.dumps(assignees_data))
+            if assignees_data and len(assignees_data) > 0:
+                if "assignee_email" not in updates:
+                    fields.append("assignee_email = ?")
+                    params.append(assignees_data[0].get("email"))
+                if "assignee_name" not in updates:
+                    fields.append("assignee_name = ?")
+                    params.append(assignees_data[0].get("name"))
 
         if not fields:
             return self.get_task(task_id)
@@ -186,6 +218,22 @@ class TaskRepository:
                 raw["tags"] = json.loads(tags)
             except Exception:
                 raw["tags"] = []
+
+        assignees = raw.get("assignees", "[]")
+        if isinstance(assignees, str):
+            try:
+                raw["assignees"] = json.loads(assignees)
+            except Exception:
+                raw["assignees"] = []
+        elif not isinstance(assignees, list):
+            raw["assignees"] = []
+
+        if not raw["assignees"] and raw.get("assignee_email"):
+            raw["assignees"] = [{
+                "email": raw["assignee_email"],
+                "name": raw.get("assignee_name") or raw["assignee_email"].split("@")[0],
+            }]
+
         return raw
 
     # =========================================================================
@@ -251,7 +299,6 @@ class TaskRepository:
                 }
 
         return list(members_map.values())
-
 
     def invite_member(
         self,

@@ -154,6 +154,7 @@ class TaskCreateRequest(BaseModel):
     priority: Optional[str] = "medium"
     assignee_email: Optional[str] = None
     assignee_name: Optional[str] = None
+    assignees: Optional[List[Dict[str, Any]]] = None
     tags: Optional[List[str]] = []
     due_date: Optional[str] = None
 
@@ -165,8 +166,10 @@ class TaskUpdateRequest(BaseModel):
     priority: Optional[str] = None
     assignee_email: Optional[str] = None
     assignee_name: Optional[str] = None
+    assignees: Optional[List[Dict[str, Any]]] = None
     tags: Optional[List[str]] = None
     due_date: Optional[str] = None
+
 
 
 class TeamInviteRequest(BaseModel):
@@ -998,38 +1001,50 @@ async def create_task(
     req: TaskCreateRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Create and assign a new team task card, dispatching email notification to assignee."""
+    """Create and assign a new team task card, dispatching email notification to all assignees."""
     user = repo.get_by_id(current_user["user_id"])
     creator_email = user["email"] if user else current_user["user_id"]
     assigned_by_name = user["username"] if user else "Workspace Admin"
 
-    assignee_email = (req.assignee_email or creator_email).strip().lower()
-    assignee_name = req.assignee_name or (user["username"] if user else "Member")
+    assignees_list = req.assignees or []
+    if not assignees_list and req.assignee_email:
+        assignees_list = [{
+            "email": req.assignee_email.strip().lower(),
+            "name": req.assignee_name or req.assignee_email.split("@")[0],
+        }]
+
+    primary_email = req.assignee_email or (assignees_list[0]["email"] if assignees_list else creator_email)
+    primary_name = req.assignee_name or (assignees_list[0]["name"] if assignees_list else (user["username"] if user else "Member"))
 
     new_task = task_repo.create_task({
         "title": req.title.strip(),
         "description": (req.description or "").strip(),
         "status": req.status or "todo",
         "priority": req.priority or "medium",
-        "assignee_email": assignee_email,
-        "assignee_name": assignee_name,
+        "assignee_email": primary_email,
+        "assignee_name": primary_name,
+        "assignees": assignees_list,
         "created_by": creator_email,
         "tags": req.tags or [],
         "due_date": req.due_date,
     })
 
-    # Dispatch assignment email notification to assignee
-    if assignee_email and "@" in assignee_email:
-        email_svc.send_task_assignment_email(
-            recipient_email=assignee_email,
-            recipient_name=assignee_name,
-            task_title=new_task["title"],
-            task_description=new_task.get("description"),
-            priority=new_task.get("priority", "medium"),
-            due_date=new_task.get("due_date"),
-            assigned_by=assigned_by_name,
-            task_id=new_task["id"],
-        )
+    # Dispatch assignment email notification to all assignees
+    targets = assignees_list if assignees_list else ([{"email": primary_email, "name": primary_name}] if primary_email else [])
+    for target in targets:
+        target_email = target.get("email", "").strip().lower()
+        target_name = target.get("name") or target_email.split("@")[0]
+        if target_email and "@" in target_email:
+            email_svc.send_task_assignment_email(
+                recipient_email=target_email,
+                recipient_name=target_name,
+                task_title=new_task["title"],
+                task_description=new_task.get("description"),
+                priority=new_task.get("priority", "medium"),
+                due_date=new_task.get("due_date"),
+                assigned_by=assigned_by_name,
+                task_id=new_task["id"],
+            )
 
     return {"status": "SUCCESS", "task": new_task}
 
@@ -1040,7 +1055,7 @@ async def update_task(
     req: TaskUpdateRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Update task card status (Kanban movement), priority, deadline, or assignee."""
+    """Update task card status (Kanban movement), priority, deadline, or assignees."""
     existing = task_repo.get_task(task_id)
     if not existing:
         raise HTTPException(
@@ -1051,17 +1066,36 @@ async def update_task(
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     updated = task_repo.update_task(task_id, updates)
 
-    # If assigned to a new assignee, dispatch notification
-    if req.assignee_email and req.assignee_email.strip().lower() != (existing.get("assignee_email") or "").lower():
-        user = repo.get_by_id(current_user["user_id"])
-        assigned_by_name = user["username"] if user else "Workspace Admin"
-        new_assignee_email = req.assignee_email.strip().lower()
-        new_assignee_name = req.assignee_name or new_assignee_email.split("@")[0]
+    # If assignees were updated, notify any newly added assignees
+    user = repo.get_by_id(current_user["user_id"])
+    assigned_by_name = user["username"] if user else "Workspace Admin"
 
-        if "@" in new_assignee_email:
+    existing_assignees = set()
+    for a in existing.get("assignees", []):
+        if isinstance(a, dict) and a.get("email"):
+            existing_assignees.add(a["email"].strip().lower())
+    if existing.get("assignee_email"):
+        existing_assignees.add(existing["assignee_email"].strip().lower())
+
+    new_targets = []
+    if req.assignees is not None:
+        for a in req.assignees:
+            email = a.get("email", "").strip().lower()
+            if email and email not in existing_assignees:
+                new_targets.append(a)
+    elif req.assignee_email and req.assignee_email.strip().lower() not in existing_assignees:
+        new_targets.append({
+            "email": req.assignee_email.strip().lower(),
+            "name": req.assignee_name or req.assignee_email.split("@")[0],
+        })
+
+    for target in new_targets:
+        target_email = target.get("email", "").strip().lower()
+        target_name = target.get("name") or target_email.split("@")[0]
+        if target_email and "@" in target_email:
             email_svc.send_task_assignment_email(
-                recipient_email=new_assignee_email,
-                recipient_name=new_assignee_name,
+                recipient_email=target_email,
+                recipient_name=target_name,
                 task_title=updated.get("title", existing["title"]),
                 task_description=updated.get("description", existing.get("description")),
                 priority=updated.get("priority", existing.get("priority", "medium")),
@@ -1071,6 +1105,7 @@ async def update_task(
             )
 
     return {"status": "SUCCESS", "task": updated}
+
 
 
 
