@@ -144,7 +144,7 @@ class MFAProvider(abstractMFAProvider):
         user_id: str,
         secret: str,
         account_name: str,
-        issuer_name: str = "OOB-based-auth-app",
+        issuer_name: str = "Task Tracker",
     ) -> str:
         escaped_issuer=quote(issuer_name)
         escaped_account=quote(account_name)

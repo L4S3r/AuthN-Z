@@ -187,6 +187,11 @@ class OAuthExchangeRequest(BaseModel):
     redirect_uri: Optional[str] = None
 
 
+class MFAVerifySetupRequest(BaseModel):
+    code: str = Field(..., min_length=6, max_length=12)
+
+
+
 
 class RefreshRequest(BaseModel):
     refresh_token: str
@@ -493,9 +498,9 @@ async def setup_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
 
-    metadata["mfa_enabled"] = True
-    metadata["mfa_secret"] = secret
-    metadata["backup_codes"] = hashed_backups
+    # Store as pending secret until verified by 6-digit TOTP input
+    metadata["pending_mfa_secret"] = secret
+    metadata["pending_backup_codes"] = hashed_backups
     repo.update_user(user_id, {"metadata": metadata})
 
     uri = mfa_prov.get_provisioning_uri(user_id, secret, user["email"])
@@ -504,6 +509,52 @@ async def setup_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
         "secret": secret,
         "provisioning_uri": uri,
         "backup_codes": backup_codes,
+    }
+
+
+@app.post("/auth/mfa/verify-setup", tags=["MFA Enrollment"])
+async def verify_mfa_setup(
+    req: MFAVerifySetupRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Verify the 6-digit TOTP code from authenticator app to finalize and activate 2FA."""
+    user_id = current_user["user_id"]
+    user = repo.get_by_id(user_id)
+    metadata = user.get("metadata", {})
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+
+    pending_secret = metadata.get("pending_mfa_secret") or metadata.get("mfa_secret")
+    if not pending_secret:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pending MFA enrollment found. Please restart MFA setup.",
+        )
+
+    is_valid = mfa_prov.verify_totp(pending_secret, req.code.strip())
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid 6-digit verification code. Please check your authenticator clock and try again.",
+        )
+
+    # Commit active MFA enrollment
+    metadata["mfa_enabled"] = True
+    metadata["mfa_secret"] = pending_secret
+    if "pending_backup_codes" in metadata:
+        metadata["backup_codes"] = metadata.pop("pending_backup_codes")
+    metadata.pop("pending_mfa_secret", None)
+    repo.update_user(user_id, {"metadata": metadata})
+
+    audit_log.record_security_event(
+        event_name="MFA_ACTIVATED",
+        severity="INFO",
+        details={"user_id": user_id},
+    )
+
+    return {
+        "status": "SUCCESS",
+        "message": "Two-factor authentication has been successfully verified and activated.",
     }
 
 
@@ -519,6 +570,8 @@ async def disable_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
     metadata["mfa_enabled"] = False
     metadata.pop("mfa_secret", None)
     metadata.pop("backup_codes", None)
+    metadata.pop("pending_mfa_secret", None)
+    metadata.pop("pending_backup_codes", None)
     repo.update_user(user_id, {"metadata": metadata})
 
     audit_log.record_security_event(
@@ -527,6 +580,7 @@ async def disable_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
         details={"user_id": user_id},
     )
     return {"status": "SUCCESS", "message": "Two-factor authentication has been disabled."}
+
 
 
 
@@ -723,6 +777,22 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
             },
         )
 
+    # Check if user has MFA active
+    user_meta = user.get("metadata", {})
+    if isinstance(user_meta, str):
+        try:
+            user_meta = json.loads(user_meta)
+        except Exception:
+            user_meta = {}
+
+    if user_meta.get("mfa_enabled") and user_meta.get("mfa_secret"):
+        challenge = auth.initiate_mfa_challenge(user["id"], challenge_type="totp")
+        return {
+            "status": "MFA_REQUIRED",
+            "user_id": user["id"],
+            "challenge_id": challenge["challenge_id"],
+        }
+
     roles = user.get("roles", [])
     if isinstance(roles, str):
         try:
@@ -733,6 +803,7 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
     access_token = token_svc.create_access_token(user["id"], claims={"roles": roles})
     refresh_token = token_svc.create_refresh_token(user["id"], claims={"roles": roles})
     session_id = sess_store.create_session(user["id"], session_data={"roles": roles})
+
 
     safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
     safe_metadata.pop("mfa_secret", None)
