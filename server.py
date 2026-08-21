@@ -531,7 +531,7 @@ async def verify_mfa_setup(
             detail="No pending MFA enrollment found. Please restart MFA setup.",
         )
 
-    is_valid = mfa_prov.verify_totp(pending_secret, req.code.strip())
+    is_valid = mfa_prov.verify_totp_code(pending_secret, req.code.strip())
     if not is_valid:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

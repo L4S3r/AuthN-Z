@@ -164,7 +164,11 @@ class MFAProvider(abstractMFAProvider):
             return bool(pyotp.TOTP(secret).verify(clean_code,valid_window=tolerance_steps))
         except Exception:
             return False
+
+    verify_totp = verify_totp_code
+
     def generate_backup_codes(self, count: int = 8, code_length: int = 10) -> List[str]:
+
         characters = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
         unique_codes=set()
         while len(unique_codes)<count:
