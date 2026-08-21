@@ -76,9 +76,10 @@ app = FastAPI(
     },
 )
 
-# Explicit CORS Whitelist (Wildcard '*' dropped to secure credentialed requests)
+# Explicit CORS Whitelist
 ALLOWED_ORIGINS = [
     "https://auth-api.l4s3r.site",
+    "https://tasks.l4s3r.site",
     "https://l4s3r.site",
     "https://www.l4s3r.site",
     "http://localhost:3000",
@@ -92,11 +93,12 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"^https://[a-zA-Z0-9_-]+\.vercel\.app$",
+    allow_origin_regex=r"^https://([a-zA-Z0-9_-]+\.)*(l4s3r\.site|vercel\.app)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 from oauth_provider import OAuthManager, generate_pkce_pair, generate_oauth_state
 
