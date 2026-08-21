@@ -94,6 +94,7 @@ The system strictly adheres to the principle of Separation of Concerns, dividing
 
 1. Clone or navigate to the project directory:
    ```bash
+   git clone https://github.com/L4S3r/AuthN-Z
    cd "Auth N&Z"
    ```
 
