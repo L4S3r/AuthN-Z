@@ -150,11 +150,11 @@ class abstractPermissionEvaluator(ABC):
 class PermissionEvaluator(abstractPermissionEvaluator):
     def __init__(
         self,
-        user_repo:Optional[concreteUserRepository]=None,
+        user_repo:Optional[UserRepository]=None,
         role_permissions:Optional[Dict[str,List[str]]]=None,
         role_hierarchy:Optional[Dict[str,List[str]]]=None
         ):
-        self.user_repo=user_repo or concreteUserRepository()
+        self.user_repo=user_repo or UserRepository()
 
         self.role_permissions=role_permissions or {
             "viewer":["documents:read","reports:read"],

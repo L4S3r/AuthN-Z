@@ -133,8 +133,7 @@ class UserRepository(abstractUserRepository):
     def __init__(self, db_file: str = "DATABASE.db"):
         self.db_file = db_file
         try:
-            # Use ":memory:" instead of a file name to create a temporary database in RAM
-            self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
+            self.conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=10.0)
             self.conn.row_factory = sqlite3.Row
             self._create_table()
             print(f"Connected successfully to SQLite version: {sqlite3.sqlite_version}")
@@ -143,9 +142,12 @@ class UserRepository(abstractUserRepository):
             raise
 
     def _create_table(self) -> None:
-        """Create the user table if it doesn't already exist."""
+        """Create the user table and configure concurrent WAL journal mode."""
+        if self.db_file != ":memory:":
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute("PRAGMA synchronous=NORMAL;")
 
-        query="""
+        query = """
         CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
@@ -159,6 +161,7 @@ class UserRepository(abstractUserRepository):
         """
         with self.conn:
             self.conn.execute(query)
+
     
     def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
         """Safely insert a new user using a parameterized query."""
@@ -247,3 +250,6 @@ class UserRepository(abstractUserRepository):
         with self.conn:
             cursor = self.conn.execute(query,(status_int, str(user_id)))
             return cursor.rowcount > 0
+
+
+concreteUserRepository = UserRepository

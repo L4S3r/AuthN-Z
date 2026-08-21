@@ -19,6 +19,13 @@ import os
 import secrets
 import uuid
 
+try:
+    import redis
+except ImportError:
+    redis = None
+
+
+
 class abstractTokenService(ABC):
     """Abstract interface defining cryptographic token creation, verification, and revocation mechanisms."""
 
@@ -128,23 +135,53 @@ class abstractTokenService(ABC):
         """
         ...
 
+import logging
+
+logger = logging.getLogger("auth_nz.token_service")
+
+
 class TokenService(abstractTokenService):
-    def __init__(self, secret_key: Optional[str]=None, algorithm: str="HS256"):
-        self.algorithm=algorithm
-        self.secret_key=secret_key or self._get_or_generate_secret_key()
-        self._revocation_blocklist: Set[str]=set()
-    
+    def __init__(
+        self,
+        secret_key: Optional[str] = None,
+        algorithm: str = "HS256",
+        redis_client: Optional[Any] = None,
+    ):
+        self.algorithm = algorithm
+        self.secret_key = secret_key or self._get_or_generate_secret_key()
+        if redis_client is not None:
+            self.r = redis_client
+        elif redis is not None:
+            try:
+                self.r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+                self.r.ping()
+            except Exception as exc:
+                logger.warning(
+                    "Redis connection failed (%s). Falling back to in-memory JWT blocklist. "
+                    "Warning: In-memory blocklists are not shared across multi-process workers.",
+                    exc,
+                )
+                self.r = None
+        else:
+            self.r = None
+            logger.warning(
+                "The 'redis' package is not installed. Falling back to in-memory JWT blocklist. "
+                "Install with `python -m pip install redis` to enable shared Redis persistence."
+            )
+        self._in_memory_blocklist: Set[str] = set()
+
+
     def _get_or_generate_secret_key(self, key_name: str = "JWT_SECRET_KEY") -> str:
-        existing_key=os.environ.get(key_name)
+        existing_key = os.environ.get(key_name)
         if existing_key:
             return existing_key
         if os.path.exists(".env"):
-            with open(".env","r",encoding="utf-8") as f:
+            with open(".env", "r", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith(f"{key_name}="):
-                        return line.strip().split("=",1)[1]
+                        return line.strip().split("=", 1)[1]
         new_key = secrets.token_urlsafe(32)
-        with open(".env","a",encoding="utf-8") as f:
+        with open(".env", "a", encoding="utf-8") as f:
             f.write(f"{key_name}={new_key}\n")
         print(f"Generated new secret key and saved to .env as '{key_name}'")
         return new_key
@@ -152,54 +189,56 @@ class TokenService(abstractTokenService):
     def create_access_token(
         self,
         subject_id: str,
-        claims: Optional[Dict[str,Any]]=None,
-        lifetime_seconds:int=900,) -> str:
-        """Mint a short-lived signed access token"""
-        now=datetime.now(timezone.utc)
-        exp=now + timedelta(seconds=lifetime_seconds)
-        payload={
-            "sub":str(subject_id),
-            "iat":now,
-            "exp":exp,
-            "jti":str(uuid.uuid4()),
-            "type":"access",
+        claims: Optional[Dict[str, Any]] = None,
+        lifetime_seconds: int = 900,
+    ) -> str:
+        """Mint a short-lived signed access token."""
+        now = datetime.now(timezone.utc)
+        exp = now + timedelta(seconds=lifetime_seconds)
+        payload = {
+            "sub": str(subject_id),
+            "iat": now,
+            "exp": exp,
+            "jti": str(uuid.uuid4()),
+            "type": "access",
         }
         if claims:
-            for k,v in claims.items():
+            for k, v in claims.items():
                 if k not in payload:
-                    payload[k]=v
-        return jwt.encode(payload,self.secret_key,algorithm=self.algorithm)
+                    payload[k] = v
+        return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
 
     def create_refresh_token(
         self,
         subject_id: str,
-        claims: Optional[Dict[str, Any]]=None,
+        claims: Optional[Dict[str, Any]] = None,
         lifetime_seconds: int = 604800,
     ) -> str:
-        """Mint a long-lived refresh token"""
-        now=datetime.now(timezone.utc)
-        exp=now+timedelta(seconds=lifetime_seconds)
-        payload={
-            "sub":str(subject_id),
-            "iat":now,
-            "exp":exp,
-            "jti":str(uuid.uuid4()),
-            "type":"refresh",
+        """Mint a long-lived refresh token."""
+        now = datetime.now(timezone.utc)
+        exp = now + timedelta(seconds=lifetime_seconds)
+        payload = {
+            "sub": str(subject_id),
+            "iat": now,
+            "exp": exp,
+            "jti": str(uuid.uuid4()),
+            "type": "refresh",
         }
 
         if claims:
-            for k,v in claims.items():
+            for k, v in claims.items():
                 if k not in payload:
-                    payload[k]=v
-        return jwt.encode(payload,self.secret_key,algorithm=self.algorithm)
-    def decode_and_verify(self,token:str) -> Dict[str,Any]:
-        """Validate token signature, expiration, issuer, and return decoded payload/claims dictionary"""
+                    payload[k] = v
+        return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
+
+    def decode_and_verify(self, token: str) -> Dict[str, Any]:
+        """Validate token signature, expiration, issuer, and return decoded payload/claims dictionary."""
         try:
-            payload=jwt.decode(
+            payload = jwt.decode(
                 token,
                 self.secret_key,
                 algorithms=[self.algorithm],
-                options={"require":["sub","exp","iat","jti"]}
+                options={"require": ["sub", "exp", "iat", "jti"]},
             )
             if self.is_token_revoked(payload["jti"]):
                 raise ValueError("Token has been revoked")
@@ -207,11 +246,44 @@ class TokenService(abstractTokenService):
         except jwt.ExpiredSignatureError:
             raise ValueError("Token has expired")
         except jwt.InvalidTokenError as e:
-            raise ValueError(f"Invaild token: {e}")
-    def revoke_token(self,token_identifier:str,expires_at:Optional[int]=None)->bool:
-        """Add a token's jti to the in-memory revocation blocklist."""
-        self._revocation_blocklist.add(token_identifier)
+            raise ValueError(f"Invalid token: {e}")
+
+    def revoke_token(self, token_identifier: str, expires_at: Optional[int] = None) -> bool:
+        """Add a token's jti to the Redis revocation blocklist with matching TTL."""
+        ttl = 604800  # Default 7 days fallback
+        if expires_at is not None:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            ttl = max(1, expires_at - now_ts)
+
+        if self.r is not None:
+            try:
+                key = f"revoked_token:{token_identifier}"
+                self.r.set(key, "1", ex=ttl)
+                return True
+            except Exception as exc:
+                logger.error(
+                    "Failed to record token revocation in Redis (%s). Falling back to memory.",
+                    exc,
+                )
+
+        self._in_memory_blocklist.add(token_identifier)
         return True
-    def is_token_revoked(self,token_identifier:str) ->bool:
-        """Check if a token's jti is in the revocation blocklist."""
-        return token_identifier in self._revocation_blocklist
+
+    def is_token_revoked(self, token_identifier: str) -> bool:
+        """Check if a token's jti is in the Redis or fallback revocation blocklist."""
+        if self.r is not None:
+            try:
+                key = f"revoked_token:{token_identifier}"
+                return bool(self.r.exists(key))
+            except Exception as exc:
+                logger.error(
+                    "Failed to query token revocation in Redis (%s). Falling back to memory.",
+                    exc,
+                )
+        return token_identifier in self._in_memory_blocklist
+
+
+
+concreteTokenService = TokenService
+
+

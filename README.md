@@ -122,16 +122,29 @@ The system strictly adheres to the principle of Separation of Concerns, dividing
 
 ## API Reference
 
-### Authentication Endpoints
-- `POST /auth/register` - Create account with username, email, password, and roles.
-- `POST /auth/login` - Authenticate credentials. Returns tokens or an active MFA challenge.
+### Authentication & Session Endpoints
+- `POST /auth/register` - Public account registration (assigns default 'viewer' role).
+- `POST /auth/login` - Primary credential authentication with rate limiting and side-channel protection.
+- `POST /auth/refresh` - Rotate and exchange refresh token for new access and refresh tokens.
+- `POST /auth/logout` - Revoke current JWT access token and invalidate single or all active Redis sessions.
 - `POST /auth/mfa/setup` - Generate TOTP QR secret and emergency backup codes (Protected).
 - `POST /auth/mfa/complete` - Submit 6-digit TOTP code or backup code to finalize challenge.
 - `GET /auth/me` - Retrieve current user profile and JWT claim context (Protected).
 
+### Social Login & OAuth2 (OIDC) Endpoints
+- `GET /auth/oauth/providers` - Discover enabled OAuth providers (Google, GitHub).
+- `GET /auth/oauth/{provider}/login` - Initiate PKCE authorization flow for web browsers.
+- `GET /auth/oauth/{provider}/callback` - Handle authorization code redirect and return issued tokens.
+- `POST /auth/oauth/{provider}/exchange` - Direct authorization code exchange for mobile apps (Flutter, React Native, Swift, Kotlin).
+
+### Administrative Endpoints
+- `POST /admin/users` - Provision user accounts with custom roles and clearance levels (Admin only).
+- `GET /audit/logs` - Query security telemetry audit trail with filters and pagination (Admin only).
+
 ### Resource and Policy Endpoints
 - `GET /documents/{doc_id}` - Access controlled resource evaluated by RBAC and ABAC policies.
-- `GET /audit/logs` - Query security telemetry audit trail (Requires Admin role).
+
+
 
 ---
 

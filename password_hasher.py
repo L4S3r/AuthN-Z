@@ -101,3 +101,6 @@ class PasswordHasher(abstractPasswordHasher):
         return current_rounds < target_rounds
       except (ValueError, IndexError):
         return True
+
+
+concretePasswordHasher = PasswordHasher

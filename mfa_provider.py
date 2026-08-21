@@ -187,4 +187,8 @@ class MFAProvider(abstractMFAProvider):
         return (False,remaining_codes)
 
 
+concreteMFAProvider = MFAProvider
+
+
+
 

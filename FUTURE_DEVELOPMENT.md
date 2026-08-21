@@ -4,16 +4,21 @@ This document outlines strategic enhancements, production hardening steps, and a
 
 ---
 
-## 1. OAuth2 and OpenID Connect (OIDC) Social Login Integration
+## 1. OAuth2 and OpenID Connect (OIDC) Social Login Integration (COMPLETED)
 
 ### Objective
 Allow users to authenticate using external identity providers (Google, GitHub, Microsoft, Apple).
 
-### Implementation Plan
-1. Create `OAuth2Provider` abstract interface.
-2. Implement Authorization Code Grant flow with PKCE (Proof Key for Code Exchange).
-3. Add user linking in `UserRepository` to map external provider IDs (e.g. `google_sub_123`) to internal account IDs.
-4. Expose `/auth/oauth/{provider}/login` and `/auth/oauth/{provider}/callback` endpoints.
+### Status
+Implemented and active via `oauth_provider.py` and `server.py`:
+- `GoogleOAuth2Provider` and `GitHubOAuth2Provider` with PKCE (RFC 7636) and single-use state verification.
+- Automatic account provisioning and email-based identity linking in `user_repository.py`.
+- Endpoints:
+  - `GET /auth/oauth/providers` - Discover enabled providers.
+  - `GET /auth/oauth/{provider}/login` - Web/Browser redirect initiation with PKCE.
+  - `GET /auth/oauth/{provider}/callback` - Web OAuth redirect callback handler.
+  - `POST /auth/oauth/{provider}/exchange` - Direct authorization code exchange for mobile apps (Flutter, React Native, Swift, Kotlin).
+
 
 ---
 

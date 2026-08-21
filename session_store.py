@@ -13,11 +13,14 @@ session management, and concurrent session revocation.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 from datetime import datetime, timezone
 import secrets
 import json
-import redis
+try:
+    import redis
+except ImportError:
+    redis = None
 
 
 class abstractSessionStore(ABC):
@@ -30,198 +33,207 @@ class abstractSessionStore(ABC):
         session_data: Optional[Dict[str, Any]] = None,
         ttl_seconds: int = 3600,
     ) -> str:
-        """
-        Initialize and store a new active session for a user, returning a unique session ID.
-
-        Args:
-            user_id: The unique identifier of the user logging in.
-            session_data: Optional contextual data to attach to the session (e.g., IP address, user agent, login time).
-            ttl_seconds: Time-To-Live in seconds before the session expires (default is 1 hour / 3600 seconds).
-
-        Returns:
-            A cryptographically secure, high-entropy session identifier string (e.g., UUID4 or 256-bit random hex).
-
-        Edge Cases to Consider:
-            - Enforcing maximum concurrent session limits per user (e.g., kicking oldest session).
-            - Ensuring session ID generator entropy is sufficient to prevent brute-force guessing.
-            - Serializing non-primitive objects within session_data safely.
-        """
-        ...
+        pass
 
     @abstractmethod
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve session state and metadata by session ID if it is valid and has not expired.
-
-        Args:
-            session_id: The unique session identifier string.
-
-        Returns:
-            A dictionary of session data (including user_id, timestamps, and custom attributes),
-            or None if the session does not exist or has expired.
-
-        Edge Cases to Consider:
-            - Passive expiration handling (cleaning up lazily if the underlying store doesn't support native TTLs).
-            - Handling corrupted or deserialization-resistant payload data.
-        """
-        ...
+        pass
 
     @abstractmethod
-    def update_session_data(self, session_id: str, session_data: Dict[str, Any]) -> bool:
-        """
-        Update or merge custom data stored inside an existing active session without modifying its TTL.
-
-        Args:
-            session_id: The unique session identifier.
-            session_data: Dictionary of key-value pairs to update or add.
-
-        Returns:
-            True if the session exists and was updated, False if the session was not found or has expired.
-
-        Edge Cases to Consider:
-            - Race conditions during concurrent writes from parallel requests belonging to the same session.
-            - Deep merging vs. shallow replacement of existing keys.
-        """
-        ...
+    def update_session_data(
+        self, session_id: str, session_data: Dict[str, Any]
+    ) -> bool:
+        pass
 
     @abstractmethod
-    def refresh_session_ttl(self, session_id: str, ttl_seconds: int = 3600) -> bool:
-        """
-        Extend the expiration time of an active session (sliding expiration).
-
-        Args:
-            session_id: The unique session identifier.
-            ttl_seconds: The new duration from the current moment until expiration.
-
-        Returns:
-            True if the session was successfully refreshed, False if the session does not exist.
-
-        Edge Cases to Consider:
-            - Respecting an absolute maximum session lifetime limit regardless of sliding activity extensions.
-            - Frequency throttling of TTL refreshes to avoid excessive database/cache writes on high-frequency requests.
-        """
-        ...
+    def refresh_session_ttl(
+        self, session_id: str, ttl_seconds: int = 3600
+    ) -> bool:
+        pass
 
     @abstractmethod
     def delete_session(self, session_id: str) -> bool:
-        """
-        Explicitly terminate and remove a single session (e.g., during single-device logout).
-
-        Args:
-            session_id: The unique session identifier to destroy.
-
-        Returns:
-            True if the session existed and was removed, False if it was already absent.
-
-        Edge Cases to Consider:
-            - Handling idempotent deletion calls safely without raising errors.
-        """
-        ...
+        pass
 
     @abstractmethod
-    def delete_all_user_sessions(self, user_id: str, except_session_id: Optional[str] = None) -> int:
-        """
-        Invalidate all active sessions belonging to a specific user (e.g., password change, security reset, or 'logout all devices').
+    def delete_all_user_sessions(
+        self, user_id: str, except_session_id: Optional[str] = None
+    ) -> int:
+        pass
 
-        Args:
-            user_id: The identifier of the user whose sessions should be terminated.
-            except_session_id: Optional session ID to preserve (e.g., keeping the user's current session alive).
 
-        Returns:
-            The total number of sessions successfully deleted/invalidated.
+import logging
 
-        Edge Cases to Consider:
-            - Indexing efficiency: quickly discovering all session keys belonging to a specific user without scanning the entire database.
-            - Handling partial failures if multiple keys are deleted in a distributed environment.
-        """
-        ...
+logger = logging.getLogger("auth_nz.session_store")
+
 
 class SessionStore(abstractSessionStore):
-    def __init__(self,host="localhost",port=6379,db=0,ttl=1800):
-        self.r=redis.Redis(host=host,port=port,db=db,decode_responses=True)
-        self.ttl=ttl
+    def __init__(self, host="localhost", port=6379, db=0, ttl=1800):
+        self.ttl = ttl
+        self._in_memory_sessions: Dict[str, Dict[str, Any]] = {}
+        self._in_memory_user_index: Dict[str, Set[str]] = {}
 
-    def create_session(self,
-    user_id:str,
-    session_data:Optional[Dict[str,Any]] = None,
-    ttl_seconds: int =3600
+        if redis is not None:
+            try:
+                self.r = redis.Redis(host=host, port=port, db=db, decode_responses=True)
+                self.r.ping()
+            except Exception as exc:
+                logger.warning(
+                    "Redis session store is currently unreachable at %s:%s (%s). "
+                    "Falling back to in-memory sessions.",
+                    host,
+                    port,
+                    exc,
+                )
+                self.r = None
+        else:
+            self.r = None
+            logger.warning(
+                "The 'redis' package is not installed. Falling back to in-memory sessions. "
+                "Install with `python -m pip install redis` to enable shared Redis persistence."
+            )
+
+    def create_session(
+        self,
+        user_id: str,
+        session_data: Optional[Dict[str, Any]] = None,
+        ttl_seconds: int = 3600,
     ) -> str:
+        """Initialize and store a new active session for a user, returning a unique session ID."""
+        session_id = secrets.token_urlsafe(32)
 
-        """Initialize and store a new active session for a user, returning a unique session ID"""
-        session_id=secrets.token_urlsafe(32)
-        session_key=f"session:{session_id}"
-
-        session_payload={
-            "user_id":user_id,
-            "created_at":datetime.utcnow().isoformat(),
-            "data":json.dumps(session_data or {})
+        session_payload = {
+            "user_id": user_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "data": json.dumps(session_data or {}),
         }
 
-        self.r.hset(session_key,mapping=session_payload)
-        self.r.expire(session_key,ttl_seconds)
+        if self.r is not None:
+            try:
+                session_key = f"session:{session_id}"
+                self.r.hset(session_key, mapping=session_payload)
+                self.r.expire(session_key, ttl_seconds)
 
-        user_session_key=f"user_sessions:{user_id}"
-        self.r.sadd(user_session_key,session_id)
-        self.r.expire(user_session_key,ttl_seconds)
+                user_session_key = f"user_sessions:{user_id}"
+                self.r.sadd(user_session_key, session_id)
+                self.r.expire(user_session_key, ttl_seconds)
+                return session_id
+            except Exception as exc:
+                logger.error("Redis create_session failed (%s). Falling back to memory.", exc)
+
+        # In-memory fallback
+        self._in_memory_sessions[session_id] = session_payload
+        self._in_memory_user_index.setdefault(user_id, set()).add(session_id)
         return session_id
-    
-    def get_session(self,session_id:str) -> Optional[Dict[str,Any]]:
-        """Retrieve session state and metadata by session ID if it is valid and has not expired."""
-        session_key=f"session:{session_id}"
-        session=self.r.hgetall(session_key)
+
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve session state and metadata by session ID if valid."""
+        session = None
+        if self.r is not None:
+            try:
+                session_key = f"session:{session_id}"
+                session = self.r.hgetall(session_key)
+            except Exception as exc:
+                logger.error("Redis get_session failed (%s). Checking memory.", exc)
+
+        if not session:
+            session = self._in_memory_sessions.get(session_id)
 
         if not session:
             return None
-        if "data" in session:
-            try:
-                session["data"]=json.loads(session["data"])
-            except (ValueError,TypeError):
-                session["data"]={}
-        return session
-    def update_session_data(self,session_id:str,session_data:Dict[str,Any])->bool:
-        """Update or merge custom data stored inside an existing active session without modifying its TTL."""
-        session_key=f"session:{session_id}"
-        current_session=self.get_session(session_id)
 
+        parsed = dict(session)
+        if "data" in parsed and isinstance(parsed["data"], str):
+            try:
+                parsed["data"] = json.loads(parsed["data"])
+            except (ValueError, TypeError):
+                parsed["data"] = {}
+        return parsed
+
+    def update_session_data(self, session_id: str, session_data: Dict[str, Any]) -> bool:
+        """Update custom data stored inside an existing active session."""
+        current_session = self.get_session(session_id)
         if not current_session:
             return False
-        
-        current_data=current_session.get("data",{})
+
+        current_data = current_session.get("data", {})
         current_data.update(session_data)
-        self.r.hset(session_key,"data",json.dumps(current_data))
-        return True
-    def refresh_session_ttl(self,session_id:str,ttl_seconds:int=3600)->bool:
-        """Extend the expiration time of an active session (sliding expiration)"""
-        session_key=f"session:{session_id}"
-        ttl_to_apply=ttl_seconds if ttl_seconds is not None else self.ttl
-        return bool(self.r.expire(session_key,ttl_to_apply))
-    def delete_session(self,session_id:str)->bool:
-        """Explicitly terminate and remove a single session (e.g., during single-device logout)"""
-        session_key=f"session:{session_id}"
-        current=self.get_session(session_id)
-        if current and "user_id" in current:
-            self.r.srem(f"user_sessions:{current['user_id']}",session_id)
-        return bool(self.r.delete(session_key))
-    def delete_all_user_sessions(self, user_id: str, except_session_id: Optional[str] = None) -> int:
-        """Invalidate all active sessions belonging to a specific user (e.g., password change, security reset, or 'logout all devices')."""
-        user_index_key=f"user_sessions{user_id}"
-        session_ids=self.r.smembers(user_index_key)
-        if not session_ids:
-            return 0
-        sessions_to_delete=[sid for sid in session_ids if sid != except_session_id]
-        if not sessions_to_delete:
-            return 0
-        keys_to_delete=[f"session:{sid}" for sid in sessions_to_delete]
-        pipe=self.r.pipeline()
-        pipe.delete(*keys_to_delete)
-        pipe.srem(user_index_key,*sessions_to_delete)
-        if not except_session_id or len(sessions_to_delete)==len(session_ids):
-            pipe.delete(user_index_key)
-        
-        pipe.execute()
-        return len(sessions_to_delete)
-        
+        serialized = json.dumps(current_data)
 
-    
+        if self.r is not None:
+            try:
+                self.r.hset(f"session:{session_id}", "data", serialized)
+                return True
+            except Exception as exc:
+                logger.error("Redis update_session_data failed (%s).", exc)
 
-        
+        if session_id in self._in_memory_sessions:
+            self._in_memory_sessions[session_id]["data"] = serialized
+            return True
+        return False
+
+    def refresh_session_ttl(self, session_id: str, ttl_seconds: int = 3600) -> bool:
+        """Extend the expiration time of an active session (sliding expiration)."""
+        ttl_to_apply = ttl_seconds if ttl_seconds is not None else self.ttl
+        if self.r is not None:
+            try:
+                return bool(self.r.expire(f"session:{session_id}", ttl_to_apply))
+            except Exception as exc:
+                logger.error("Redis refresh_session_ttl failed (%s).", exc)
+        return session_id in self._in_memory_sessions
+
+    def delete_session(self, session_id: str) -> bool:
+        """Explicitly terminate and remove a single session."""
+        current = self.get_session(session_id)
+        user_id = current.get("user_id") if current else None
+
+        if self.r is not None:
+            try:
+                if user_id:
+                    self.r.srem(f"user_sessions:{user_id}", session_id)
+                return bool(self.r.delete(f"session:{session_id}"))
+            except Exception as exc:
+                logger.error("Redis delete_session failed (%s).", exc)
+
+        if user_id and user_id in self._in_memory_user_index:
+            self._in_memory_user_index[user_id].discard(session_id)
+        return self._in_memory_sessions.pop(session_id, None) is not None
+
+    def delete_all_user_sessions(
+        self, user_id: str, except_session_id: Optional[str] = None
+    ) -> int:
+        """Invalidate all active sessions belonging to a specific user."""
+        count = 0
+        if self.r is not None:
+            try:
+                user_index_key = f"user_sessions:{user_id}"
+                session_ids = self.r.smembers(user_index_key)
+                if session_ids:
+                    sessions_to_delete = [
+                        sid for sid in session_ids if sid != except_session_id
+                    ]
+                    if sessions_to_delete:
+                        keys_to_delete = [f"session:{sid}" for sid in sessions_to_delete]
+                        pipe = self.r.pipeline()
+                        pipe.delete(*keys_to_delete)
+                        pipe.srem(user_index_key, *sessions_to_delete)
+                        if not except_session_id or len(sessions_to_delete) == len(session_ids):
+                            pipe.delete(user_index_key)
+                        pipe.execute()
+                        count = len(sessions_to_delete)
+            except Exception as exc:
+                logger.error("Redis delete_all_user_sessions failed (%s).", exc)
+
+        # Clear in-memory as well
+        if user_id in self._in_memory_user_index:
+            sids = list(self._in_memory_user_index[user_id])
+            for sid in sids:
+                if sid != except_session_id:
+                    self._in_memory_sessions.pop(sid, None)
+                    self._in_memory_user_index[user_id].discard(sid)
+                    count += 1
+
+        return count
+
+
+concreteSessionStore = SessionStore

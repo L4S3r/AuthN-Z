@@ -141,218 +141,285 @@ class abstractAuthenticator(ABC):
         """
         ...
 
+import logging
+
+logger = logging.getLogger("auth_nz.authenticator")
+
+DUMMY_BCRYPT_HASH = "$2b$12$e8YkZ7G4t9I1mPqLwK9ZCe8YkZ7G4t9I1mPqLwK9ZCe8YkZ7G4t9I"
+
+
 class Authenticator(abstractAuthenticator):
-    def __init__(self,
-    user_repo:Optional[UserRepository] = None,
-    hasher:Optional[PasswordHasher]=None,
-    token_service:Optional[TokenService]=None,
-    session_store:Optional[SessionStore]=None,
-    mfa_provider:Optional[MFAProvider]=None
+    def __init__(
+        self,
+        user_repo: Optional[UserRepository] = None,
+        hasher: Optional[PasswordHasher] = None,
+        token_service: Optional[TokenService] = None,
+        session_store: Optional[SessionStore] = None,
+        mfa_provider: Optional[MFAProvider] = None,
     ):
-        self.user_repo=user_repo or UserRepository()
-        self.hasher=hasher or PasswordHasher()
-        self.token_service=token_service or TokenService()
-        self.session_store=session_store or SessionStore()
-        self.mfa_provider=mfa_provider or MFAProvider()
-        self._pending_mfa_challenges:Dict[str,Dict[str,Any]]={}
-        
+        self.user_repo = user_repo or UserRepository()
+        self.hasher = hasher or PasswordHasher()
+        self.token_service = token_service or TokenService()
+        self.session_store = session_store or SessionStore()
+        self.mfa_provider = mfa_provider or MFAProvider()
+        self._pending_mfa_challenges: Dict[str, Dict[str, Any]] = {}
+
+    def _get_mfa_challenge(self, challenge_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve challenge data from Redis with fallback to in-memory store."""
+        if self.session_store and getattr(self.session_store, "r", None):
+            try:
+                raw = self.session_store.r.get(f"mfa_challenge:{challenge_id}")
+                if raw:
+                    return json.loads(raw)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to query MFA challenge from Redis (%s). Falling back to in-memory dictionary.",
+                    exc,
+                )
+        return self._pending_mfa_challenges.get(challenge_id)
+
+    def _save_mfa_challenge(self, challenge_id: str, data: Dict[str, Any], ttl_seconds: int = 300) -> None:
+        """Store challenge data in Redis with 5-minute TTL, fallback to memory."""
+        if self.session_store and getattr(self.session_store, "r", None):
+            try:
+                self.session_store.r.set(f"mfa_challenge:{challenge_id}", json.dumps(data), ex=ttl_seconds)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "Failed to store MFA challenge in Redis (%s). Falling back to in-memory dictionary.",
+                    exc,
+                )
+        self._pending_mfa_challenges[challenge_id] = data
+
+    def _delete_mfa_challenge(self, challenge_id: str) -> None:
+        """Purge completed or expired challenge from Redis and memory."""
+        if self.session_store and getattr(self.session_store, "r", None):
+            try:
+                self.session_store.r.delete(f"mfa_challenge:{challenge_id}")
+            except Exception as exc:
+                logger.warning("Failed to delete MFA challenge from Redis (%s).", exc)
+        self._pending_mfa_challenges.pop(challenge_id, None)
+
+
     def authenticate_credentials(
         self,
         identifier: str,
         plain_password: str,
     ) -> Dict[str, Any]:
         """Verify primary identity credentials (username/email and password)."""
-        user=self.user_repo.get_by_identifier(identifier)
-        #user lookup
+        user = self.user_repo.get_by_identifier(identifier)
+
+        # Constant-time side-channel mitigation: verify against dummy hash if user is absent
         if not user:
-            return{
-                "status":"FAILED",
-                "reason":"INVALID_CREDENTIALS"
-            }
-        #check if account is active
-        if not user.get("is_active",1):
+            self.hasher.verify(plain_password, DUMMY_BCRYPT_HASH)
             return {
-                "status":"FAILED",
-                "reason":"ACCOUNT_INACTIVE"
+                "status": "FAILED",
+                "reason": "INVALID_CREDENTIALS",
             }
-        #verify password
-        if not self.hasher.verify(plain_password,user["hashed_password"]):
+
+        # Check if account is active
+        if not user.get("is_active", 1):
             return {
-                "status":"FAILED",
-                "reason":"INVALID_CREDENTIALS"
+                "status": "FAILED",
+                "reason": "ACCOUNT_INACTIVE",
             }
-        #check if password needs rehash
+
+        # Verify password
+        if not self.hasher.verify(plain_password, user["hashed_password"]):
+            return {
+                "status": "FAILED",
+                "reason": "INVALID_CREDENTIALS",
+            }
+
+        # Check if password needs rehash
         if self.hasher.needs_rehash(user["hashed_password"]):
-            new_hash=self.hasher.hash(plain_password)
-            self.user_repo.update_user(user["id"],{"hashed_password":new_hash})
-        #check mfa
-        metadata=user.get("metadata",{})
-        if isinstance(metadata,str):
+            new_hash = self.hasher.hash(plain_password)
+            self.user_repo.update_user(user["id"], {"hashed_password": new_hash})
+
+        # Check MFA requirement
+        metadata = user.get("metadata", {})
+        if isinstance(metadata, str):
             try:
-                metadata=json.loads(metadata)
+                metadata = json.loads(metadata)
             except Exception:
-                metadata={}
+                metadata = {}
+
         if metadata.get("mfa_enabled") and metadata.get("mfa_secret"):
-            challenge=self.initiate_mfa_challenge(user["id"],challenge_type="totp")
-            return{
-                "status":"MFA_REQUIRED",
-                "user_id":user["id"],
-                "challenge_id":challenge["challenge_id"]
+            challenge = self.initiate_mfa_challenge(user["id"], challenge_type="totp")
+            return {
+                "status": "MFA_REQUIRED",
+                "user_id": user["id"],
+                "challenge_id": challenge["challenge_id"],
             }
-        #create tokens and session
-        roles=user.get("roles",[])
-        if isinstance(roles,str):
+
+        # Issue tokens and session
+        roles = user.get("roles", [])
+        if isinstance(roles, str):
             try:
-                roles=json.loads(roles)
+                roles = json.loads(roles)
             except Exception:
-                roles=[]
-        access_token=self.token_service.create_access_token(user["id"],claims={"roles":roles})
-        refresh_token=self.token_service.create_refresh_token(user["id"],claims={"roles":roles})
-        session_id=self.session_store.create_session(user["id"],session_data={"roles":roles})
+                roles = []
+
+        access_token = self.token_service.create_access_token(user["id"], claims={"roles": roles})
+        refresh_token = self.token_service.create_refresh_token(user["id"], claims={"roles": roles})
+        session_id = self.session_store.create_session(user["id"], session_data={"roles": roles})
 
         return {
-            "status":"SUCCESS",
-            "user_id":user["id"],
-            "access_token":access_token,
-            "refresh_token":refresh_token,
-            "session_id":session_id,
-            "user":{
-                "id":user["id"],
-                "username":user["username"],
-                "email":user["email"],
-                "roles":roles
+            "status": "SUCCESS",
+            "user_id": user["id"],
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "session_id": session_id,
+            "user": {
+                "id": user["id"],
+                "username": user["username"],
+                "email": user["email"],
+                "roles": roles,
             },
         }
+
     def authenticate_token(self, token: str) -> Dict[str, Any]:
-        """ Validate a bearer token and produce the authenticated subject's execution context."""
-        if not token or not isinstance(token,str):
-            return{
-                "status":"FAILED",
-                "reason":"MISSING_TOKEN"
+        """Validate a bearer token and produce the authenticated subject's execution context."""
+        if not token or not isinstance(token, str):
+            return {
+                "status": "FAILED",
+                "reason": "MISSING_TOKEN",
             }
-        #sanitize bearer prefix
-        clean_token=token.strip()
+
+        # Sanitize bearer prefix
+        clean_token = token.strip()
         if clean_token.lower().startswith("bearer "):
-            clean_token=clean_token[7:].strip()
-        #decode and verify claims
+            clean_token = clean_token[7:].strip()
+
+        # Decode and verify claims
         try:
-            payload=self.token_service.decode_and_verify(clean_token)
+            payload = self.token_service.decode_and_verify(clean_token)
         except ValueError as e:
-            error_message=str(e).lower()
+            error_message = str(e).lower()
             if "expired" in error_message:
-                reason="TOKEN_EXPIRED"
+                reason = "TOKEN_EXPIRED"
             elif "revoked" in error_message:
-                reason="TOKEN_REVOKED"
+                reason = "TOKEN_REVOKED"
             else:
-                reason="TOKEN_INVALID"
-            return{
-                "status":"FAILED",
-                "reason":reason,
-                "detail":str(e)
+                reason = "TOKEN_INVALID"
+            return {
+                "status": "FAILED",
+                "reason": reason,
+                "detail": str(e),
             }
         except Exception as e:
-            return{
-                "status":"FAILED",
-                "reason":"TOKEN_ERROR",
-                "detail":str(e)
+            return {
+                "status": "FAILED",
+                "reason": "TOKEN_ERROR",
+                "detail": str(e),
             }
-        #ensure token is access token not refresh token
-        if payload.get("type")!="access":
-            return{
-                "status":"FAILED",
-                "reason":"INVALID_TOKEN_TYPE"
+
+        # Ensure token is access token not refresh token
+        if payload.get("type") != "access":
+            return {
+                "status": "FAILED",
+                "reason": "INVALID_TOKEN_TYPE",
             }
-        #check if user account is still active in the database
-        user_id=payload.get("sub")
-        user=self.user_repo.get_by_id(user_id)
+
+        # Check if user account is still active in the database
+        user_id = payload.get("sub")
+        user = self.user_repo.get_by_id(user_id)
         if not user:
-            return{
-                "status":"FAILED",
-                "reason":"USER_NOT_FOUND"
+            return {
+                "status": "FAILED",
+                "reason": "USER_NOT_FOUND",
             }
-        if not user.get("is_active",1):
-            return{
-                "status":"FAILED",
-                "reason":"ACCOUNT_INACTIVE"
+        if not user.get("is_active", 1):
+            return {
+                "status": "FAILED",
+                "reason": "ACCOUNT_INACTIVE",
             }
+
         return {
-            "status":"SUCCESS",
-            "user_id":user_id,
-            "username":user.get("username"),
-            "roles":payload.get("roles",user.get("roles",[])),
-            "claims":payload
+            "status": "SUCCESS",
+            "user_id": user_id,
+            "username": user.get("username"),
+            "roles": payload.get("roles", user.get("roles", [])),
+            "claims": payload,
         }
+
     def authenticate_session(self, session_id: str) -> Dict[str, Any]:
-                """Validate an active session ID and resolve the current authenticated user context."""
+        """Validate an active session ID and resolve the current authenticated user context."""
+        if not session_id or not isinstance(session_id, str):
+            return {
+                "status": "FAILED",
+                "reason": "MISSING_SESSION_ID",
+            }
 
-                if not session_id or not isinstance(session_id,str):
-                    return {
-                        "status":"FAILED",
-                        "reason":"MISSING_SESSION_ID"
-                    }
+        session = self.session_store.get_session(session_id)
+        if not session:
+            return {
+                "status": "FAILED",
+                "reason": "SESSION_EXPIRED",
+            }
 
-                session=self.session_store.get_session(session_id)
-                if not session:
-                    return{
-                        "status":"FAILED",
-                        "reason":"SESSION_EXPIRED"
-                    }
-                user_id=session.get("user_id")
-                user=self.user_repo.get_by_id(user_id)
-                #check if user account is still active in the Database
-                if not user:
-                    return{
-                        "status":"FAILED",
-                        "reason":"USER_NOT_FOUND"
-                    }
-                if not user.get("is_active",1):
-                    return{
-                        "status":"FAILED",
-                        "reason":"ACCOUNT_INACTIVE"
-                    }
-                self.session_store.refresh_session_ttl(session_id)
-                return{
-                    "status":"SUCCESS",
-                    "user_id":user_id,
-                    "username":user.get("username"),
-                    "created_at":session.get("created_at"),
-                    "data":session.get("data",{})
-                }
+        user_id = session.get("user_id")
+        user = self.user_repo.get_by_id(user_id)
+        if not user:
+            return {
+                "status": "FAILED",
+                "reason": "USER_NOT_FOUND",
+            }
+        if not user.get("is_active", 1):
+            return {
+                "status": "FAILED",
+                "reason": "ACCOUNT_INACTIVE",
+            }
+
+        self.session_store.refresh_session_ttl(session_id)
+        return {
+            "status": "SUCCESS",
+            "user_id": user_id,
+            "username": user.get("username"),
+            "created_at": session.get("created_at"),
+            "data": session.get("data", {}),
+        }
+
     def initiate_mfa_challenge(
         self,
         user_id: str,
         challenge_type: str = "totp",
     ) -> Dict[str, Any]:
-        """Create and record an active pending MFA challenge during an in-progress authentication flow."""
-        user=self.user_repo.get_by_id(user_id)
+        """Create and record an active pending MFA challenge in Redis with 5-minute TTL."""
+        user = self.user_repo.get_by_id(user_id)
         if not user:
             raise ValueError("User not found")
-        metadata=user.get("metadata",{})
-        if isinstance(metadata,str):
+
+        metadata = user.get("metadata", {})
+        if isinstance(metadata, str):
             try:
-                metadata=json.loads(metadata)
+                metadata = json.loads(metadata)
             except Exception:
-                metadata={}
+                metadata = {}
+
         if not metadata.get("mfa_secret"):
             raise ValueError("User does not have MFA configured")
 
-        challenge_id=str(uuid.uuid4())
-        now=datetime.now(timezone.utc)
-        expires_at=now+timedelta(minutes=5)
-        self._pending_mfa_challenges[challenge_id]={
-            "user_id":str(user_id),
-            "challenge_type":challenge_type,
-            "created_at":now.isoformat(),
-            "expires_at":expires_at.isoformat(),
-            "attempts":0
+        challenge_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(minutes=5)
+
+        challenge_data = {
+            "user_id": str(user_id),
+            "challenge_type": challenge_type,
+            "created_at": now.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "attempts": 0,
         }
 
-        return{
-            "challenge_id":challenge_id,
-            "expires_at":expires_at.isoformat(),
-            "challenge_type":challenge_type
-        }
+        # Store challenge in Redis with 300s TTL
+        self._save_mfa_challenge(challenge_id, challenge_data, ttl_seconds=300)
 
+        return {
+            "challenge_id": challenge_id,
+            "expires_at": expires_at.isoformat(),
+            "challenge_type": challenge_type,
+        }
 
     def complete_mfa_challenge(
         self,
@@ -360,84 +427,99 @@ class Authenticator(abstractAuthenticator):
         challenge_id: str,
         response_code: str,
     ) -> Dict[str, Any]:
-        """Validate a submitted second-factor code to finalize an authentication workflow."""
-        user=self.user_repo.get_by_id(user_id)
+        """Validate a submitted second-factor code against the Redis-backed challenge."""
+        user = self.user_repo.get_by_id(user_id)
         if not user:
-            return{
-                "status":"FAILED",
-                "reason":"USER_NOT_FOUND"
-            }
-        if challenge_id not in self._pending_mfa_challenges:
             return {
-                "status":"FAILED",
-                "reason":"MFA_CHALLENGE_DOES_NOT_EXIST"
+                "status": "FAILED",
+                "reason": "USER_NOT_FOUND",
             }
-        challenge=self._pending_mfa_challenges[challenge_id]
-        if challenge["user_id"]!=str(user_id):
-            return{
-                "status":"FAILED",
-                "reason":"CHALLENGE_USER_MISMATCH"
+
+        challenge = self._get_mfa_challenge(challenge_id)
+        if not challenge:
+            return {
+                "status": "FAILED",
+                "reason": "MFA_CHALLENGE_DOES_NOT_EXIST",
+            }
+
+        if challenge["user_id"] != str(user_id):
+            return {
+                "status": "FAILED",
+                "reason": "CHALLENGE_USER_MISMATCH",
             }
 
         now = datetime.now(timezone.utc)
-        expires_at=datetime.fromisoformat(challenge["expires_at"])    
+        expires_at = datetime.fromisoformat(challenge["expires_at"])
         if now > expires_at:
-            del self._pending_mfa_challenges[challenge_id]
-            return{
-                "status":"FAILED",
-                "reason":"MFA_CHALLENGE_EXPIRED"
+            self._delete_mfa_challenge(challenge_id)
+            return {
+                "status": "FAILED",
+                "reason": "MFA_CHALLENGE_EXPIRED",
             }
-        metadata=user.get("metadata",{})
-        if isinstance(metadata,str):
+
+        metadata = user.get("metadata", {})
+        if isinstance(metadata, str):
             try:
-                metadata=json.loads(metadata)
+                metadata = json.loads(metadata)
             except Exception:
-                metadata={}
+                metadata = {}
+
         if not metadata.get("mfa_secret"):
-            return{
-                "status":"FAILED",
-                "reason":"MFA_NOT_CONFIGURED"
+            return {
+                "status": "FAILED",
+                "reason": "MFA_NOT_CONFIGURED",
             }
-        backup_codes=metadata.get("backup_codes",[])
-        is_valid=self.mfa_provider.verify_totp_code(metadata["mfa_secret"],response_code)
-        
+
+        backup_codes = metadata.get("backup_codes", [])
+        is_valid = self.mfa_provider.verify_totp_code(metadata["mfa_secret"], response_code)
+
         if not is_valid and backup_codes:
-            is_valid,remaining_codes=self.mfa_provider.verify_and_consume_backup_code(response_code,backup_codes)
+            is_valid, remaining_codes = self.mfa_provider.verify_and_consume_backup_code(
+                response_code, backup_codes
+            )
             if is_valid:
-                metadata["backup_codes"]=remaining_codes
-                self.user_repo.update_user(user["id"],{"metadata":metadata})
+                metadata["backup_codes"] = remaining_codes
+                self.user_repo.update_user(user["id"], {"metadata": metadata})
+
         if not is_valid:
-            challenge["attempts"]+=1
-            if challenge["attempts"]>=3:
-                del self._pending_mfa_challenges[challenge_id]
+            challenge["attempts"] += 1
+            if challenge["attempts"] >= 3:
+                self._delete_mfa_challenge(challenge_id)
                 return {
-                    "status":"FAILED",
-                    "reason":"MFA_ATTEMPTS_EXCEEDED"
+                    "status": "FAILED",
+                    "reason": "MFA_ATTEMPTS_EXCEEDED",
                 }
-            return{
-                "status":"FAILED",
-                "reason":"INVALID_MFA_CODE"
+            self._save_mfa_challenge(challenge_id, challenge, ttl_seconds=300)
+            return {
+                "status": "FAILED",
+                "reason": "INVALID_MFA_CODE",
             }
-        del self._pending_mfa_challenges[challenge_id]
-        roles=user.get("roles",[])
-        if isinstance(roles,str):
+
+        # Challenge passed: delete challenge record
+        self._delete_mfa_challenge(challenge_id)
+
+        roles = user.get("roles", [])
+        if isinstance(roles, str):
             try:
-                roles=json.loads(roles)
+                roles = json.loads(roles)
             except Exception:
-                roles=[]
-        access_token=self.token_service.create_access_token(user["id"],claims={"roles":roles})
-        refresh_token=self.token_service.create_refresh_token(user["id"],claims={"roles":roles})
-        session_id=self.session_store.create_session(user["id"],session_data={"roles":roles})
-        return{
-            "status":"SUCCESS",
-            "user_id":user["id"],
-            "access_token":access_token,
-            "refresh_token":refresh_token,
-            "session_id":session_id,
-            "user":{
-                "id":user["id"],
-                "username":user["username"],
-                "email":user["email"],
-                "roles":roles,
-            }
-        }        
+                roles = []
+
+        access_token = self.token_service.create_access_token(user["id"], claims={"roles": roles})
+        refresh_token = self.token_service.create_refresh_token(user["id"], claims={"roles": roles})
+        session_id = self.session_store.create_session(user["id"], session_data={"roles": roles})
+
+        return {
+            "status": "SUCCESS",
+            "user_id": user["id"],
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "session_id": session_id,
+            "user": {
+                "id": user["id"],
+                "username": user["username"],
+                "email": user["email"],
+                "roles": roles,
+            },
+        }
+        

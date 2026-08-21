@@ -142,16 +142,21 @@ class abstractAuditLogger(ABC):
         ...
 
 class AuditLogger(abstractAuditLogger):
-    def __init__(self,db_file:str="DATABASE.db"):
-        self.db_file=db_file
+    def __init__(self, db_file: str = "DATABASE.db"):
+        self.db_file = db_file
         self._create_table()
-    def _get_connection(self)->sqlite3.Connection:
-        conn=sqlite3.connect(self.db_file)
-        conn.row_factory=sqlite3.Row
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_file, timeout=10.0)
+        conn.row_factory = sqlite3.Row
         return conn
-    def _create_table(self)->None:
-        """Create audit_logs table if it doesn't already exist"""
+
+    def _create_table(self) -> None:
+        """Create audit_logs table and configure WAL mode if it doesn't already exist."""
         with self._get_connection() as conn:
+            if self.db_file != ":memory:":
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
             conn.executescript("""
         CREATE TABLE IF NOT EXISTS audit_logs(
             id TEXT PRIMARY KEY,
@@ -170,6 +175,7 @@ class AuditLogger(abstractAuditLogger):
         CREATE INDEX IF NOT EXISTS idx_audit_event ON audit_logs(event_type);
         CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
         """)
+
 
     def _insert_event(
         self,
@@ -324,3 +330,6 @@ class AuditLogger(abstractAuditLogger):
                         pass
                 results.append(record)
         return results
+
+
+concreteAuditLogger = AuditLogger
