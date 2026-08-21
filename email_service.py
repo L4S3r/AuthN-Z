@@ -7,15 +7,18 @@ and credential recovery. Supports production SMTP and development logging fallba
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 import logging
 import os
 import smtplib
+import uuid
 from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
 logger = logging.getLogger("auth_nz.email_service")
+
 
 
 class EmailService:
@@ -145,8 +148,14 @@ https://l4s3r.site
                 msg["Subject"] = subject
                 msg["From"] = self.smtp_from
                 msg["To"] = recipient_email
-                msg.attach(MIMEText(text_content, "plain"))
-                msg.attach(MIMEText(html_content, "html"))
+                msg["Date"] = formatdate(localtime=True)
+                msg["Message-ID"] = make_msgid(domain="l4s3r.site")
+                msg["Reply-To"] = self.smtp_from
+                msg["Auto-Submitted"] = "auto-generated"
+                msg["X-Mailer"] = "AuthNZ-Gateway/1.0"
+                msg.attach(MIMEText(text_content, "plain", "utf-8"))
+                msg.attach(MIMEText(html_content, "html", "utf-8"))
+
 
                 if self.smtp_port == 465:
                     server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=12.0)
