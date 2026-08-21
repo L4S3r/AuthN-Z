@@ -817,9 +817,10 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
     session_id = sess_store.create_session(user["id"], session_data={"roles": roles})
 
 
-    safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    safe_metadata = dict(user_meta) if isinstance(user_meta, dict) else {}
     safe_metadata.pop("mfa_secret", None)
     safe_metadata.pop("backup_codes", None)
+
 
     audit_log.record_auth_success(user["id"], f"oauth_{provider}", ip_address=client_ip)
 
@@ -1114,7 +1115,33 @@ async def delete_task(
     task_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Delete a task card from the workspace."""
+    """Delete a task card from the workspace. Requires task creator or admin role."""
+    existing_task = task_repo.get_task(task_id)
+    if not existing_task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found.",
+        )
+
+    user = repo.get_by_id(current_user["user_id"])
+    caller_email = user["email"].strip().lower() if user and user.get("email") else ""
+    task_creator = (existing_task.get("created_by") or "").strip().lower()
+
+    is_creator = bool(caller_email and caller_email == task_creator)
+    is_admin = perm_eval.has_role(current_user["user_id"], "admin")
+
+    if not (is_creator or is_admin):
+        audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="delete",
+            resource=f"tasks/{task_id}",
+            reason="CREATOR_OR_ADMIN_ROLE_REQUIRED",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Only the task creator or a workspace admin may delete this task.",
+        )
+
     deleted = task_repo.delete_task(task_id)
     if not deleted:
         raise HTTPException(
@@ -1122,6 +1149,7 @@ async def delete_task(
             detail="Task not found.",
         )
     return {"status": "SUCCESS", "deleted_task_id": task_id}
+
 
 
 # =============================================================================
@@ -1141,7 +1169,19 @@ async def invite_team_member(
     req: TeamInviteRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Invite a new colleague to the team workspace with email notification."""
+    """Invite a new colleague to the team workspace with email notification. Requires 'admin' role."""
+    if not perm_eval.has_role(current_user["user_id"], "admin"):
+        audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="invite",
+            resource="team_members",
+            reason="ADMIN_ROLE_REQUIRED",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Admin role required to invite team members.",
+        )
+
     admin_user = repo.get_by_id(current_user["user_id"])
     invited_by_name = admin_user["username"] if admin_user else "Admin"
 
@@ -1152,6 +1192,7 @@ async def invite_team_member(
         department=req.department or "General",
         invited_by=invited_by_name,
     )
+
 
     # Dispatch branded invitation email
     email_res = email_svc.send_invitation_email(

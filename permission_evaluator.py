@@ -278,7 +278,7 @@ class PermissionEvaluator(abstractPermissionEvaluator):
         #admin override
         if subject_attributes.get("role") == "admin" or "admin" in subject_attributes.get("roles",[]):
             return True
-        #department match
+        #department match with security clearance check
         sub_dept=subject_attributes.get("department")
         res_dept=resource_attributes.get("department")
         if sub_dept and res_dept and sub_dept.lower() == res_dept.lower():
@@ -286,9 +286,7 @@ class PermissionEvaluator(abstractPermissionEvaluator):
             required_clearance=resource_attributes.get("required_clearance",1)
             if user_clearance>=required_clearance:
                 return True
-        #security clearance
-        if subject_attributes.get("clearance",0) >= resource_attributes.get("required_clearance",1):
-            return True
+
         #environmental constraints
         if environment_attributes and environment_attributes.get("mfa_required"):
             if not environment_attributes.get("mfa_verified",False):
