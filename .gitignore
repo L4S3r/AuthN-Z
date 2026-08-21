@@ -1,0 +1,6 @@
+*.env
+*.db
+*_unittest.py
+*_list.md
+*demo.py
+
