@@ -73,9 +73,11 @@ class SessionStore(abstractSessionStore):
         self._in_memory_sessions: Dict[str, Dict[str, Any]] = {}
         self._in_memory_user_index: Dict[str, Set[str]] = {}
 
+        if host == "localhost":
+            host = "127.0.0.1"
         if redis is not None:
             try:
-                self.r = redis.Redis(host=host, port=port, db=db, decode_responses=True)
+                self.r = redis.Redis(host=host, port=port, db=db, decode_responses=True, socket_connect_timeout=0.5, socket_timeout=0.5)
                 self.r.ping()
             except Exception as exc:
                 logger.warning(
