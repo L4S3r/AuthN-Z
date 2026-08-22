@@ -135,6 +135,7 @@ class GoogleOAuth2Provider(abstractOAuth2Provider):
                 "email": info.get("email"),
                 "email_verified": info.get("email_verified", False),
                 "name": info.get("name"),
+                "username": info.get("preferred_username") or (info.get("email", "").split("@")[0] if info.get("email") else None),
                 "picture": info.get("picture"),
             }
 
@@ -223,6 +224,7 @@ class GitHubOAuth2Provider(abstractOAuth2Provider):
                 "email": email,
                 "email_verified": email_verified,
                 "name": user_data.get("name") or user_data.get("login"),
+                "username": user_data.get("login"),
                 "picture": user_data.get("avatar_url"),
             }
 

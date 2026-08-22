@@ -958,7 +958,8 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
             metadata["avatar_url"] = profile["picture"]
         repo.update_user(user["id"], {"metadata": metadata})
     else:
-        base_username = email.split("@")[0].lower()
+        preferred = profile.get("username") or profile.get("login") or email.split("@")[0]
+        base_username = str(preferred).strip().lower()
         clean_username = "".join(c for c in base_username if c.isalnum() or c in ("_", "-"))
         if len(clean_username) < 3:
             clean_username = f"user_{secrets.token_hex(4)}"
