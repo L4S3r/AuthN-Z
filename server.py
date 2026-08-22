@@ -884,9 +884,13 @@ async def get_protected_document(
 async def get_audit_trail(
     limit: int = 50,
     offset: int = 0,
+    event_type: Optional[str] = None,
+    severity: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    subject_id: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Query security audit telemetry records. Requires 'admin' role."""
+    """Query security audit telemetry records. Requires 'admin' or 'superadmin' role."""
     if not perm_eval.has_role(current_user["user_id"], "admin"):
         audit_log.record_access_denial(
             subject_id=current_user["user_id"],
@@ -899,8 +903,23 @@ async def get_audit_trail(
             detail="Access denied: Admin role required to query audit logs.",
         )
 
-    logs = audit_log.query_events({}, limit=limit, offset=offset)
-    return {"status": "SUCCESS", "count": len(logs), "logs": logs}
+    filters = {}
+    if event_type:
+        filters["event_type"] = event_type
+    if severity:
+        filters["severity"] = severity.upper()
+    if workspace_id:
+        filters["workspace_id"] = ws_repo._resolve_ws_id(workspace_id)
+    if subject_id:
+        filters["subject_id"] = subject_id
+
+    logs = audit_log.query_events(filters, limit=min(limit, 200), offset=offset)
+    return {
+        "status": "SUCCESS",
+        "count": len(logs),
+        "logs": logs,
+        "audit_logs": logs,
+    }
 
 
 # =============================================================================
@@ -2192,35 +2211,43 @@ async def get_workspace_audit_logs(
     offset: int = 0,
     event_type: Optional[str] = None,
     severity: Optional[str] = None,
+    include_global: bool = True,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Retrieve security audit telemetry for a specific workspace. Requires Workspace Admin or Superadmin."""
-    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    ws_id = ws_repo._resolve_ws_id(workspace_id)
+    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
     if not is_admin:
         audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="view_audit_logs",
-            resource=f"workspaces/{workspace_id}/audit-logs",
+            resource=f"workspaces/{ws_id}/audit-logs",
             reason="ADMIN_ROLE_REQUIRED",
-            workspace_id=workspace_id,
+            workspace_id=ws_id,
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: Workspace Admin or Superadmin role required to view audit logs.",
         )
 
-    filters = {"workspace_id": workspace_id}
+    filters = {"workspace_id": ws_id}
     if event_type:
         filters["event_type"] = event_type
     if severity:
         filters["severity"] = severity.upper()
 
-    logs = audit_log.query_events(filters, limit=min(limit, 200), offset=offset)
+    logs = audit_log.query_events(
+        filters,
+        limit=min(limit, 200),
+        offset=offset,
+        include_global=include_global,
+    )
     return {
         "status": "SUCCESS",
-        "workspace_id": workspace_id,
+        "workspace_id": ws_id,
         "count": len(logs),
         "audit_logs": logs,
+        "logs": logs,
     }
 
 

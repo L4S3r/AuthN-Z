@@ -259,6 +259,7 @@ class AuditLogger(abstractAuditLogger):
         filter_criteria: Dict[str, Any],
         limit: int = 100,
         offset: int = 0,
+        include_global: bool = False,
     ) -> List[Dict[str, Any]]:
         """Retrieve historical audit log records matching specific filtering criteria."""
         allowed_columns = {
@@ -275,8 +276,19 @@ class AuditLogger(abstractAuditLogger):
         conditions = []
         params = []
 
+        inc_global = include_global or (filter_criteria and filter_criteria.get("include_global", False))
+
         for key, val in (filter_criteria or {}).items():
-            if key in allowed_columns and val is not None:
+            if key == "include_global":
+                continue
+            if key == "workspace_id" and val is not None:
+                if inc_global:
+                    conditions.append("(workspace_id = ? OR workspace_id IS NULL OR workspace_id = '')")
+                    params.append(val)
+                else:
+                    conditions.append("workspace_id = ?")
+                    params.append(val)
+            elif key in allowed_columns and val is not None:
                 conditions.append(f"{key} = ?")
                 params.append(val)
 
@@ -284,7 +296,7 @@ class AuditLogger(abstractAuditLogger):
             query += " WHERE " + " AND ".join(conditions)
 
         # Reverse-chronological order
-        query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+        query += " ORDER BY datetime(timestamp) DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
         with self._get_connection() as conn:
