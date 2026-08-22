@@ -296,47 +296,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                         lm_dict.get("invited_at") or now,
                     ))
 
-            # Also ensure all registered users are active members of ws_default
-            if has_users_table:
-                cursor.execute("SELECT id, email, username, roles, metadata, created_at FROM users")
-                all_users = cursor.fetchall()
-                for u in all_users:
-                    u_email = u["email"].strip().lower()
-                    roles_raw = u["roles"]
-                    roles_list = []
-                    if isinstance(roles_raw, str):
-                        try:
-                            roles_list = json.loads(roles_raw)
-                        except Exception:
-                            roles_list = []
-                    role = "admin" if "admin" in roles_list else ("editor" if "editor" in roles_list else "viewer")
-
-                    meta_raw = u["metadata"]
-                    meta = {}
-                    if isinstance(meta_raw, str):
-                        try:
-                            meta = json.loads(meta_raw)
-                        except Exception:
-                            meta = {}
-
-                    name = meta.get("name") or u["username"]
-                    dept = meta.get("department", "General")
-
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO workspace_members (
-                            id, workspace_id, user_id, email, name, role, department, status, invited_by, invited_at
-                        ) VALUES (?, 'ws_default', ?, ?, ?, ?, ?, 'active', 'system', ?)
-                    """, (
-                        str(uuid.uuid4()),
-                        u["id"],
-                        u_email,
-                        name,
-                        role,
-                        dept,
-                        u["created_at"] or now,
-                    ))
-
-            # Migrate tasks without workspace_id
+            # Migrate legacy tasks without workspace_id
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
             if cursor.fetchone():
                 cursor.execute("UPDATE tasks SET workspace_id = 'ws_default' WHERE workspace_id IS NULL OR workspace_id = ''")
@@ -536,6 +496,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
 
     def _format_workspace(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         """Format workspace record for API response."""
+        role = raw.get("member_role") or raw.get("role")
         return {
             "id": raw["id"],
             "name": raw["name"],
@@ -544,7 +505,8 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             "created_by": raw["created_by"],
             "created_at": raw["created_at"],
             "updated_at": raw.get("updated_at", raw["created_at"]),
-            "member_role": raw.get("member_role"),
+            "role": role,
+            "member_role": role,
             "member_status": raw.get("member_status"),
             "member_department": raw.get("member_department"),
             "member_count": raw.get("member_count"),
