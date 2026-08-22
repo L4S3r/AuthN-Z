@@ -1,15 +1,15 @@
 """
 Auth N&Z - User Promotion Utility (promote_admin.py)
 ---------------------------------------------------
-Promotes an existing registered user account to the administrator role,
-assigns security clearance, and records an audit event.
+Promotes an existing registered user account to Superadmin or Administrator role,
+assigns security clearance, and records a structured audit event.
 
 Usage (Interactive):
     python promote_admin.py
 
-Usage (CLI Argument):
-    python promote_admin.py -i your_username_or_email
-    python promote_admin.py --identifier admin@l4s3r.site --clearance 3 --department Security
+Usage (CLI Arguments):
+    python promote_admin.py -i admin@l4s3r.site --super
+    python promote_admin.py -i user@l4s3r.site --role superadmin --clearance 3 --department Security
 """
 
 import argparse
@@ -24,14 +24,22 @@ from audit_logger import AuditLogger
 def promote_user_to_admin(
     identifier: str,
     db_file: str = "DATABASE.db",
+    role: str = "admin",
     department: str = "Security",
     clearance: int = 3,
 ) -> Optional[dict]:
-    """Promote an existing user to administrator role with clearance level."""
+    """Promote an existing user to administrator or superadmin role with clearance level."""
     clean_id = identifier.strip()
     if not clean_id:
         print("Error: Identifier cannot be empty.", file=sys.stderr)
         return None
+
+    # Normalize role
+    clean_role = role.strip().lower()
+    if clean_role in ("super-admin", "super_admin", "superadmin", "root"):
+        target_role = "superadmin"
+    else:
+        target_role = clean_role
 
     repo = UserRepository(db_file=db_file)
     audit = AuditLogger(db_file=db_file)
@@ -48,8 +56,9 @@ def promote_user_to_admin(
             roles = json.loads(roles)
         except Exception:
             roles = []
-    if "admin" not in roles:
-        roles.append("admin")
+
+    if target_role not in roles:
+        roles.append(target_role)
 
     # Parse and update metadata
     metadata = user.get("metadata", {})
@@ -82,6 +91,7 @@ def promote_user_to_admin(
         details={
             "user_id": user["id"],
             "username": user["username"],
+            "target_role": target_role,
             "roles": roles,
             "clearance": clearance,
             "source": "CLI_PROMOTE_SCRIPT",
@@ -94,13 +104,26 @@ def promote_user_to_admin(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Auth N&Z - Promote Existing User to Administrator"
+        description="Auth N&Z - Promote Existing User to Superadmin or Administrator"
     )
     parser.add_argument(
         "--identifier",
         "-i",
         type=str,
         help="Username or email address of the existing user",
+    )
+    parser.add_argument(
+        "--role",
+        "-r",
+        type=str,
+        default="admin",
+        help="Role to assign: admin, superadmin, developer, editor, viewer (default: admin)",
+    )
+    parser.add_argument(
+        "--super",
+        "-s",
+        action="store_true",
+        help="Shorthand flag to promote directly to superadmin role",
     )
     parser.add_argument(
         "--db",
@@ -130,15 +153,18 @@ def main():
         print("--- Auth N&Z User Promotion Utility ---")
         identifier = input("Enter username or email of existing user: ").strip()
 
+    target_role = "superadmin" if args.super else args.role
+
     result = promote_user_to_admin(
         identifier=identifier,
         db_file=args.db,
+        role=target_role,
         department=args.department,
         clearance=args.clearance,
     )
 
     if result:
-        print("\nUser successfully promoted to administrator.")
+        print(f"\nUser successfully promoted with '{target_role}' clearance.")
         print(f"User ID:     {result['id']}")
         print(f"Username:    {result['username']}")
         print(f"Email:       {result['email']}")

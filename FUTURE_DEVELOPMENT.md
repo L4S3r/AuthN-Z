@@ -72,12 +72,15 @@ Detect credential stuffing, distributed brute-force attacks, and compromised cre
 
 ---
 
-## 6. Multi-Tenancy and Scoped Permissions
+## 6. Multi-Tenancy and Scoped Permissions (COMPLETED)
 
 ### Objective
-Support SaaS multi-tenant environments with isolated organization boundaries.
+Support SaaS multi-tenant environments with isolated organization boundaries, custom team workspaces, and scoped role clearances.
 
-### Implementation Plan
-1. Add `tenant_id` column to `users`, `audit_logs`, and session state.
-2. Introduce scoped role assignments in `PermissionEvaluator` (e.g. user is `admin` in `org_1`, but `viewer` in `org_2`).
-3. Enforce tenant isolation middleware to prevent cross-tenant data leakage.
+### Status
+Implemented and active via `workspace_repository.py`, `permission_evaluator.py`, `audit_logger.py`, and `server.py`:
+- `WorkspaceRepository` providing multi-workspace provisioning, cryptographic invite tokens, member role management, and migration.
+- Scoped RBAC in `PermissionEvaluator` (`superadmin` > `admin` > `editor` > `viewer`) evaluated per workspace scope.
+- REST endpoints for Workspace CRUD, member onboarding, and contextual workspace switching (`POST /auth/workspaces/switch`).
+- Workspace-scoped audit logging telemetry in `AuditLogger` (`GET /workspaces/{id}/audit-logs`).
+- Task gateway authorization enforcing that only Editors, Admins, and Superadmins can create, edit, or delete sprint tasks.

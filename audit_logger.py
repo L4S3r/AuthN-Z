@@ -1,22 +1,17 @@
 """
-Component Role: Security Audit Logger
--------------------------------------
-This component provides structured, tamper-evident recording of security-critical identity,
-authentication, and authorization events for compliance, incident response, and anomaly detection.
-
-System Relationship:
-Both the Authenticator (login attempts, logouts, MFA challenges, account lockouts) and the
-PermissionEvaluator (access denials, privileged actions) trigger this component to record events.
-It sits alongside all operational components to ensure comprehensive visibility without coupling
-to storage mechanisms (e.g., SIEM, Elasticsearch, CloudWatch, append-only logs).
+Component Role: Security Audit Logger (audit_logger.py)
+------------------------------------------------------
+Provides structured, tamper-evident recording of security-critical identity,
+authentication, authorization, and multi-tenant workspace events.
 """
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
-from datetime import datetime,timezone
+from datetime import datetime, timezone
 import json
 import sqlite3
 import uuid
+
 
 class abstractAuditLogger(ABC):
     """Abstract interface defining structured audit event logging, security telemetry, and historical querying."""
@@ -29,22 +24,10 @@ class abstractAuditLogger(ABC):
         ip_address: Optional[str] = None,
         user_agent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        workspace_id: Optional[str] = None,
     ) -> None:
-        """
-        Record a successful authentication event.
-
-        Args:
-            subject_id: Unique identifier of the authenticated user.
-            method: The authentication mechanism used (e.g., 'password', 'oauth2_google', 'session_cookie', 'mfa_totp').
-            ip_address: Client IP address from which the request originated.
-            user_agent: Client user-agent string.
-            metadata: Additional non-sensitive operational details (e.g., tenant ID, session ID).
-
-        Edge Cases to Consider:
-            - Masking or excluding sensitive parameters (NEVER log plaintext passwords, session tokens, or OTP codes).
-            - Asynchronous emission to ensure auditing does not introduce significant latency to the login path.
-        """
-        ...
+        """Record a successful authentication event."""
+        pass
 
     @abstractmethod
     def record_auth_failure(
@@ -54,22 +37,10 @@ class abstractAuditLogger(ABC):
         ip_address: Optional[str] = None,
         user_agent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        workspace_id: Optional[str] = None,
     ) -> None:
-        """
-        Record a failed authentication attempt.
-
-        Args:
-            identifier: The claimed username, email, or identity handle attempted.
-            reason: Specific code or description of failure (e.g., 'INVALID_PASSWORD', 'USER_NOT_FOUND', 'MFA_TIMEOUT').
-            ip_address: Client IP address from which the request originated.
-            user_agent: Client user-agent string.
-            metadata: Additional context for forensics.
-
-        Edge Cases to Consider:
-            - User enumeration risks: Ensure internal failure details logged here are distinct from user-facing generic errors.
-            - Defense against log injection attacks (sanitizing malformed input in identifier).
-        """
-        ...
+        """Record a failed authentication attempt."""
+        pass
 
     @abstractmethod
     def record_access_denial(
@@ -79,22 +50,10 @@ class abstractAuditLogger(ABC):
         resource: str,
         reason: str,
         metadata: Optional[Dict[str, Any]] = None,
+        workspace_id: Optional[str] = None,
     ) -> None:
-        """
-        Record an authorization denial (403 Forbidden event) when a subject attempts an unauthorized operation.
-
-        Args:
-            subject_id: The identifier of the requesting user.
-            action: The attempted action (e.g., 'delete_database', 'export_financial_records').
-            resource: The resource identifier or URI targeted.
-            reason: Policy reason for denial (e.g., 'MISSING_ROLE_ADMIN', 'DEPARTMENT_MISMATCH').
-            metadata: Contextual attributes (e.g., IP address, request payload summary).
-
-        Edge Cases to Consider:
-            - High volume denial events caused by automated scanners/crawlers (sampling vs. full logging).
-            - Capturing sufficient context to reproduce access control policy evaluation issues.
-        """
-        ...
+        """Record an authorization denial (403 Forbidden event)."""
+        pass
 
     @abstractmethod
     def record_security_event(
@@ -102,20 +61,10 @@ class abstractAuditLogger(ABC):
         event_name: str,
         severity: str,
         details: Dict[str, Any],
+        workspace_id: Optional[str] = None,
     ) -> None:
-        """
-        Record general security events (e.g., account lockouts, privilege escalation, password changes, token revocations).
-
-        Args:
-            event_name: Standardized event descriptor (e.g., 'ACCOUNT_LOCKED', 'ROLE_GRANTED', 'PASSWORD_RESET').
-            severity: Event severity level ('INFO', 'WARNING', 'ERROR', 'CRITICAL').
-            details: Structured dictionary of event-specific payload information.
-
-        Edge Cases to Consider:
-            - Alert triggering: Routing CRITICAL severity events to real-time alerting systems.
-            - Structured JSON formatting for seamless ingestion into log aggregators and SIEM tools.
-        """
-        ...
+        """Record general security events (e.g., privilege escalation, invitations, workspace CRUD)."""
+        pass
 
     @abstractmethod
     def query_events(
@@ -124,22 +73,9 @@ class abstractAuditLogger(ABC):
         limit: int = 100,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """
-        Retrieve historical audit log records matching specific filtering criteria.
+        """Retrieve historical audit log records matching specific filtering criteria."""
+        pass
 
-        Args:
-            filter_criteria: Dictionary of filter keys (e.g., {'subject_id': '123', 'event_name': 'AUTH_FAILURE'}).
-            limit: Maximum number of records to return.
-            offset: Pagination offset.
-
-        Returns:
-            A list of matching audit event records in reverse-chronological order.
-
-        Edge Cases to Consider:
-            - Access control on the audit log itself: Only authorized compliance/security roles should query this method.
-            - Handling large result sets efficiently via streaming or cursor-based pagination.
-        """
-        ...
 
 class AuditLogger(abstractAuditLogger):
     def __init__(self, db_file: str = "DATABASE.db"):
@@ -152,55 +88,69 @@ class AuditLogger(abstractAuditLogger):
         return conn
 
     def _create_table(self) -> None:
-        """Create audit_logs table and configure WAL mode if it doesn't already exist."""
+        """Create audit_logs table, configure WAL mode, and ensure workspace_id column exists."""
         with self._get_connection() as conn:
             if self.db_file != ":memory:":
                 conn.execute("PRAGMA journal_mode=WAL;")
                 conn.execute("PRAGMA synchronous=NORMAL;")
             conn.executescript("""
-        CREATE TABLE IF NOT EXISTS audit_logs(
-            id TEXT PRIMARY KEY,
-            event_type TEXT NOT NULL,
-            severity TEXT DEFAULT 'INFO',
-            subject_id TEXT,
-            action TEXT,
-            resource TEXT,
-            reason TEXT,
-            ip_address TEXT,
-            user_agent TEXT,
-            metadata TEXT DEFAULT '{}',
-            timestamp TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_logs(subject_id);
-        CREATE INDEX IF NOT EXISTS idx_audit_event ON audit_logs(event_type);
-        CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
-        """)
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT,
+                event_type TEXT NOT NULL,
+                severity TEXT DEFAULT 'INFO',
+                subject_id TEXT,
+                action TEXT,
+                resource TEXT,
+                reason TEXT,
+                ip_address TEXT,
+                user_agent TEXT,
+                metadata TEXT DEFAULT '{}',
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_logs(subject_id);
+            CREATE INDEX IF NOT EXISTS idx_audit_event ON audit_logs(event_type);
+            CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
+            """)
 
+            # Schema migration check: ensure workspace_id column exists in pre-existing DBs
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(audit_logs)")
+            cols = [c["name"] for c in cursor.fetchall()]
+            if "workspace_id" not in cols:
+                cursor.execute("ALTER TABLE audit_logs ADD COLUMN workspace_id TEXT")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_workspace ON audit_logs(workspace_id)")
+            conn.commit()
 
     def _insert_event(
         self,
-        event_type:str,
-        severity:str,
-        subject_id:Optional[str]=None,
-        action:Optional[str]=None,
-        resource:Optional[str]=None,
-        reason:Optional[str]=None,
-        ip_address:Optional[str]=None,
-        user_agent:Optional[str]=None,
-        metadata:Optional[Dict[str,Any]]=None
-    )-> None:
+        event_type: str,
+        severity: str,
+        subject_id: Optional[str] = None,
+        action: Optional[str] = None,
+        resource: Optional[str] = None,
+        reason: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        workspace_id: Optional[str] = None,
+    ) -> None:
         """Helper to insert a structured audit record."""
-        meta_json=json.dumps(metadata or {})
+        meta = dict(metadata or {})
+        ws_id = workspace_id or meta.get("workspace_id")
+        meta_json = json.dumps(meta)
+
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO audit_logs(
-                id,event_type,severity,subject_id,action,resource,reason,
-                ip_address,user_agent,metadata
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO audit_logs (
+                    id, workspace_id, event_type, severity, subject_id, action, resource, reason,
+                    ip_address, user_agent, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
+                    ws_id,
                     event_type,
                     severity,
                     subject_id,
@@ -209,9 +159,11 @@ class AuditLogger(abstractAuditLogger):
                     reason,
                     ip_address,
                     user_agent,
-                    meta_json
+                    meta_json,
                 ),
             )
+            conn.commit()
+
     def record_auth_success(
         self,
         subject_id: str,
@@ -219,10 +171,11 @@ class AuditLogger(abstractAuditLogger):
         ip_address: Optional[str] = None,
         user_agent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        workspace_id: Optional[str] = None,
     ) -> None:
         """Record a successful authentication event."""
-        extra_meta=dict(metadata or {})
-        extra_meta["auth_method"]=method
+        extra_meta = dict(metadata or {})
+        extra_meta["auth_method"] = method
         self._insert_event(
             event_type="AUTH_SUCCESS",
             severity="INFO",
@@ -231,8 +184,10 @@ class AuditLogger(abstractAuditLogger):
             resource="auth_system",
             ip_address=ip_address,
             user_agent=user_agent,
-            metadata=extra_meta
+            metadata=extra_meta,
+            workspace_id=workspace_id,
         )
+
     def record_auth_failure(
         self,
         identifier: str,
@@ -240,6 +195,7 @@ class AuditLogger(abstractAuditLogger):
         ip_address: Optional[str] = None,
         user_agent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        workspace_id: Optional[str] = None,
     ) -> None:
         """Record a failed authentication attempt."""
         self._insert_event(
@@ -251,8 +207,10 @@ class AuditLogger(abstractAuditLogger):
             reason=reason,
             ip_address=ip_address,
             user_agent=user_agent,
-            metadata=metadata or {}
+            metadata=metadata or {},
+            workspace_id=workspace_id,
         )
+
     def record_access_denial(
         self,
         subject_id: str,
@@ -260,8 +218,9 @@ class AuditLogger(abstractAuditLogger):
         resource: str,
         reason: str,
         metadata: Optional[Dict[str, Any]] = None,
+        workspace_id: Optional[str] = None,
     ) -> None:
-        """Record an authorization denial (403 Forbidden event) when a subject attempts an unauthorized operation."""
+        """Record an authorization denial (403 Forbidden event)."""
         self._insert_event(
             event_type="ACCESS_DENIAL",
             severity="WARNING",
@@ -269,26 +228,32 @@ class AuditLogger(abstractAuditLogger):
             action=action,
             resource=resource,
             reason=reason,
-            metadata=metadata or {}
+            metadata=metadata or {},
+            workspace_id=workspace_id,
         )
+
     def record_security_event(
         self,
         event_name: str,
         severity: str,
         details: Dict[str, Any],
+        workspace_id: Optional[str] = None,
     ) -> None:
-        """Record general security events (e.g., account lockouts, privilege escalation, password changes, token revocations)."""
+        """Record general security events (e.g., account lockouts, privilege changes, password changes)."""
+        ws_id = workspace_id or details.get("workspace_id")
         self._insert_event(
             event_type=event_name,
             severity=severity.upper(),
             subject_id=details.get("user_id") or details.get("subject_id"),
-            action=details.get("action",event_name.lower()),
-            resource=details.get("resource","system"),
+            action=details.get("action", event_name.lower()),
+            resource=details.get("resource", "system"),
             reason=details.get("reason"),
             ip_address=details.get("ip_address"),
             user_agent=details.get("user_agent"),
-            metadata=details 
+            metadata=details,
+            workspace_id=ws_id,
         )
+
     def query_events(
         self,
         filter_criteria: Dict[str, Any],
@@ -296,36 +261,40 @@ class AuditLogger(abstractAuditLogger):
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """Retrieve historical audit log records matching specific filtering criteria."""
-        allowed_columns={
+        allowed_columns = {
+            "workspace_id",
             "event_type",
             "severity",
             "subject_id",
             "action",
             "resource",
             "reason",
-            "ip_address"
+            "ip_address",
         }
-        query="SELECT * FROM audit_logs"
-        conditions=[]
-        params=[]
-        for key,val in (filter_criteria or {}).items():
+        query = "SELECT * FROM audit_logs"
+        conditions = []
+        params = []
+
+        for key, val in (filter_criteria or {}).items():
             if key in allowed_columns and val is not None:
-                conditions.append(f"{key}=?")
+                conditions.append(f"{key} = ?")
                 params.append(val)
+
         if conditions:
-            query+= " WHERE "+" AND ".join(conditions)
-        #reverse-chronological order
-        query+=" ORDER BY timestamp DESC LIMIT ? OFFSET ?"
-        params.extend([limit,offset])
+            query += " WHERE " + " AND ".join(conditions)
+
+        # Reverse-chronological order
+        query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
         with self._get_connection() as conn:
-            rows=conn.execute(query,params).fetchall()
-            results=[]
+            rows = conn.execute(query, params).fetchall()
+            results = []
             for row in rows:
-                record=dict(row)
-                #parse json metadata string
-                if isinstance(record.get("metadata"),str):
+                record = dict(row)
+                if isinstance(record.get("metadata"), str):
                     try:
-                        record["metadata"]=json.loads(record["metadata"])
+                        record["metadata"] = json.loads(record["metadata"])
                     except Exception:
                         pass
                 results.append(record)

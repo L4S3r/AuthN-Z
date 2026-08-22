@@ -86,14 +86,18 @@ class TaskRepository:
 
     def list_tasks(
         self,
+        workspace_id: Optional[str] = None,
         status: Optional[str] = None,
         priority: Optional[str] = None,
         assignee_email: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """List tasks with optional filtering."""
+        """List tasks with optional workspace and attribute filtering."""
         query = "SELECT * FROM tasks WHERE 1=1"
         params: List[Any] = []
 
+        if workspace_id:
+            query += " AND (workspace_id = ? OR workspace_id IS NULL)"
+            params.append(workspace_id)
         if status:
             query += " AND status = ?"
             params.append(status)
@@ -122,6 +126,7 @@ class TaskRepository:
 
     def create_task(self, data: Dict[str, Any]) -> Dict[str, Any]:
         task_id = data.get("id") or str(uuid.uuid4())
+        workspace_id = data.get("workspace_id") or "ws_default"
         now = datetime.now(timezone.utc).isoformat()
         tags_json = json.dumps(data.get("tags", []))
 
@@ -141,12 +146,13 @@ class TaskRepository:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO tasks (
-                    id, title, description, status, priority,
+                    id, workspace_id, title, description, status, priority,
                     assignee_email, assignee_name, assignees, created_by,
                     tags, due_date, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_id,
+                workspace_id,
                 data.get("title", "").strip(),
                 data.get("description", "").strip(),
                 data.get("status", "todo"),
@@ -168,7 +174,7 @@ class TaskRepository:
         params = []
         now = datetime.now(timezone.utc).isoformat()
 
-        for key in ["title", "description", "status", "priority", "assignee_email", "assignee_name", "due_date"]:
+        for key in ["title", "description", "status", "priority", "assignee_email", "assignee_name", "due_date", "workspace_id"]:
             if key in updates:
                 fields.append(f"{key} = ?")
                 params.append(updates[key])

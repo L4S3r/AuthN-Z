@@ -103,11 +103,13 @@ app.add_middleware(
 
 from oauth_provider import OAuthManager, generate_pkce_pair, generate_oauth_state
 from task_repository import TaskRepository
+from workspace_repository import WorkspaceRepository
 from email_service import EmailService
 
 # Core Component Singletons
 hasher = concretePasswordHasher()
 repo = concreteUserRepository(db_file="DATABASE.db")
+ws_repo = WorkspaceRepository(db_file="DATABASE.db")
 sess_store = concreteSessionStore()
 token_svc = concreteTokenService(redis_client=sess_store.r)
 mfa_prov = concreteMFAProvider()
@@ -124,7 +126,7 @@ auth = Authenticator(
     mfa_provider=mfa_prov,
 )
 
-perm_eval = PermissionEvaluator(user_repo=repo)
+perm_eval = PermissionEvaluator(user_repo=repo, workspace_repo=ws_repo)
 
 security = HTTPBearer(auto_error=False)
 
@@ -152,6 +154,7 @@ class TaskCreateRequest(BaseModel):
     description: Optional[str] = ""
     status: Optional[str] = "todo"
     priority: Optional[str] = "medium"
+    workspace_id: Optional[str] = "ws_default"
     assignee_email: Optional[str] = None
     assignee_name: Optional[str] = None
     assignees: Optional[List[Dict[str, Any]]] = None
@@ -164,12 +167,46 @@ class TaskUpdateRequest(BaseModel):
     description: Optional[str] = None
     status: Optional[str] = None
     priority: Optional[str] = None
+    workspace_id: Optional[str] = None
     assignee_email: Optional[str] = None
     assignee_name: Optional[str] = None
     assignees: Optional[List[Dict[str, Any]]] = None
     tags: Optional[List[str]] = None
     due_date: Optional[str] = None
 
+
+
+class WorkspaceCreateRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    slug: Optional[str] = None
+    description: Optional[str] = ""
+
+
+class WorkspaceUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    description: Optional[str] = None
+
+
+class WorkspaceInviteRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=100)
+    name: Optional[str] = None
+    role: Optional[str] = "viewer"
+    department: Optional[str] = "General"
+
+
+class WorkspaceRoleUpdateRequest(BaseModel):
+    role: str = Field(..., pattern="^(admin|editor|viewer)$")
+
+
+class WorkspaceAcceptInviteRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+    password: str = Field(..., min_length=8)
+    name: Optional[str] = None
+
+
+class WorkspaceSwitchRequest(BaseModel):
+    workspace_id: str = Field(..., min_length=3)
 
 
 class TeamInviteRequest(BaseModel):
@@ -983,6 +1020,7 @@ async def oauth_exchange_code(
 # =============================================================================
 @app.get("/tasks", tags=["Task Tracker"])
 async def get_tasks(
+    workspace_id: Optional[str] = None,
     status: Optional[str] = None,
     priority: Optional[str] = None,
     assignee_email: Optional[str] = None,
@@ -990,6 +1028,7 @@ async def get_tasks(
 ):
     """Retrieve workspace sprint tasks with optional filtering."""
     tasks = task_repo.list_tasks(
+        workspace_id=workspace_id,
         status=status,
         priority=priority,
         assignee_email=assignee_email,
@@ -1002,7 +1041,22 @@ async def create_task(
     req: TaskCreateRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Create and assign a new team task card, dispatching email notification to all assignees."""
+    """Create and assign a new team task card, dispatching email notification to all assignees. Requires Editor, Admin, or Superadmin role."""
+    ws_id = req.workspace_id or "ws_default"
+
+    # Enforce RBAC: only editors, admins, and superadmins can create tasks
+    if not perm_eval.has_role(current_user["user_id"], "editor", scope=ws_id):
+        audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="create",
+            resource=f"workspaces/{ws_id}/tasks",
+            reason="EDITOR_OR_ADMIN_ROLE_REQUIRED",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Editor, Admin, or Superadmin role required to create tasks.",
+        )
+
     user = repo.get_by_id(current_user["user_id"])
     creator_email = user["email"] if user else current_user["user_id"]
     assigned_by_name = user["username"] if user else "Workspace Admin"
@@ -1018,6 +1072,7 @@ async def create_task(
     primary_name = req.assignee_name or (assignees_list[0]["name"] if assignees_list else (user["username"] if user else "Member"))
 
     new_task = task_repo.create_task({
+        "workspace_id": ws_id,
         "title": req.title.strip(),
         "description": (req.description or "").strip(),
         "status": req.status or "todo",
@@ -1056,12 +1111,27 @@ async def update_task(
     req: TaskUpdateRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Update task card status (Kanban movement), priority, deadline, or assignees."""
+    """Update task card status (Kanban movement), priority, deadline, or assignees. Requires Editor, Admin, or Superadmin role."""
     existing = task_repo.get_task(task_id)
     if not existing:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found.",
+        )
+
+    ws_id = existing.get("workspace_id") or "ws_default"
+
+    # Enforce RBAC: only editors, admins, and superadmins can modify tasks
+    if not perm_eval.has_role(current_user["user_id"], "editor", scope=ws_id):
+        audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="update",
+            resource=f"tasks/{task_id}",
+            reason="EDITOR_OR_ADMIN_ROLE_REQUIRED",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Editor, Admin, or Superadmin role required to modify tasks.",
         )
 
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
@@ -1115,7 +1185,7 @@ async def delete_task(
     task_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Delete a task card from the workspace. Requires task creator or admin role."""
+    """Delete a task card from the workspace. Requires task creator (with editor role), workspace admin, or superadmin role."""
     existing_task = task_repo.get_task(task_id)
     if not existing_task:
         raise HTTPException(
@@ -1126,20 +1196,23 @@ async def delete_task(
     user = repo.get_by_id(current_user["user_id"])
     caller_email = user["email"].strip().lower() if user and user.get("email") else ""
     task_creator = (existing_task.get("created_by") or "").strip().lower()
+    ws_id = existing_task.get("workspace_id") or "ws_default"
 
     is_creator = bool(caller_email and caller_email == task_creator)
-    is_admin = perm_eval.has_role(current_user["user_id"], "admin")
+    is_editor = perm_eval.has_role(current_user["user_id"], "editor", scope=ws_id)
+    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
+    is_superadmin = perm_eval.has_role(current_user["user_id"], "superadmin")
 
-    if not (is_creator or is_admin):
+    if not (is_superadmin or is_admin or (is_creator and is_editor)):
         audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="delete",
             resource=f"tasks/{task_id}",
-            reason="CREATOR_OR_ADMIN_ROLE_REQUIRED",
+            reason="CREATOR_EDITOR_OR_ADMIN_ROLE_REQUIRED",
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: Only the task creator or a workspace admin may delete this task.",
+            detail="Access denied: Workspace admin, superadmin, or task creator (with editor role) required to delete this task.",
         )
 
     deleted = task_repo.delete_task(task_id)
@@ -1419,6 +1492,579 @@ async def remove_team_member(
         "status": "SUCCESS",
         "message": f"Member {clean_email} has been removed.",
         "removed_email": clean_email,
+    }
+
+
+# =============================================================================
+# Workspaces & Multi-Tenancy REST Endpoints
+# =============================================================================
+
+@app.post("/workspaces", tags=["Workspaces"])
+async def create_workspace(
+    req: WorkspaceCreateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Create a new team workspace. The creator is automatically assigned as the Workspace Admin."""
+    user = repo.get_by_id(current_user["user_id"])
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    try:
+        new_ws = ws_repo.create_workspace(
+            name=req.name,
+            created_by=current_user["user_id"],
+            slug=req.slug,
+            description=req.description,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    audit_log.record_security_event(
+        event_name="WORKSPACE_CREATED",
+        severity="INFO",
+        details={
+            "workspace_id": new_ws["id"],
+            "workspace_name": new_ws["name"],
+            "slug": new_ws["slug"],
+            "created_by": current_user["user_id"],
+        },
+    )
+    return {"status": "SUCCESS", "workspace": new_ws}
+
+
+@app.get("/workspaces", tags=["Workspaces"])
+async def list_user_workspaces(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """List all workspaces the authenticated user belongs to (or all workspaces if Superadmin)."""
+    user = repo.get_by_id(current_user["user_id"])
+    user_email = user["email"] if user else None
+
+    is_superadmin = perm_eval.has_role(current_user["user_id"], "superadmin")
+    if is_superadmin:
+        workspaces = ws_repo.list_all_workspaces()
+    else:
+        workspaces = ws_repo.list_workspaces_for_user(
+            user_id=current_user["user_id"],
+            email=user_email,
+        )
+
+    return {"status": "SUCCESS", "count": len(workspaces), "workspaces": workspaces}
+
+
+@app.get("/workspaces/{workspace_id}", tags=["Workspaces"])
+async def get_workspace_details(
+    workspace_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Retrieve workspace profile, metadata, and member metrics."""
+    is_authorized = perm_eval.has_role(current_user["user_id"], "viewer", scope=workspace_id) or perm_eval.has_role(current_user["user_id"], "superadmin")
+    if not is_authorized:
+        audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="view",
+            resource=f"workspaces/{workspace_id}",
+            reason="WORKSPACE_MEMBERSHIP_REQUIRED",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You are not a member of this workspace.",
+        )
+
+    ws = ws_repo.get_workspace(workspace_id)
+    if not ws:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found.")
+
+    metrics = ws_repo.count_members(workspace_id)
+    return {"status": "SUCCESS", "workspace": ws, "metrics": metrics}
+
+
+@app.patch("/workspaces/{workspace_id}", tags=["Workspaces"])
+async def update_workspace(
+    workspace_id: str,
+    req: WorkspaceUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Update workspace name, slug, or description. Requires Workspace Admin or Superadmin role."""
+    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    if not is_admin:
+        audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="update",
+            resource=f"workspaces/{workspace_id}",
+            reason="ADMIN_ROLE_REQUIRED",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Workspace Admin or Superadmin role required.",
+        )
+
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    try:
+        updated = ws_repo.update_workspace(workspace_id, updates)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found.")
+
+    audit_log.record_security_event(
+        event_name="WORKSPACE_UPDATED",
+        severity="INFO",
+        details={"workspace_id": workspace_id, "updates": updates, "updated_by": current_user["user_id"]},
+    )
+    return {"status": "SUCCESS", "workspace": updated}
+
+
+@app.delete("/workspaces/{workspace_id}", tags=["Workspaces"])
+async def delete_workspace(
+    workspace_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Delete a workspace and cascade delete all its tasks and member associations. Requires Workspace Admin or Superadmin."""
+    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    if not is_admin:
+        audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="delete",
+            resource=f"workspaces/{workspace_id}",
+            reason="ADMIN_ROLE_REQUIRED",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Workspace Admin or Superadmin role required.",
+        )
+
+    try:
+        deleted = ws_repo.delete_workspace(workspace_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found.")
+
+    audit_log.record_security_event(
+        event_name="WORKSPACE_DELETED",
+        severity="WARNING",
+        details={"workspace_id": workspace_id, "deleted_by": current_user["user_id"]},
+    )
+    return {"status": "SUCCESS", "deleted_workspace_id": workspace_id}
+
+
+# =============================================================================
+# Workspace Member & Invitation REST Endpoints
+# =============================================================================
+
+@app.get("/workspaces/{workspace_id}/members", tags=["Workspaces"])
+async def list_workspace_members(
+    workspace_id: str,
+    status_filter: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """List all members and pending invitations for a specific workspace."""
+    is_authorized = perm_eval.has_role(current_user["user_id"], "viewer", scope=workspace_id) or perm_eval.has_role(current_user["user_id"], "superadmin")
+    if not is_authorized:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You are not a member of this workspace.",
+        )
+
+    members = ws_repo.list_members(workspace_id=workspace_id, status=status_filter)
+    return {"status": "SUCCESS", "count": len(members), "members": members}
+
+
+@app.post("/workspaces/{workspace_id}/invite", tags=["Workspaces"])
+async def invite_workspace_member(
+    workspace_id: str,
+    req: WorkspaceInviteRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Invite a new colleague to a specific workspace with a defined role. Requires Workspace Admin or Superadmin."""
+    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    if not is_admin:
+        audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="invite",
+            resource=f"workspaces/{workspace_id}/members",
+            reason="ADMIN_ROLE_REQUIRED",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Admin role required to invite workspace members.",
+        )
+
+    admin_user = repo.get_by_id(current_user["user_id"])
+    invited_by_name = admin_user["username"] if admin_user else "Workspace Admin"
+
+    try:
+        invitation = ws_repo.invite_member(
+            workspace_id=workspace_id,
+            email=req.email,
+            name=req.name,
+            role=req.role or "viewer",
+            department=req.department or "General",
+            invited_by=invited_by_name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # Dispatch branded invitation email
+    email_res = email_svc.send_invitation_email(
+        recipient_email=invitation["email"],
+        recipient_name=invitation["name"],
+        role=invitation["role"],
+        department=invitation["department"],
+        invited_by=invited_by_name,
+        invite_token=invitation["invite_token"],
+        workspace_name=invitation.get("workspace_name", "TaskTracker Workspace"),
+    )
+
+    audit_log.record_security_event(
+        event_name="WORKSPACE_MEMBER_INVITED",
+        severity="INFO",
+        details={
+            "workspace_id": workspace_id,
+            "invited_email": req.email,
+            "role": req.role,
+            "department": req.department,
+            "invited_by": invited_by_name,
+            "invite_token": invitation["invite_token"],
+            "email_dispatched": email_res.get("delivered", False),
+        },
+    )
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Invitation notification dispatched to {req.email} for {invitation.get('workspace_name')}.",
+        "invite_url": email_res.get("invite_url"),
+        "member": invitation,
+    }
+
+
+@app.patch("/workspaces/{workspace_id}/members/{user_id_or_email}/role", tags=["Workspaces"])
+async def update_workspace_member_role(
+    workspace_id: str,
+    user_id_or_email: str,
+    req: WorkspaceRoleUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Change a colleague's clearance role within a specific workspace. Requires Workspace Admin or Superadmin."""
+    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    if not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Admin role required to update member roles.",
+        )
+
+    try:
+        updated = ws_repo.update_member_role(workspace_id, user_id_or_email, req.role)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found in this workspace.")
+
+    audit_log.record_security_event(
+        event_name="WORKSPACE_MEMBER_ROLE_UPDATED",
+        severity="INFO",
+        details={
+            "workspace_id": workspace_id,
+            "member": user_id_or_email,
+            "new_role": req.role,
+            "updated_by": current_user["user_id"],
+        },
+    )
+    return {"status": "SUCCESS", "message": f"Role updated to '{req.role}' for {user_id_or_email}."}
+
+
+@app.delete("/workspaces/{workspace_id}/members/{user_id_or_email}", tags=["Workspaces"])
+async def remove_workspace_member(
+    workspace_id: str,
+    user_id_or_email: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Remove a colleague from a specific workspace or cancel their invitation. Requires Workspace Admin or Superadmin."""
+    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    if not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Admin role required to remove members.",
+        )
+
+    if user_id_or_email == current_user["user_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot remove your own administrator membership from the workspace.",
+        )
+
+    removed = ws_repo.remove_member(workspace_id, user_id_or_email)
+    if not removed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found in this workspace.")
+
+    audit_log.record_security_event(
+        event_name="WORKSPACE_MEMBER_REMOVED",
+        severity="WARNING",
+        details={
+            "workspace_id": workspace_id,
+            "removed_member": user_id_or_email,
+            "removed_by": current_user["user_id"],
+        },
+    )
+    return {"status": "SUCCESS", "message": f"Member {user_id_or_email} removed from workspace."}
+
+
+@app.get("/workspaces/invite/verify", tags=["Workspaces"])
+async def verify_workspace_invitation(token: str):
+    """Verify an invitation token when a user lands on the accept-invite onboarding page."""
+    invite = ws_repo.get_invitation_by_token(token)
+    if not invite:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invitation token not found or already consumed.",
+        )
+
+    if invite.get("is_expired"):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This invitation link has expired. Please request a new invitation.",
+        )
+
+    return {
+        "status": "SUCCESS",
+        "email": invite["email"],
+        "name": invite["name"],
+        "role": invite["role"],
+        "department": invite["department"],
+        "workspace_id": invite["workspace_id"],
+        "workspace_name": invite.get("workspace_name", "TaskTracker Workspace"),
+        "invited_by": invite.get("invited_by", "Workspace Admin"),
+        "expires_at": invite.get("expires_at"),
+    }
+
+
+@app.post("/workspaces/invite/accept", tags=["Workspaces"])
+async def accept_workspace_invitation(
+    req: WorkspaceAcceptInviteRequest,
+    request: Request,
+):
+    """Accept a workspace invitation, register credentials, activate workspace membership, and log in."""
+    invite = ws_repo.get_invitation_by_token(req.token)
+    if not invite:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invitation token not found or already consumed.",
+        )
+
+    if invite.get("is_expired"):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This invitation link has expired. Please request a new invitation.",
+        )
+
+    email = invite["email"].strip().lower()
+    workspace_id = invite["workspace_id"]
+    client_ip = request.client.host if request.client else "unknown"
+    clearance_levels = {"admin": 3, "editor": 2, "viewer": 1}
+    clearance = clearance_levels.get(invite["role"], 1)
+
+    existing_user = repo.get_by_identifier(email)
+    hashed_pw = hasher.hash(req.password)
+
+    if existing_user:
+        user_id = existing_user["id"]
+        roles = existing_user.get("roles", [])
+        if isinstance(roles, str):
+            try:
+                roles = json.loads(roles)
+            except Exception:
+                roles = []
+        if invite["role"] not in roles:
+            roles.append(invite["role"])
+
+        metadata = existing_user.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        metadata["department"] = invite["department"]
+        metadata["clearance"] = max(metadata.get("clearance", 1), clearance)
+        if req.name:
+            metadata["name"] = req.name.strip()
+
+        repo.update_user(user_id, {
+            "hashed_password": hashed_pw,
+            "roles": roles,
+            "metadata": metadata,
+            "is_active": 1,
+        })
+        user = repo.get_by_id(user_id)
+    else:
+        base_username = email.split("@")[0].lower()
+        clean_username = "".join(c for c in base_username if c.isalnum() or c in ("_", "-"))
+        if len(clean_username) < 3 or repo.get_by_identifier(clean_username):
+            clean_username = f"{clean_username}_{secrets.token_hex(3)}"
+
+        user = repo.create_user({
+            "username": clean_username,
+            "email": email,
+            "hashed_password": hashed_pw,
+            "roles": [invite["role"]],
+            "metadata": {
+                "department": invite["department"],
+                "clearance": clearance,
+                "name": req.name.strip() if req.name else invite["name"],
+            },
+        })
+        user_id = user["id"]
+        roles = [invite["role"]]
+
+    # Mark invitation as accepted in SQLite workspace_members
+    ws_repo.accept_invitation(req.token, user_id=user_id)
+
+    # Generate JWT tokens and active session
+    access_token = token_svc.create_access_token(user_id, claims={"roles": roles, "workspace_id": workspace_id})
+    refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles, "workspace_id": workspace_id})
+    session_id = sess_store.create_session(user_id, session_data={"roles": roles, "workspace_id": workspace_id})
+
+    safe_meta = user.get("metadata", {})
+    if isinstance(safe_meta, str):
+        try:
+            safe_meta = json.loads(safe_meta)
+        except Exception:
+            safe_meta = {}
+    safe_meta.pop("mfa_secret", None)
+    safe_meta.pop("backup_codes", None)
+
+    audit_log.record_security_event(
+        event_name="WORKSPACE_INVITE_ACCEPTED",
+        severity="INFO",
+        details={
+            "user_id": user_id,
+            "email": email,
+            "workspace_id": workspace_id,
+            "role": invite["role"],
+            "department": invite["department"],
+            "ip_address": client_ip,
+        },
+    )
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Invitation accepted. Welcome to {invite.get('workspace_name', 'the workspace')}!",
+        "user_id": user_id,
+        "workspace_id": workspace_id,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "session_id": session_id,
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "email": user["email"],
+            "roles": roles,
+            "metadata": safe_meta,
+        },
+    }
+
+
+@app.post("/auth/workspaces/switch", tags=["Workspaces", "Authentication"])
+async def switch_active_workspace(
+    req: WorkspaceSwitchRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Switch the authenticated user's active tenant workspace context, returning refreshed scoped JWT tokens."""
+    target_ws_id = req.workspace_id.strip()
+    user_id = current_user["user_id"]
+    user = repo.get_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    is_superadmin = perm_eval.has_role(user_id, "superadmin")
+    ws = ws_repo.get_workspace(target_ws_id)
+    if not ws:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target workspace not found.")
+
+    member = ws_repo.get_member(target_ws_id, user_id=user_id, email=user.get("email"))
+    if not member and not is_superadmin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You are not an active member of this workspace.",
+        )
+
+    # Scoped roles in this workspace
+    workspace_role = member["role"] if member else ("superadmin" if is_superadmin else "viewer")
+    roles = [workspace_role]
+    if is_superadmin and "superadmin" not in roles:
+        roles.append("superadmin")
+
+    # Issue refreshed JWT tokens scoped to target workspace
+    access_token = token_svc.create_access_token(user_id, claims={"roles": roles, "workspace_id": target_ws_id})
+    refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles, "workspace_id": target_ws_id})
+    session_id = sess_store.create_session(user_id, session_data={"roles": roles, "workspace_id": target_ws_id})
+
+    audit_log.record_security_event(
+        event_name="WORKSPACE_SWITCHED",
+        severity="INFO",
+        details={
+            "user_id": user_id,
+            "workspace_id": target_ws_id,
+            "workspace_name": ws["name"],
+            "role": workspace_role,
+        },
+        workspace_id=target_ws_id,
+    )
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Active workspace switched to '{ws['name']}'.",
+        "active_workspace": {
+            "id": ws["id"],
+            "name": ws["name"],
+            "slug": ws["slug"],
+            "role": workspace_role,
+        },
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "session_id": session_id,
+    }
+
+
+@app.get("/workspaces/{workspace_id}/audit-logs", tags=["Workspaces", "Security & Auditing"])
+async def get_workspace_audit_logs(
+    workspace_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    event_type: Optional[str] = None,
+    severity: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Retrieve security audit telemetry for a specific workspace. Requires Workspace Admin or Superadmin."""
+    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    if not is_admin:
+        audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="view_audit_logs",
+            resource=f"workspaces/{workspace_id}/audit-logs",
+            reason="ADMIN_ROLE_REQUIRED",
+            workspace_id=workspace_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Workspace Admin or Superadmin role required to view audit logs.",
+        )
+
+    filters = {"workspace_id": workspace_id}
+    if event_type:
+        filters["event_type"] = event_type
+    if severity:
+        filters["severity"] = severity.upper()
+
+    logs = audit_log.query_events(filters, limit=min(limit, 200), offset=offset)
+    return {
+        "status": "SUCCESS",
+        "workspace_id": workspace_id,
+        "count": len(logs),
+        "audit_logs": logs,
     }
 
 

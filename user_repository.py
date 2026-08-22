@@ -244,12 +244,91 @@ class UserRepository(abstractUserRepository):
             return cursor.rowcount>0
     
     def set_status(self, user_id: str, is_active: bool) -> bool:
-        """Activate or deactivate/suspend a user account(soft-delete)."""
-        query="UPDATE users SET is_active = ? WHERE id = ?"
+        """Activate or deactivate/suspend a user account (soft-delete)."""
+        query = "UPDATE users SET is_active = ? WHERE id = ?"
         status_int = 1 if is_active else 0
         with self.conn:
-            cursor = self.conn.execute(query,(status_int, str(user_id)))
+            cursor = self.conn.execute(query, (status_int, str(user_id)))
             return cursor.rowcount > 0
+
+    def list_users(
+        self,
+        is_active: Optional[bool] = None,
+        role: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List all users with optional status and role filtering."""
+        query = "SELECT * FROM users WHERE 1=1"
+        params: List[Any] = []
+
+        if is_active is not None:
+            query += " AND is_active = ?"
+            params.append(1 if is_active else 0)
+
+        query += " ORDER BY datetime(created_at) ASC"
+
+        cursor = self.conn.cursor()
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        users = []
+        for r in rows:
+            u = dict(r)
+            if isinstance(u.get("roles"), str):
+                try:
+                    u["roles"] = json.loads(u["roles"])
+                except Exception:
+                    u["roles"] = []
+            if isinstance(u.get("metadata"), str):
+                try:
+                    u["metadata"] = json.loads(u["metadata"])
+                except Exception:
+                    u["metadata"] = {}
+
+            if role:
+                user_roles = [str(rl).strip().lower() for rl in u.get("roles", [])]
+                if role.strip().lower() not in user_roles:
+                    continue
+
+            users.append(u)
+        return users
+
+    def get_roles(self, user_id: str) -> List[str]:
+        """Retrieve all role strings assigned to a user."""
+        user = self.get_by_id(user_id)
+        if not user:
+            return []
+        raw_roles = user.get("roles", [])
+        if isinstance(raw_roles, str):
+            try:
+                return json.loads(raw_roles)
+            except Exception:
+                return []
+        return raw_roles if isinstance(raw_roles, list) else []
+
+    def add_role(self, user_id: str, role: str) -> bool:
+        """Add a role to a user if not already present."""
+        clean_role = role.strip().lower()
+        user = self.get_by_id(user_id)
+        if not user:
+            return False
+
+        roles = self.get_roles(user_id)
+        if clean_role not in roles:
+            roles.append(clean_role)
+            return self.update_user(user_id, {"roles": roles})
+        return True
+
+    def remove_role(self, user_id: str, role: str) -> bool:
+        """Remove a role from a user."""
+        clean_role = role.strip().lower()
+        user = self.get_by_id(user_id)
+        if not user:
+            return False
+
+        roles = self.get_roles(user_id)
+        if clean_role in roles:
+            roles = [r for r in roles if r != clean_role]
+            return self.update_user(user_id, {"roles": roles})
+        return True
 
 
 concreteUserRepository = UserRepository

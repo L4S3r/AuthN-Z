@@ -132,6 +132,7 @@ class EmailService:
         department: Optional[str] = "General",
         invited_by: Optional[str] = "Workspace Admin",
         invite_token: str = "",
+        workspace_name: Optional[str] = "TaskTracker Workspace",
     ) -> Dict[str, Any]:
         """Dispatch a branded workspace team invitation email."""
         clean_recipient = (recipient_email or "").strip()
@@ -140,13 +141,14 @@ class EmailService:
         safe_department = (department or "General").strip()
         safe_invited_by = (invited_by or "Workspace Admin").strip()
         safe_token = (invite_token or "").strip()
+        safe_ws_name = (workspace_name or "TaskTracker Workspace").strip()
 
         invite_url = f"{self.frontend_url}/invite/accept?token={safe_token}"
-        subject = f"You've been invited to join TaskTracker by {safe_invited_by}"
+        subject = f"You've been invited to join {safe_ws_name} by {safe_invited_by}"
 
         text_content = f"""Hello {safe_name},
 
-{safe_invited_by} has invited you to join the TaskTracker workspace as an {safe_role.capitalize()} in the {safe_department} department.
+{safe_invited_by} has invited you to join the {safe_ws_name} as an {safe_role.capitalize()} in the {safe_department} department.
 
 To accept your invitation and set up your account credentials, click the link below:
 {invite_url}
@@ -163,6 +165,7 @@ https://l4s3r.site
         escaped_subject = html.escape(subject)
         escaped_name = html.escape(safe_name)
         escaped_invited_by = html.escape(safe_invited_by)
+        escaped_ws_name = html.escape(safe_ws_name)
         escaped_role = html.escape(safe_role.upper())
         escaped_department = html.escape(safe_department)
         escaped_url = html.escape(invite_url)
@@ -180,7 +183,7 @@ https://l4s3r.site
         <table width="560" border="0" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
           <tr>
             <td style="padding: 32px 32px 20px; text-align: center; background-color: #0f172a;">
-              <h1 style="color: #ffffff; font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.5px;">TaskTracker Workspace</h1>
+              <h1 style="color: #ffffff; font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.5px;">{escaped_ws_name}</h1>
               <p style="color: #94a3b8; font-size: 12px; margin: 4px 0 0;">Zero-Trust Access & Identity Gateway</p>
             </td>
           </tr>
@@ -189,7 +192,7 @@ https://l4s3r.site
               <h2 style="font-size: 18px; font-weight: 700; color: #0f172a; margin: 0 0 12px;">You've been invited to join the team!</h2>
               <p style="font-size: 14px; line-height: 1.6; color: #334155; margin: 0 0 20px;">
                 Hello <strong>{escaped_name}</strong>,<br>
-                <strong>{escaped_invited_by}</strong> has invited you to collaborate on the TaskTracker workspace with the following security clearance:
+                <strong>{escaped_invited_by}</strong> has invited you to collaborate on <strong>{escaped_ws_name}</strong> with the following security clearance:
               </p>
               <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f1f5f9; border-radius: 10px; margin-bottom: 24px;">
                 <tr>
@@ -240,6 +243,7 @@ https://l4s3r.site
         due_date: Optional[str] = None,
         assigned_by: Optional[str] = "Workspace Admin",
         task_id: Optional[str] = None,
+        workspace_name: Optional[str] = "TaskTracker Workspace",
     ) -> Dict[str, Any]:
         """Dispatch a notification email when a user is assigned a new task or deliverable."""
         clean_recipient = (recipient_email or "").strip()
