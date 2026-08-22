@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import uuid
 import secrets
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
@@ -27,6 +27,7 @@ from mfa_provider import concreteMFAProvider
 from authenticator import Authenticator
 from permission_evaluator import PermissionEvaluator
 from audit_logger import AuditLogger
+from device_trust_service import DeviceTrustService
 
 
 # =============================================================================
@@ -117,6 +118,7 @@ audit_log = AuditLogger(db_file="DATABASE.db")
 oauth_mgr = OAuthManager(redis_client=sess_store.r)
 task_repo = TaskRepository(db_file="DATABASE.db")
 email_svc = EmailService()
+device_trust_svc = DeviceTrustService(db_file="DATABASE.db")
 
 auth = Authenticator(
     user_repo=repo,
@@ -228,6 +230,7 @@ class TeamAcceptInviteRequest(BaseModel):
 class LoginRequest(BaseModel):
     identifier: str
     password: str
+    trusted_device_token: Optional[str] = None
 
 
 class OAuthExchangeRequest(BaseModel):
@@ -255,6 +258,7 @@ class MFACompleteRequest(BaseModel):
     user_id: str
     challenge_id: str
     code: str
+    remember_device: Optional[bool] = False
 
 
 
@@ -390,9 +394,10 @@ async def admin_create_user(
 
 
 @app.post("/auth/login", tags=["Authentication"])
-async def login(req: LoginRequest, request: Request):
-    """Primary credential authentication with rate limiting and constant-time execution."""
+async def login(req: LoginRequest, request: Request, response: Response):
+    """Primary credential authentication with rate limiting, constant-time execution, and trusted device MFA bypass."""
     client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "")
     clean_ident = req.identifier.strip().lower()
 
     # Rate limiting: max 15 requests per minute per IP, max 5 per minute per identifier
@@ -414,6 +419,62 @@ async def login(req: LoginRequest, request: Request):
         audit_log.record_auth_success(res["user_id"], "password", ip_address=client_ip)
         return res
     elif res["status"] == "MFA_REQUIRED":
+        # Check if client presented a valid, unexpired trusted-device token
+        user_id = res["user_id"]
+        cand_token = req.trusted_device_token or request.cookies.get("trusted_device") or request.headers.get("X-Trusted-Device-Token")
+        if cand_token:
+            trusted_dev = device_trust_svc.verify_trusted_device(
+                user_id=user_id,
+                raw_token=cand_token,
+                user_agent=user_agent,
+                ip_address=client_ip,
+            )
+            if trusted_dev:
+                # Valid trusted device: skip second factor
+                user = repo.get_by_id(user_id)
+                roles = user.get("roles", []) if user else []
+                if isinstance(roles, str):
+                    try:
+                        roles = json.loads(roles)
+                    except Exception:
+                        roles = []
+
+                access_token = token_svc.create_access_token(user_id, claims={"roles": roles})
+                refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles})
+                session_id = sess_store.create_session(user_id, session_data={"roles": roles})
+
+                audit_log.record_security_event(
+                    event_name="MFA_SKIPPED_TRUSTED_DEVICE",
+                    severity="INFO",
+                    details={
+                        "user_id": user_id,
+                        "device_id": trusted_dev["id"],
+                        "device_label": trusted_dev["device_label"],
+                        "ip_address": client_ip,
+                    },
+                )
+                audit_log.record_auth_success(user_id, "password+trusted_device", ip_address=client_ip)
+
+                response.set_cookie(
+                    "trusted_device",
+                    cand_token.strip(),
+                    max_age=30 * 86400,
+                    httponly=True,
+                    samesite="lax",
+                )
+
+                return {
+                    "status": "SUCCESS",
+                    "mfa_skipped": True,
+                    "trusted_device": trusted_dev,
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "roles": roles,
+                }
+
+        # Otherwise require TOTP challenge
         return res
     else:
         audit_log.record_auth_failure(
@@ -623,6 +684,9 @@ async def disable_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
     metadata.pop("pending_backup_codes", None)
     repo.update_user(user_id, {"metadata": metadata})
 
+    # Revoke all trusted devices when MFA is disabled
+    device_trust_svc.revoke_all_trusted_devices(user_id)
+
     audit_log.record_security_event(
         event_name="MFA_DISABLED",
         severity="WARNING",
@@ -634,13 +698,43 @@ async def disable_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 
 @app.post("/auth/mfa/complete", tags=["MFA Verification"])
-async def complete_mfa(req: MFACompleteRequest, request: Request):
-    """Validate a TOTP code or emergency backup code to finalize an MFA challenge."""
+async def complete_mfa(req: MFACompleteRequest, request: Request, response: Response):
+    """Validate a TOTP code or emergency backup code to finalize an MFA challenge with optional device trust."""
     res = auth.complete_mfa_challenge(req.user_id, req.challenge_id, req.code)
     client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "")
 
     if res["status"] == "SUCCESS":
         audit_log.record_auth_success(req.user_id, "mfa_challenge", ip_address=client_ip)
+
+        if req.remember_device:
+            dev_rec, raw_dev_token = device_trust_svc.create_trusted_device(
+                user_id=req.user_id,
+                user_agent=user_agent,
+                ip_address=client_ip,
+                days_valid=30,
+            )
+            response.set_cookie(
+                "trusted_device",
+                raw_dev_token,
+                max_age=30 * 86400,
+                httponly=True,
+                samesite="lax",
+            )
+            res["trusted_device_token"] = raw_dev_token
+            res["trusted_device"] = dev_rec
+
+            audit_log.record_security_event(
+                event_name="DEVICE_TRUSTED",
+                severity="INFO",
+                details={
+                    "user_id": req.user_id,
+                    "device_id": dev_rec["id"],
+                    "device_label": dev_rec["device_label"],
+                    "ip_address": client_ip,
+                },
+            )
+
         return res
     else:
         audit_log.record_auth_failure(
@@ -652,6 +746,61 @@ async def complete_mfa(req: MFACompleteRequest, request: Request):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=res.get("reason", "MFA verification failed."),
         )
+
+
+@app.get("/auth/trusted-devices", tags=["Device Trust"])
+async def list_my_trusted_devices(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """List all active trusted devices for the authenticated user."""
+    user_id = current_user["user_id"]
+    current_token = request.cookies.get("trusted_device") or request.headers.get("X-Trusted-Device-Token")
+    devices = device_trust_svc.list_trusted_devices(user_id, current_token=current_token)
+    return {
+        "status": "SUCCESS",
+        "devices": devices,
+        "count": len(devices),
+    }
+
+
+@app.delete("/auth/trusted-devices/{device_id}", tags=["Device Trust"])
+async def revoke_my_trusted_device(
+    device_id: str,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Revoke trust for a specific device."""
+    user_id = current_user["user_id"]
+    client_ip = request.client.host if request.client else "unknown"
+    revoked = device_trust_svc.revoke_trusted_device(user_id, device_id)
+    if not revoked:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trusted device not found.")
+
+    audit_log.record_security_event(
+        event_name="DEVICE_TRUST_REVOKED",
+        severity="INFO",
+        details={"user_id": user_id, "device_id": device_id, "ip_address": client_ip},
+    )
+    return {"status": "SUCCESS", "message": "Device trust revoked successfully."}
+
+
+@app.delete("/auth/trusted-devices", tags=["Device Trust"])
+async def revoke_all_my_trusted_devices(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Revoke all trusted devices for the authenticated user."""
+    user_id = current_user["user_id"]
+    client_ip = request.client.host if request.client else "unknown"
+    count = device_trust_svc.revoke_all_trusted_devices(user_id)
+
+    audit_log.record_security_event(
+        event_name="ALL_DEVICES_TRUST_REVOKED",
+        severity="INFO",
+        details={"user_id": user_id, "devices_revoked": count, "ip_address": client_ip},
+    )
+    return {"status": "SUCCESS", "message": f"Successfully revoked {count} trusted device(s)."}
 
 
 @app.get("/auth/me", tags=["User Context"])
@@ -1741,7 +1890,7 @@ async def invite_workspace_member(
     }
 
 
-@app.patch("/workspaces/{workspace_id}/members/{user_id_or_email}/role", tags=["Workspaces"])
+@app.patch("/workspaces/{workspace_id}/members/{user_id_or_email:path}/role", tags=["Workspaces"])
 async def update_workspace_member_role(
     workspace_id: str,
     user_id_or_email: str,
@@ -1756,11 +1905,7 @@ async def update_workspace_member_role(
             detail="Access denied: Admin role required to update member roles.",
         )
 
-    try:
-        updated = ws_repo.update_member_role(workspace_id, user_id_or_email, req.role)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
+    updated = ws_repo.update_member_role(workspace_id, user_id_or_email, req.role)
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found in this workspace.")
 
@@ -1777,7 +1922,7 @@ async def update_workspace_member_role(
     return {"status": "SUCCESS", "message": f"Role updated to '{req.role}' for {user_id_or_email}."}
 
 
-@app.delete("/workspaces/{workspace_id}/members/{user_id_or_email}", tags=["Workspaces"])
+@app.delete("/workspaces/{workspace_id}/members/{user_id_or_email:path}", tags=["Workspaces"])
 async def remove_workspace_member(
     workspace_id: str,
     user_id_or_email: str,
@@ -1791,7 +1936,13 @@ async def remove_workspace_member(
             detail="Access denied: Admin role required to remove members.",
         )
 
-    if user_id_or_email == current_user["user_id"]:
+    # Check for self-removal
+    curr_user = repo.get_by_id(current_user["user_id"])
+    curr_email = curr_user["email"].lower() if curr_user else ""
+    from urllib.parse import unquote
+    clean_target = unquote(user_id_or_email).strip().lower()
+
+    if clean_target in (current_user["user_id"].lower(), curr_email):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot remove your own administrator membership from the workspace.",

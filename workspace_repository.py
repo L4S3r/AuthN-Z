@@ -679,31 +679,66 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             "invited_at": now_str,
         }
 
+    def _resolve_ws_id(self, workspace_id_or_slug: str) -> str:
+        """Resolve a workspace ID or slug to canonical workspace ID."""
+        clean = (workspace_id_or_slug or "").strip()
+        if not clean:
+            return clean
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM workspaces WHERE id = ? OR slug = ?", (clean, clean))
+            row = cursor.fetchone()
+            return row["id"] if row else clean
+
     def get_member(
         self,
         workspace_id: str,
         user_id: Optional[str] = None,
         email: Optional[str] = None,
+        identifier: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Retrieve a member record within a workspace scope."""
-        if not user_id and not email:
+        """Retrieve a member record within a workspace scope by user_id, email, username, or membership ID."""
+        from urllib.parse import unquote
+        ws_id = self._resolve_ws_id(workspace_id)
+
+        lookup_keys = []
+        if identifier:
+            lookup_keys.append(unquote(identifier).strip())
+        if user_id:
+            lookup_keys.append(unquote(user_id).strip())
+        if email:
+            lookup_keys.append(unquote(email).strip().lower())
+
+        if not lookup_keys:
             return None
-
-        query = "SELECT * FROM workspace_members WHERE workspace_id = ?"
-        params: List[Any] = [workspace_id]
-
-        if user_id and email:
-            query += " AND (user_id = ? OR LOWER(email) = LOWER(?))"
-            params.extend([user_id, email.strip().lower()])
-        elif user_id:
-            query += " AND user_id = ?"
-            params.append(user_id)
-        elif email:
-            query += " AND LOWER(email) = LOWER(?)"
-            params.append(email.strip().lower())
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
+
+            extra_user_ids = []
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+            if cursor.fetchone():
+                for k in lookup_keys:
+                    cursor.execute("SELECT id, email FROM users WHERE id = ? OR LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)", (k, k, k))
+                    u = cursor.fetchone()
+                    if u:
+                        extra_user_ids.append(u["id"])
+                        if u["email"]:
+                            extra_user_ids.append(u["email"])
+
+            all_keys = list(set(lookup_keys + extra_user_ids))
+            placeholders = ", ".join(["?"] * len(all_keys))
+
+            query = f"""
+                SELECT * FROM workspace_members
+                WHERE workspace_id = ? AND (
+                    id IN ({placeholders})
+                    OR user_id IN ({placeholders})
+                    OR LOWER(email) IN ({placeholders})
+                    OR LOWER(name) IN ({placeholders})
+                )
+            """
+            params = [ws_id] + all_keys + all_keys + [k.lower() for k in all_keys] + [k.lower() for k in all_keys]
             cursor.execute(query, params)
             row = cursor.fetchone()
             return dict(row) if row else None
@@ -714,6 +749,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         status: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """List all members and invitations for a specific workspace."""
+        ws_id = self._resolve_ws_id(workspace_id)
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
@@ -732,7 +768,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                     FROM workspace_members wm
                     WHERE wm.workspace_id = ?
                 """
-            params: List[Any] = [workspace_id]
+            params: List[Any] = [ws_id]
             if status:
                 query += " AND wm.status = ?"
                 params.append(status)
@@ -827,18 +863,45 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         user_id_or_email: str,
         new_role: str,
     ) -> bool:
-        """Update a member's role (admin, editor, viewer) within a specific workspace."""
-        if new_role not in ("admin", "editor", "viewer"):
-            raise ValueError(f"Invalid role '{new_role}'. Must be admin, editor, or viewer.")
+        """Update a member's role (admin, developer, editor, viewer) within a specific workspace."""
+        if new_role not in ("admin", "developer", "editor", "viewer"):
+            raise ValueError(f"Invalid role '{new_role}'. Must be admin, developer, editor, or viewer.")
 
-        identifier = user_id_or_email.strip()
+        from urllib.parse import unquote
+        ws_id = self._resolve_ws_id(workspace_id)
+        raw_ident = (user_id_or_email or "").strip()
+        if not raw_ident:
+            return False
+        clean_ident = unquote(raw_ident).strip()
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+
+            extra_ids = [clean_ident]
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+            if cursor.fetchone():
+                cursor.execute("SELECT id, email FROM users WHERE id = ? OR LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)", (clean_ident, clean_ident, clean_ident))
+                u = cursor.fetchone()
+                if u:
+                    extra_ids.append(u["id"])
+                    if u["email"]:
+                        extra_ids.append(u["email"])
+
+            all_keys = list(set(extra_ids))
+            placeholders = ", ".join(["?"] * len(all_keys))
+
+            query = f"""
                 UPDATE workspace_members
                 SET role = ?
-                WHERE workspace_id = ? AND (user_id = ? OR LOWER(email) = LOWER(?))
-            """, (new_role, workspace_id, identifier, identifier))
+                WHERE workspace_id = ? AND (
+                    id IN ({placeholders})
+                    OR user_id IN ({placeholders})
+                    OR LOWER(email) IN ({placeholders})
+                    OR LOWER(name) IN ({placeholders})
+                )
+            """
+            params = [new_role, ws_id] + all_keys + all_keys + [k.lower() for k in all_keys] + [k.lower() for k in all_keys]
+            cursor.execute(query, params)
             conn.commit()
             return cursor.rowcount > 0
 
@@ -848,13 +911,40 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         user_id_or_email: str,
     ) -> bool:
         """Remove a member from a workspace or revoke their invitation."""
-        identifier = user_id_or_email.strip()
+        from urllib.parse import unquote
+        ws_id = self._resolve_ws_id(workspace_id)
+        raw_ident = (user_id_or_email or "").strip()
+        if not raw_ident:
+            return False
+        clean_ident = unquote(raw_ident).strip()
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+
+            extra_ids = [clean_ident]
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+            if cursor.fetchone():
+                cursor.execute("SELECT id, email FROM users WHERE id = ? OR LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)", (clean_ident, clean_ident, clean_ident))
+                u = cursor.fetchone()
+                if u:
+                    extra_ids.append(u["id"])
+                    if u["email"]:
+                        extra_ids.append(u["email"])
+
+            all_keys = list(set(extra_ids))
+            placeholders = ", ".join(["?"] * len(all_keys))
+
+            query = f"""
                 DELETE FROM workspace_members
-                WHERE workspace_id = ? AND (user_id = ? OR LOWER(email) = LOWER(?))
-            """, (workspace_id, identifier, identifier))
+                WHERE workspace_id = ? AND (
+                    id IN ({placeholders})
+                    OR user_id IN ({placeholders})
+                    OR LOWER(email) IN ({placeholders})
+                    OR LOWER(name) IN ({placeholders})
+                )
+            """
+            params = [ws_id] + all_keys + all_keys + [k.lower() for k in all_keys] + [k.lower() for k in all_keys]
+            cursor.execute(query, params)
             conn.commit()
             return cursor.rowcount > 0
 
