@@ -827,15 +827,31 @@ async def get_my_profile(current_user: Dict[str, Any] = Depends(get_current_user
         except Exception:
             roles = []
 
+    safe_name = safe_meta.get("name") or user.get("name") or user["username"]
+    safe_avatar = safe_meta.get("avatar_url") or user.get("avatar_url")
+
     safe_user = {
         "id": user["id"],
+        "name": safe_name,
         "username": user["username"],
         "email": user["email"],
+        "avatar_url": safe_avatar,
         "roles": roles,
         "metadata": safe_meta,
         "created_at": user.get("created_at"),
     }
-    return {"status": "SUCCESS", "user": safe_user, "claims": current_user.get("claims", {})}
+    return {
+        "status": "SUCCESS",
+        "user_id": user["id"],
+        "name": safe_name,
+        "username": user["username"],
+        "email": user["email"],
+        "avatar_url": safe_avatar,
+        "roles": roles,
+        "metadata": safe_meta,
+        "user": safe_user,
+        "claims": current_user.get("claims", {}),
+    }
 
 
 
@@ -936,6 +952,8 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
 
     provider = profile.get("provider", "oauth")
     provider_uid = profile.get("provider_user_id")
+    display_name = profile.get("name")
+    avatar_url = profile.get("picture")
 
     user = repo.get_by_identifier(email)
     if user:
@@ -954,12 +972,40 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
 
         oauth_map = metadata.setdefault("oauth_providers", {})
         oauth_map[provider] = provider_uid
-        if profile.get("picture"):
-            metadata["avatar_url"] = profile["picture"]
-        repo.update_user(user["id"], {"metadata": metadata})
+        if avatar_url:
+            metadata["avatar_url"] = avatar_url
+        if display_name:
+            metadata["name"] = display_name
+
+        update_fields = {"metadata": metadata}
+
+        # If user currently has an auto-generated or email-prefix username and a better handle/name is provided
+        clean_preferred = None
+        if profile.get("username"):
+            clean_preferred = "".join(c for c in profile["username"].lower() if c.isalnum() or c in ("_", "-"))
+        elif display_name:
+            clean_preferred = "".join(c for c in display_name.replace(" ", "_").lower() if c.isalnum() or c in ("_", "-"))
+
+        curr_username = user.get("username", "")
+        if clean_preferred and len(clean_preferred) >= 3 and (curr_username == email.split("@")[0].lower() or curr_username.startswith("user_")):
+            existing_target = repo.get_by_identifier(clean_preferred)
+            if not existing_target or existing_target["id"] == user["id"]:
+                update_fields["username"] = clean_preferred
+
+        repo.update_user(user["id"], update_fields)
+        user = repo.get_by_id(user["id"])
     else:
-        preferred = profile.get("username") or profile.get("login") or email.split("@")[0]
-        base_username = str(preferred).strip().lower()
+        # Determine preferred username:
+        # 1. profile['username'] (e.g. GitHub login handle)
+        # 2. profile['name'] slugified (e.g. "Ahmed Yasser" -> "ahmed_yasser")
+        # 3. email prefix (e.g. "ahmedyaso55")
+        raw_preferred = profile.get("username")
+        if not raw_preferred and display_name:
+            raw_preferred = display_name.strip().replace(" ", "_")
+        if not raw_preferred:
+            raw_preferred = email.split("@")[0]
+
+        base_username = str(raw_preferred).strip().lower()
         clean_username = "".join(c for c in base_username if c.isalnum() or c in ("_", "-"))
         if len(clean_username) < 3:
             clean_username = f"user_{secrets.token_hex(4)}"
@@ -976,11 +1022,11 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
             "hashed_password": hashed_pw,
             "roles": ["viewer"],
             "metadata": {
+                "name": display_name or clean_username,
                 "department": "General",
                 "clearance": 1,
                 "oauth_providers": {provider: provider_uid},
-                "avatar_url": profile.get("picture"),
-                "name": profile.get("name"),
+                "avatar_url": avatar_url,
             },
         })
 
@@ -1022,24 +1068,31 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
     refresh_token = token_svc.create_refresh_token(user["id"], claims={"roles": roles})
     session_id = sess_store.create_session(user["id"], session_data={"roles": roles})
 
-
     safe_metadata = dict(user_meta) if isinstance(user_meta, dict) else {}
     safe_metadata.pop("mfa_secret", None)
     safe_metadata.pop("backup_codes", None)
 
-
     audit_log.record_auth_success(user["id"], f"oauth_{provider}", ip_address=client_ip)
+
+    user_name = safe_metadata.get("name") or display_name or user["username"]
+    user_avatar = safe_metadata.get("avatar_url") or avatar_url
 
     return {
         "status": "SUCCESS",
         "user_id": user["id"],
+        "name": user_name,
+        "username": user["username"],
+        "email": user["email"],
+        "avatar_url": user_avatar,
         "access_token": access_token,
         "refresh_token": refresh_token,
         "session_id": session_id,
         "user": {
             "id": user["id"],
+            "name": user_name,
             "username": user["username"],
             "email": user["email"],
+            "avatar_url": user_avatar,
             "roles": roles,
             "metadata": safe_metadata,
         },

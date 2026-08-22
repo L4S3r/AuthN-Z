@@ -129,13 +129,25 @@ class GoogleOAuth2Provider(abstractOAuth2Provider):
                 raise ValueError("Failed to fetch Google user profile.")
 
             info = userinfo_resp.json()
+            full_name = info.get("name")
+            if not full_name:
+                given = info.get("given_name", "")
+                family = info.get("family_name", "")
+                full_name = f"{given} {family}".strip() or None
+
+            preferred_username = (
+                info.get("preferred_username")
+                or (full_name.strip().replace(" ", "_").lower() if full_name else None)
+                or (info.get("email", "").split("@")[0] if info.get("email") else None)
+            )
+
             return {
                 "provider": "google",
                 "provider_user_id": info.get("sub"),
                 "email": info.get("email"),
                 "email_verified": info.get("email_verified", False),
-                "name": info.get("name"),
-                "username": info.get("preferred_username") or (info.get("email", "").split("@")[0] if info.get("email") else None),
+                "name": full_name,
+                "username": preferred_username,
                 "picture": info.get("picture"),
             }
 
