@@ -710,7 +710,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         workspace_id: str,
         status: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """List all members and invitations for a specific workspace."""
+        """List all members and invitations for a specific workspace with live user profile resolution."""
         ws_id = self._resolve_ws_id(workspace_id)
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -721,7 +721,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 query = """
                     SELECT wm.*, u.username, u.metadata as user_metadata
                     FROM workspace_members wm
-                    LEFT JOIN users u ON wm.user_id = u.id
+                    LEFT JOIN users u ON (wm.user_id = u.id OR LOWER(wm.email) = LOWER(u.email))
                     WHERE wm.workspace_id = ?
                 """
             else:
@@ -742,13 +742,20 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             result = []
             for r in rows:
                 item = dict(r)
+                user_meta_name = None
                 avatar_url = None
                 if item.get("user_metadata"):
                     try:
                         meta = json.loads(item["user_metadata"])
-                        avatar_url = meta.get("avatar_url")
+                        if isinstance(meta, dict):
+                            user_meta_name = meta.get("name")
+                            avatar_url = meta.get("avatar_url")
                     except Exception:
                         pass
+
+                # Priority: user.metadata.name -> wm.name -> u.username -> None
+                resolved_name = user_meta_name or item.get("name") or item.get("username")
+                item["name"] = resolved_name
                 item["avatar_url"] = avatar_url
                 item.pop("user_metadata", None)
                 result.append(item)
@@ -792,8 +799,9 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         self,
         token: str,
         user_id: Optional[str] = None,
+        name: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Atomically consume invitation token, activate workspace clearance, and prevent replay."""
+        """Atomically consume invitation token, activate workspace clearance, synchronize name, and prevent replay."""
         clean_token = (token or "").strip()
         if not clean_token:
             return None
@@ -806,11 +814,31 @@ class WorkspaceRepository(abstractWorkspaceRepository):
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
+
+            resolved_name = name
+            if not resolved_name and user_id:
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+                if cursor.fetchone():
+                    cursor.execute("SELECT username, metadata FROM users WHERE id = ?", (user_id,))
+                    u_row = cursor.fetchone()
+                    if u_row:
+                        u_meta = {}
+                        if u_row["metadata"]:
+                            try:
+                                u_meta = json.loads(u_row["metadata"])
+                            except Exception:
+                                pass
+                        resolved_name = u_meta.get("name") or u_row["username"]
+
             cursor.execute("""
                 UPDATE workspace_members
-                SET status = 'active', invite_token = NULL, expires_at = NULL, user_id = COALESCE(?, user_id)
+                SET status = 'active',
+                    invite_token = NULL,
+                    expires_at = NULL,
+                    user_id = COALESCE(?, user_id),
+                    name = COALESCE(?, name)
                 WHERE (invite_token = ? OR invite_token = ?) AND status = 'invited'
-            """, (user_id, lookup_hash, clean_token))
+            """, (user_id, resolved_name, lookup_hash, clean_token))
             conn.commit()
 
             # Guard against concurrent consumption

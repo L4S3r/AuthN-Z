@@ -994,6 +994,15 @@ def resolve_or_create_oauth_user(profile: Dict[str, Any], client_ip: str) -> Dic
 
         repo.update_user(user["id"], update_fields)
         user = repo.get_by_id(user["id"])
+
+        # Synchronize display name & user_id into workspace_members
+        if display_name:
+            with ws_repo._get_connection() as conn:
+                conn.execute(
+                    "UPDATE workspace_members SET user_id = ?, name = COALESCE(?, name) WHERE (user_id = ? OR LOWER(email) = LOWER(?))",
+                    (user["id"], display_name, user["id"], email.lower()),
+                )
+                conn.commit()
     else:
         # Determine preferred username:
         # 1. profile['username'] (e.g. GitHub login handle)
@@ -1960,6 +1969,7 @@ async def invite_workspace_member(
         "message": f"Invitation notification dispatched to {req.email} for {invitation.get('workspace_name')}.",
         "invite_url": email_res.get("invite_url"),
         "member": invitation,
+        "invitation": invitation,
     }
 
 
@@ -2113,7 +2123,8 @@ async def accept_workspace_invitation(
                 metadata = {}
         metadata["department"] = invite["department"]
         metadata["clearance"] = max(metadata.get("clearance", 1), clearance)
-        if req.name:
+        existing_name = metadata.get("name")
+        if not existing_name and req.name and req.name.strip():
             metadata["name"] = req.name.strip()
 
         repo.update_user(user_id, {
@@ -2143,8 +2154,17 @@ async def accept_workspace_invitation(
         user_id = user["id"]
         roles = [invite["role"]]
 
-    # Mark invitation as accepted in SQLite workspace_members
-    accepted = ws_repo.accept_invitation(req.token, user_id=user_id)
+    user_meta = user.get("metadata", {})
+    if isinstance(user_meta, str):
+        try:
+            user_meta = json.loads(user_meta)
+        except Exception:
+            user_meta = {}
+
+    sync_name = req.name.strip() if req.name else (user_meta.get("name") or invite.get("name") or user.get("username"))
+
+    # Mark invitation as accepted in SQLite workspace_members and sync name
+    accepted = ws_repo.accept_invitation(req.token, user_id=user_id, name=sync_name)
     if not accepted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
