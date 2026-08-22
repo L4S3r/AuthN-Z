@@ -1,5 +1,7 @@
 *.env
 *.db
+*.db-wal
+*.db-shm
 *_unittest.py
 *_list.md
 *demo.py
