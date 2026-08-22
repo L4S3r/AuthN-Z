@@ -1920,7 +1920,12 @@ async def accept_workspace_invitation(
         roles = [invite["role"]]
 
     # Mark invitation as accepted in SQLite workspace_members
-    ws_repo.accept_invitation(req.token, user_id=user_id)
+    accepted = ws_repo.accept_invitation(req.token, user_id=user_id)
+    if not accepted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invitation token not found or already consumed.",
+        )
 
     # Generate JWT tokens and active session
     access_token = token_svc.create_access_token(user_id, claims={"roles": roles, "workspace_id": workspace_id})

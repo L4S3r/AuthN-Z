@@ -9,6 +9,7 @@ Uses SQLite WAL mode for high-concurrency multi-process read/write operations.
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
 import re
@@ -205,9 +206,6 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 );
             """)
 
-            # Indices for performance
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_wm_ws_user ON workspace_members(workspace_id, user_id);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_wm_email ON workspace_members(email);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_wm_token ON workspace_members(invite_token);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ws_slug ON workspaces(slug);")
 
@@ -223,6 +221,11 @@ class WorkspaceRepository(abstractWorkspaceRepository):
 
         # Ensure default workspace exists and migrate existing records
         self._ensure_default_workspace_migration()
+
+    @staticmethod
+    def _hash_token(token: str) -> str:
+        """Compute SHA-256 digest of an invitation token for secure at-rest storage."""
+        return hashlib.sha256((token or "").strip().encode("utf-8")).hexdigest()
 
     def _slugify(self, text: str) -> str:
         """Generate a clean URL slug from a display name."""
@@ -608,6 +611,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         """Issue a cryptographic single-use invitation to join a specific workspace."""
         member_id = str(uuid.uuid4())
         invite_token = secrets.token_urlsafe(32)
+        token_hash = self._hash_token(invite_token)
         now = datetime.now(timezone.utc)
         expires_at = (now + timedelta(days=expires_days)).isoformat()
         now_str = now.isoformat()
@@ -654,7 +658,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 role,
                 department,
                 invited_by,
-                invite_token,
+                token_hash,
                 expires_at,
                 now_str,
             ))
@@ -754,9 +758,12 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             return result
 
     def get_invitation_by_token(self, token: str) -> Optional[Dict[str, Any]]:
-        """Resolve and validate an invitation token across all workspaces."""
-        if not token:
+        """Resolve and validate an active, unconsumed invitation token across all workspaces."""
+        clean_token = (token or "").strip()
+        if not clean_token:
             return None
+
+        lookup_hash = self._hash_token(clean_token)
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -764,8 +771,8 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 SELECT wm.*, w.name as workspace_name, w.slug as workspace_slug
                 FROM workspace_members wm
                 INNER JOIN workspaces w ON wm.workspace_id = w.id
-                WHERE wm.invite_token = ?
-            """, (token.strip(),))
+                WHERE (wm.invite_token = ? OR wm.invite_token = ?) AND wm.status = 'invited'
+            """, (lookup_hash, clean_token))
             row = cursor.fetchone()
             if not row:
                 return None
@@ -788,19 +795,29 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         token: str,
         user_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Mark invitation as accepted, link user ID, and activate workspace clearance."""
-        invite = self.get_invitation_by_token(token)
+        """Atomically consume invitation token, activate workspace clearance, and prevent replay."""
+        clean_token = (token or "").strip()
+        if not clean_token:
+            return None
+
+        invite = self.get_invitation_by_token(clean_token)
         if not invite or invite.get("is_expired"):
             return None
+
+        lookup_hash = self._hash_token(clean_token)
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE workspace_members
-                SET status = 'active', invite_token = NULL, user_id = COALESCE(?, user_id)
-                WHERE invite_token = ?
-            """, (user_id, token.strip()))
+                SET status = 'active', invite_token = NULL, expires_at = NULL, user_id = COALESCE(?, user_id)
+                WHERE (invite_token = ? OR invite_token = ?) AND status = 'invited'
+            """, (user_id, lookup_hash, clean_token))
             conn.commit()
+
+            # Guard against concurrent consumption
+            if cursor.rowcount == 0:
+                return None
 
         return self.get_member(invite["workspace_id"], user_id=user_id, email=invite["email"])
 
