@@ -864,6 +864,7 @@ async def list_my_trusted_devices(
     request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    user_id = current_user["user_id"]
     raw_cand = (
         request.cookies.get("trusted_device")
         or request.headers.get("X-Trusted-Device-Token")
