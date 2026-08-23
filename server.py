@@ -294,6 +294,21 @@ def set_trusted_device_cookie(response: Response, request: Request, raw_token: s
         is_https = request.url.scheme == "https" or proto == "https"
         domain = None
 
+    # Clear legacy unscoped (path=/) cookie from previous deployments to prevent stale duplicates in browser
+    response.delete_cookie(
+        key="trusted_device",
+        domain=domain,
+        path="/",
+        samesite="lax",
+        secure=is_https,
+    )
+    response.delete_cookie(
+        key="trusted_device",
+        path="/",
+        samesite="lax",
+        secure=is_https,
+    )
+
     response.set_cookie(
         key="trusted_device",
         value=raw_token,
