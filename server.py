@@ -281,6 +281,63 @@ def check_rate_limit(key: str, max_requests: int, window_seconds: int) -> bool:
     return True
 
 
+def set_trusted_device_cookie(response: Response, request: Request, raw_token: str) -> None:
+    """Set trusted device cookie with cross-subdomain support and protocol awareness."""
+    host = (request.headers.get("host") or "").lower()
+    origin = (request.headers.get("origin") or "").lower()
+    proto = (request.headers.get("x-forwarded-proto") or "").lower()
+
+    is_https = (
+        request.url.scheme == "https"
+        or proto == "https"
+        or "l4s3r.site" in host
+        or "l4s3r.site" in origin
+    )
+    # Enable root domain cookie sharing between auth-api.l4s3r.site and tasks.l4s3r.site
+    domain = ".l4s3r.site" if ("l4s3r.site" in host or "l4s3r.site" in origin) else None
+
+    response.set_cookie(
+        key="trusted_device",
+        value=raw_token,
+        max_age=30 * 86400,
+        httponly=True,
+        samesite="none" if is_https else "lax",
+        secure=is_https,
+        domain=domain,
+        path="/",
+    )
+
+
+def clear_trusted_device_cookie(response: Response, request: Request) -> None:
+    """Clear trusted device cookie across domain and host scopes."""
+    host = (request.headers.get("host") or "").lower()
+    origin = (request.headers.get("origin") or "").lower()
+    proto = (request.headers.get("x-forwarded-proto") or "").lower()
+
+    is_https = (
+        request.url.scheme == "https"
+        or proto == "https"
+        or "l4s3r.site" in host
+        or "l4s3r.site" in origin
+    )
+    domain = ".l4s3r.site" if ("l4s3r.site" in host or "l4s3r.site" in origin) else None
+
+    response.delete_cookie(
+        key="trusted_device",
+        domain=domain,
+        path="/",
+        samesite="none" if is_https else "lax",
+        secure=is_https,
+    )
+    if domain:
+        response.delete_cookie(
+            key="trusted_device",
+            path="/",
+            samesite="none" if is_https else "lax",
+            secure=is_https,
+        )
+
+
 # =============================================================================
 # Security Dependency: Current Authenticated User Context
 # =============================================================================
@@ -490,16 +547,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
                 )
                 audit_log.record_auth_success(user_id, "password+trusted_device", ip_address=client_ip)
 
-                is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https" or ENVIRONMENT == "production"
-                response.set_cookie(
-                    "trusted_device",
-                    clean_token,
-                    max_age=30 * 86400,
-                    httponly=True,
-                    samesite="none" if is_https else "lax",
-                    secure=is_https,
-                    path="/",
-                )
+                set_trusted_device_cookie(response, request, clean_token)
 
                 return {
                     "status": "SUCCESS",
@@ -713,7 +761,11 @@ async def verify_mfa_setup(
 
 
 @app.post("/auth/mfa/disable", tags=["MFA Enrollment"])
-async def disable_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
+async def disable_mfa(
+    request: Request,
+    response: Response,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Disable two-factor authentication for the authenticated user."""
     user_id = current_user["user_id"]
     user = repo.get_by_id(user_id)
@@ -730,6 +782,7 @@ async def disable_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
 
     # Revoke all trusted devices when MFA is disabled
     device_trust_svc.revoke_all_trusted_devices(user_id)
+    clear_trusted_device_cookie(response, request)
 
     audit_log.record_security_event(
         event_name="MFA_DISABLED",
@@ -758,16 +811,7 @@ async def complete_mfa(req: MFACompleteRequest, request: Request, response: Resp
                 ip_address=client_ip,
                 days_valid=30,
             )
-            is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https" or ENVIRONMENT == "production"
-            response.set_cookie(
-                "trusted_device",
-                raw_dev_token,
-                max_age=30 * 86400,
-                httponly=True,
-                samesite="none" if is_https else "lax",
-                secure=is_https,
-                path="/",
-            )
+            set_trusted_device_cookie(response, request, raw_dev_token)
             res["trusted_device_token"] = raw_dev_token
             res["trusted_device"] = dev_rec
 
@@ -820,9 +864,14 @@ async def list_my_trusted_devices(
     request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """List all active trusted devices for the authenticated user."""
-    user_id = current_user["user_id"]
-    current_token = request.cookies.get("trusted_device") or request.headers.get("X-Trusted-Device-Token")
+    raw_cand = (
+        request.cookies.get("trusted_device")
+        or request.headers.get("X-Trusted-Device-Token")
+        or request.headers.get("x-trusted-device-token")
+        or request.headers.get("X-Device-Token")
+        or request.headers.get("x-device-token")
+    )
+    current_token = str(raw_cand).strip().strip('"').strip("'") if raw_cand else None
     devices = device_trust_svc.list_trusted_devices(user_id, current_token=current_token)
     return {
         "status": "SUCCESS",
@@ -835,6 +884,7 @@ async def list_my_trusted_devices(
 async def revoke_my_trusted_device(
     device_id: str,
     request: Request,
+    response: Response,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Revoke trust for a specific device."""
@@ -843,6 +893,8 @@ async def revoke_my_trusted_device(
     revoked = device_trust_svc.revoke_trusted_device(user_id, device_id)
     if not revoked:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trusted device not found.")
+
+    clear_trusted_device_cookie(response, request)
 
     audit_log.record_security_event(
         event_name="DEVICE_TRUST_REVOKED",
@@ -855,12 +907,14 @@ async def revoke_my_trusted_device(
 @app.delete("/auth/trusted-devices", tags=["Device Trust"])
 async def revoke_all_my_trusted_devices(
     request: Request,
+    response: Response,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Revoke all trusted devices for the authenticated user."""
     user_id = current_user["user_id"]
     client_ip = request.client.host if request.client else "unknown"
     count = device_trust_svc.revoke_all_trusted_devices(user_id)
+    clear_trusted_device_cookie(response, request)
 
     audit_log.record_security_event(
         event_name="ALL_DEVICES_TRUST_REVOKED",

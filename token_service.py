@@ -153,7 +153,7 @@ class TokenService(abstractTokenService):
             self.r = redis_client
         elif redis is not None:
             try:
-                self.r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+                self.r = redis.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True, socket_connect_timeout=0.5, socket_timeout=0.5)
                 self.r.ping()
             except Exception as exc:
                 logger.warning(
