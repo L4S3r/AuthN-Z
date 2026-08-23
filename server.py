@@ -231,6 +231,8 @@ class LoginRequest(BaseModel):
     identifier: str
     password: str
     trusted_device_token: Optional[str] = None
+    device_token: Optional[str] = None
+    trusted_device: Optional[str] = None
 
 
 class OAuthExchangeRequest(BaseModel):
@@ -421,11 +423,21 @@ async def login(req: LoginRequest, request: Request, response: Response):
     elif res["status"] == "MFA_REQUIRED":
         # Check if client presented a valid, unexpired trusted-device token
         user_id = res["user_id"]
-        cand_token = req.trusted_device_token or request.cookies.get("trusted_device") or request.headers.get("X-Trusted-Device-Token")
+        cand_token = (
+            req.trusted_device_token
+            or req.device_token
+            or req.trusted_device
+            or request.cookies.get("trusted_device")
+            or request.headers.get("X-Trusted-Device-Token")
+            or request.headers.get("x-trusted-device-token")
+            or request.headers.get("X-Device-Token")
+            or request.headers.get("x-device-token")
+        )
         if cand_token:
+            clean_token = str(cand_token).strip().strip('"').strip("'")
             trusted_dev = device_trust_svc.verify_trusted_device(
                 user_id=user_id,
-                raw_token=cand_token,
+                raw_token=clean_token,
                 user_agent=user_agent,
                 ip_address=client_ip,
             )
@@ -443,6 +455,29 @@ async def login(req: LoginRequest, request: Request, response: Response):
                 refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles})
                 session_id = sess_store.create_session(user_id, session_data={"roles": roles})
 
+                meta = user.get("metadata", {}) if user else {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                safe_meta = dict(meta) if isinstance(meta, dict) else {}
+                safe_meta.pop("mfa_secret", None)
+                safe_meta.pop("backup_codes", None)
+
+                user_name = safe_meta.get("name") or (user["username"] if user else "")
+                user_avatar = safe_meta.get("avatar_url")
+
+                safe_user = {
+                    "id": user_id,
+                    "name": user_name,
+                    "username": user["username"] if user else "",
+                    "email": user["email"] if user else "",
+                    "avatar_url": user_avatar,
+                    "roles": roles,
+                    "metadata": safe_meta,
+                }
+
                 audit_log.record_security_event(
                     event_name="MFA_SKIPPED_TRUSTED_DEVICE",
                     severity="INFO",
@@ -455,23 +490,32 @@ async def login(req: LoginRequest, request: Request, response: Response):
                 )
                 audit_log.record_auth_success(user_id, "password+trusted_device", ip_address=client_ip)
 
+                is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https" or ENVIRONMENT == "production"
                 response.set_cookie(
                     "trusted_device",
-                    cand_token.strip(),
+                    clean_token,
                     max_age=30 * 86400,
                     httponly=True,
-                    samesite="lax",
+                    samesite="none" if is_https else "lax",
+                    secure=is_https,
+                    path="/",
                 )
 
                 return {
                     "status": "SUCCESS",
                     "mfa_skipped": True,
                     "trusted_device": trusted_dev,
+                    "trusted_device_token": clean_token,
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                     "session_id": session_id,
                     "user_id": user_id,
+                    "name": user_name,
+                    "username": user["username"] if user else "",
+                    "email": user["email"] if user else "",
+                    "avatar_url": user_avatar,
                     "roles": roles,
+                    "user": safe_user,
                 }
 
         # Otherwise require TOTP challenge
@@ -714,12 +758,15 @@ async def complete_mfa(req: MFACompleteRequest, request: Request, response: Resp
                 ip_address=client_ip,
                 days_valid=30,
             )
+            is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https" or ENVIRONMENT == "production"
             response.set_cookie(
                 "trusted_device",
                 raw_dev_token,
                 max_age=30 * 86400,
                 httponly=True,
-                samesite="lax",
+                samesite="none" if is_https else "lax",
+                secure=is_https,
+                path="/",
             )
             res["trusted_device_token"] = raw_dev_token
             res["trusted_device"] = dev_rec
@@ -734,6 +781,26 @@ async def complete_mfa(req: MFACompleteRequest, request: Request, response: Resp
                     "ip_address": client_ip,
                 },
             )
+
+        # Enrich user metadata in response
+        user = repo.get_by_id(req.user_id)
+        if user:
+            meta = user.get("metadata", {})
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            safe_meta = dict(meta) if isinstance(meta, dict) else {}
+            safe_meta.pop("mfa_secret", None)
+            safe_meta.pop("backup_codes", None)
+            res["name"] = safe_meta.get("name") or user["username"]
+            res["username"] = user["username"]
+            res["email"] = user["email"]
+            res["avatar_url"] = safe_meta.get("avatar_url")
+            if "user" in res and isinstance(res["user"], dict):
+                res["user"]["name"] = res["name"]
+                res["user"]["avatar_url"] = res["avatar_url"]
 
         return res
     else:
