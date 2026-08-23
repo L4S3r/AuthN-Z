@@ -24,6 +24,7 @@ from user_repository import UserRepository
 from token_service import TokenService
 from session_store import SessionStore
 from mfa_provider import MFAProvider
+from device_trust_service import DeviceTrustService
 
 
 class abstractAuthenticator(ABC):
@@ -34,6 +35,9 @@ class abstractAuthenticator(ABC):
         self,
         identifier: str,
         plain_password: str,
+        trusted_device_token: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        ip_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Verify primary identity credentials (username/email and password).
@@ -122,6 +126,9 @@ class abstractAuthenticator(ABC):
         user_id: str,
         challenge_id: str,
         response_code: str,
+        remember_device: bool = False,
+        user_agent: Optional[str] = None,
+        ip_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Validate a submitted second-factor code to finalize an authentication workflow.
@@ -130,6 +137,9 @@ class abstractAuthenticator(ABC):
             user_id: The identifier of the user completing the challenge.
             challenge_id: The identifier of the pending challenge being answered.
             response_code: The 6-8 digit code or backup code submitted by the user.
+            remember_device: Whether to issue and persist a 30-day trusted device token.
+            user_agent: The browser User-Agent header of the caller.
+            ip_address: The client IP address.
 
         Returns:
             A dictionary indicating final authentication success (with user context/tokens) or failure with retry details.
@@ -156,12 +166,14 @@ class Authenticator(abstractAuthenticator):
         token_service: Optional[TokenService] = None,
         session_store: Optional[SessionStore] = None,
         mfa_provider: Optional[MFAProvider] = None,
+        device_trust_service: Optional[DeviceTrustService] = None,
     ):
         self.user_repo = user_repo or UserRepository()
         self.hasher = hasher or PasswordHasher()
         self.token_service = token_service or TokenService()
         self.session_store = session_store or SessionStore()
         self.mfa_provider = mfa_provider or MFAProvider()
+        self.device_trust_service = device_trust_service or DeviceTrustService()
         self._pending_mfa_challenges: Dict[str, Dict[str, Any]] = {}
 
     def _get_mfa_challenge(self, challenge_id: str) -> Optional[Dict[str, Any]]:
@@ -205,6 +217,9 @@ class Authenticator(abstractAuthenticator):
         self,
         identifier: str,
         plain_password: str,
+        trusted_device_token: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        ip_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Verify primary identity credentials (username/email and password)."""
         user = self.user_repo.get_by_identifier(identifier)
@@ -244,13 +259,26 @@ class Authenticator(abstractAuthenticator):
             except Exception:
                 metadata = {}
 
+        mfa_skipped = False
+        trusted_dev_rec = None
         if metadata.get("mfa_enabled") and metadata.get("mfa_secret"):
-            challenge = self.initiate_mfa_challenge(user["id"], challenge_type="totp")
-            return {
-                "status": "MFA_REQUIRED",
-                "user_id": user["id"],
-                "challenge_id": challenge["challenge_id"],
-            }
+            if trusted_device_token and self.device_trust_service:
+                trusted_dev_rec = self.device_trust_service.verify_trusted_device(
+                    user_id=user["id"],
+                    raw_token=trusted_device_token,
+                    user_agent=user_agent,
+                    ip_address=ip_address,
+                )
+                if trusted_dev_rec:
+                    mfa_skipped = True
+
+            if not mfa_skipped:
+                challenge = self.initiate_mfa_challenge(user["id"], challenge_type="totp")
+                return {
+                    "status": "MFA_REQUIRED",
+                    "user_id": user["id"],
+                    "challenge_id": challenge["challenge_id"],
+                }
 
         # Issue tokens and session
         roles = user.get("roles", [])
@@ -269,7 +297,7 @@ class Authenticator(abstractAuthenticator):
         safe_metadata.pop("mfa_secret", None)
         safe_metadata.pop("backup_codes", None)
 
-        return {
+        resp = {
             "status": "SUCCESS",
             "user_id": user["id"],
             "access_token": access_token,
@@ -283,6 +311,16 @@ class Authenticator(abstractAuthenticator):
                 "metadata": safe_metadata,
             },
         }
+        if mfa_skipped and trusted_dev_rec:
+            resp["mfa_skipped"] = True
+            resp["trusted_device"] = {
+                "id": trusted_dev_rec.get("id"),
+                "device_label": trusted_dev_rec.get("device_label"),
+                "created_at": trusted_dev_rec.get("created_at"),
+                "expires_at": trusted_dev_rec.get("expires_at"),
+            }
+
+        return resp
 
 
     def authenticate_token(self, token: str) -> Dict[str, Any]:
@@ -433,6 +471,9 @@ class Authenticator(abstractAuthenticator):
         user_id: str,
         challenge_id: str,
         response_code: str,
+        remember_device: bool = False,
+        user_agent: Optional[str] = None,
+        ip_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Validate a submitted second-factor code against the Redis-backed challenge."""
         user = self.user_repo.get_by_id(user_id)
@@ -516,12 +557,22 @@ class Authenticator(abstractAuthenticator):
         refresh_token = self.token_service.create_refresh_token(user["id"], claims={"roles": roles})
         session_id = self.session_store.create_session(user["id"], session_data={"roles": roles})
 
+        # Provision trusted device if requested
+        raw_dev_token = None
+        dev_rec = None
+        if remember_device and self.device_trust_service:
+            dev_rec, raw_dev_token = self.device_trust_service.create_trusted_device(
+                user_id=user["id"],
+                user_agent=user_agent,
+                ip_address=ip_address,
+            )
+
         # Sanitize metadata for response
         safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
         safe_metadata.pop("mfa_secret", None)
         safe_metadata.pop("backup_codes", None)
 
-        return {
+        resp = {
             "status": "SUCCESS",
             "user_id": user["id"],
             "access_token": access_token,
@@ -535,5 +586,16 @@ class Authenticator(abstractAuthenticator):
                 "metadata": safe_metadata,
             },
         }
+        if dev_rec:
+            resp["trusted_device"] = {
+                "id": dev_rec.get("id"),
+                "device_label": dev_rec.get("device_label"),
+                "created_at": dev_rec.get("created_at"),
+                "expires_at": dev_rec.get("expires_at"),
+            }
+        if raw_dev_token:
+            resp["_raw_device_token"] = raw_dev_token
+
+        return resp
 
         

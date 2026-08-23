@@ -107,7 +107,7 @@ from task_repository import TaskRepository
 from workspace_repository import WorkspaceRepository
 from email_service import EmailService
 
-# Core Component Singletons
+#singletons
 hasher = concretePasswordHasher()
 repo = concreteUserRepository(db_file="DATABASE.db")
 ws_repo = WorkspaceRepository(db_file="DATABASE.db")
@@ -119,13 +119,13 @@ oauth_mgr = OAuthManager(redis_client=sess_store.r)
 task_repo = TaskRepository(db_file="DATABASE.db")
 email_svc = EmailService()
 device_trust_svc = DeviceTrustService(db_file="DATABASE.db")
-
 auth = Authenticator(
     user_repo=repo,
     hasher=hasher,
     token_service=token_svc,
     session_store=sess_store,
     mfa_provider=mfa_prov,
+    device_trust_service=device_trust_svc,
 )
 
 perm_eval = PermissionEvaluator(user_repo=repo, workspace_repo=ws_repo)
@@ -261,6 +261,7 @@ class MFACompleteRequest(BaseModel):
     challenge_id: str
     code: str
     remember_device: Optional[bool] = False
+    trusted_device_token: Optional[str] = None
 
 
 
@@ -282,60 +283,68 @@ def check_rate_limit(key: str, max_requests: int, window_seconds: int) -> bool:
 
 
 def set_trusted_device_cookie(response: Response, request: Request, raw_token: str) -> None:
-    """Set trusted device cookie with cross-subdomain support and protocol awareness."""
-    host = (request.headers.get("host") or "").lower()
-    origin = (request.headers.get("origin") or "").lower()
-    proto = (request.headers.get("x-forwarded-proto") or "").lower()
-
-    is_https = (
-        request.url.scheme == "https"
-        or proto == "https"
-        or "l4s3r.site" in host
-        or "l4s3r.site" in origin
-    )
-    # Enable root domain cookie sharing between auth-api.l4s3r.site and tasks.l4s3r.site
-    domain = ".l4s3r.site" if ("l4s3r.site" in host or "l4s3r.site" in origin) else None
+    """Set scoped HttpOnly trusted device cookie with path=/auth, samesite=lax, gated by server ENVIRONMENT config."""
+    if ENVIRONMENT == "production":
+        # Production: Strictly enforce HTTPS and cross-subdomain sharing
+        is_https = True
+        domain = ".l4s3r.site"
+    else:
+        # Development / Testing: Request-aware TLS without forced domain
+        proto = (request.headers.get("x-forwarded-proto") or "").lower()
+        is_https = request.url.scheme == "https" or proto == "https"
+        domain = None
 
     response.set_cookie(
         key="trusted_device",
         value=raw_token,
         max_age=30 * 86400,
         httponly=True,
-        samesite="none" if is_https else "lax",
+        samesite="lax",
         secure=is_https,
         domain=domain,
-        path="/",
+        path="/auth",
     )
 
 
 def clear_trusted_device_cookie(response: Response, request: Request) -> None:
-    """Clear trusted device cookie across domain and host scopes."""
-    host = (request.headers.get("host") or "").lower()
-    origin = (request.headers.get("origin") or "").lower()
-    proto = (request.headers.get("x-forwarded-proto") or "").lower()
+    """Clear trusted device cookie across all domain and path scopes."""
+    if ENVIRONMENT == "production":
+        is_https = True
+        domain = ".l4s3r.site"
+    else:
+        proto = (request.headers.get("x-forwarded-proto") or "").lower()
+        is_https = request.url.scheme == "https" or proto == "https"
+        domain = None
 
-    is_https = (
-        request.url.scheme == "https"
-        or proto == "https"
-        or "l4s3r.site" in host
-        or "l4s3r.site" in origin
-    )
-    domain = ".l4s3r.site" if ("l4s3r.site" in host or "l4s3r.site" in origin) else None
-
+    # Clear scoped cookie at path="/auth"
     response.delete_cookie(
         key="trusted_device",
         domain=domain,
-        path="/",
-        samesite="none" if is_https else "lax",
+        path="/auth",
+        samesite="lax",
+        secure=is_https,
+    )
+    # Clear legacy path="/" and host-only variants
+    response.delete_cookie(
+        key="trusted_device",
+        path="/auth",
+        samesite="lax",
         secure=is_https,
     )
     if domain:
         response.delete_cookie(
             key="trusted_device",
+            domain=domain,
             path="/",
-            samesite="none" if is_https else "lax",
+            samesite="lax",
             secure=is_https,
         )
+    response.delete_cookie(
+        key="trusted_device",
+        path="/",
+        samesite="lax",
+        secure=is_https,
+    )
 
 
 # =============================================================================
@@ -472,101 +481,71 @@ async def login(req: LoginRequest, request: Request, response: Response):
             detail="Too many login attempts. Please wait 60 seconds before trying again.",
         )
 
-    res = auth.authenticate_credentials(req.identifier, req.password)
+    cand_token = (
+        req.trusted_device_token
+        or req.device_token
+        or req.trusted_device
+        or request.cookies.get("trusted_device")
+        or request.headers.get("X-Trusted-Device-Token")
+        or request.headers.get("x-trusted-device-token")
+        or request.headers.get("X-Device-Token")
+        or request.headers.get("x-device-token")
+    )
+    clean_token = str(cand_token).strip().strip('"').strip("'") if cand_token else None
+
+    res = auth.authenticate_credentials(
+        req.identifier,
+        req.password,
+        trusted_device_token=clean_token,
+        user_agent=user_agent,
+        ip_address=client_ip,
+    )
 
     if res["status"] == "SUCCESS":
-        audit_log.record_auth_success(res["user_id"], "password", ip_address=client_ip)
+        if res.get("mfa_skipped"):
+            trusted_dev = res.get("trusted_device", {})
+            audit_log.record_security_event(
+                event_name="MFA_SKIPPED_TRUSTED_DEVICE",
+                severity="INFO",
+                details={
+                    "user_id": res["user_id"],
+                    "device_id": trusted_dev.get("id") if isinstance(trusted_dev, dict) else "",
+                    "device_label": trusted_dev.get("device_label") if isinstance(trusted_dev, dict) else "",
+                    "ip_address": client_ip,
+                },
+            )
+            if clean_token:
+                set_trusted_device_cookie(response, request, clean_token)
+        else:
+            audit_log.record_auth_success(res["user_id"], "password", ip_address=client_ip)
+
+        res.pop("trusted_device_token", None)
+        res.pop("_raw_device_token", None)
+
+        # Enrich user profile fields for frontend client compatibility
+        user = repo.get_by_id(res["user_id"])
+        if user:
+            meta = user.get("metadata", {})
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            safe_meta = dict(meta) if isinstance(meta, dict) else {}
+            safe_meta.pop("mfa_secret", None)
+            safe_meta.pop("backup_codes", None)
+            user_name = safe_meta.get("name") or user.get("username", "")
+            user_avatar = safe_meta.get("avatar_url")
+            res["name"] = user_name
+            res["username"] = user.get("username", "")
+            res["email"] = user.get("email", "")
+            res["avatar_url"] = user_avatar
+            if "user" in res and isinstance(res["user"], dict):
+                res["user"]["name"] = user_name
+                res["user"]["avatar_url"] = user_avatar
+
         return res
     elif res["status"] == "MFA_REQUIRED":
-        # Check if client presented a valid, unexpired trusted-device token
-        user_id = res["user_id"]
-        cand_token = (
-            req.trusted_device_token
-            or req.device_token
-            or req.trusted_device
-            or request.cookies.get("trusted_device")
-            or request.headers.get("X-Trusted-Device-Token")
-            or request.headers.get("x-trusted-device-token")
-            or request.headers.get("X-Device-Token")
-            or request.headers.get("x-device-token")
-        )
-        if cand_token:
-            clean_token = str(cand_token).strip().strip('"').strip("'")
-            trusted_dev = device_trust_svc.verify_trusted_device(
-                user_id=user_id,
-                raw_token=clean_token,
-                user_agent=user_agent,
-                ip_address=client_ip,
-            )
-            if trusted_dev:
-                # Valid trusted device: skip second factor
-                user = repo.get_by_id(user_id)
-                roles = user.get("roles", []) if user else []
-                if isinstance(roles, str):
-                    try:
-                        roles = json.loads(roles)
-                    except Exception:
-                        roles = []
-
-                access_token = token_svc.create_access_token(user_id, claims={"roles": roles})
-                refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles})
-                session_id = sess_store.create_session(user_id, session_data={"roles": roles})
-
-                meta = user.get("metadata", {}) if user else {}
-                if isinstance(meta, str):
-                    try:
-                        meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
-                safe_meta = dict(meta) if isinstance(meta, dict) else {}
-                safe_meta.pop("mfa_secret", None)
-                safe_meta.pop("backup_codes", None)
-
-                user_name = safe_meta.get("name") or (user["username"] if user else "")
-                user_avatar = safe_meta.get("avatar_url")
-
-                safe_user = {
-                    "id": user_id,
-                    "name": user_name,
-                    "username": user["username"] if user else "",
-                    "email": user["email"] if user else "",
-                    "avatar_url": user_avatar,
-                    "roles": roles,
-                    "metadata": safe_meta,
-                }
-
-                audit_log.record_security_event(
-                    event_name="MFA_SKIPPED_TRUSTED_DEVICE",
-                    severity="INFO",
-                    details={
-                        "user_id": user_id,
-                        "device_id": trusted_dev["id"],
-                        "device_label": trusted_dev["device_label"],
-                        "ip_address": client_ip,
-                    },
-                )
-                audit_log.record_auth_success(user_id, "password+trusted_device", ip_address=client_ip)
-
-                set_trusted_device_cookie(response, request, clean_token)
-
-                return {
-                    "status": "SUCCESS",
-                    "mfa_skipped": True,
-                    "trusted_device": trusted_dev,
-                    "trusted_device_token": clean_token,
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "session_id": session_id,
-                    "user_id": user_id,
-                    "name": user_name,
-                    "username": user["username"] if user else "",
-                    "email": user["email"] if user else "",
-                    "avatar_url": user_avatar,
-                    "roles": roles,
-                    "user": safe_user,
-                }
-
-        # Otherwise require TOTP challenge
         return res
     else:
         audit_log.record_auth_failure(
@@ -644,6 +623,7 @@ async def refresh_tokens(req: RefreshRequest, request: Request):
 async def logout(
     req: LogoutRequest = LogoutRequest(),
     request: Request = None,
+    response: Response = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Invalidate caller's JWT access token and active session (single-device or all devices)."""
@@ -660,6 +640,9 @@ async def logout(
     sessions_deleted = 0
     if req.logout_all_devices:
         sessions_deleted = sess_store.delete_all_user_sessions(user_id)
+        device_trust_svc.revoke_all_trusted_devices(user_id)
+        if response and request:
+            clear_trusted_device_cookie(response, request)
     elif req.session_id:
         sess_store.delete_session(req.session_id)
         sessions_deleted = 1
@@ -797,31 +780,33 @@ async def disable_mfa(
 @app.post("/auth/mfa/complete", tags=["MFA Verification"])
 async def complete_mfa(req: MFACompleteRequest, request: Request, response: Response):
     """Validate a TOTP code or emergency backup code to finalize an MFA challenge with optional device trust."""
-    res = auth.complete_mfa_challenge(req.user_id, req.challenge_id, req.code)
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "")
+
+    res = auth.complete_mfa_challenge(
+        user_id=req.user_id,
+        challenge_id=req.challenge_id,
+        response_code=req.code,
+        remember_device=bool(req.remember_device),
+        user_agent=user_agent,
+        ip_address=client_ip,
+    )
 
     if res["status"] == "SUCCESS":
         audit_log.record_auth_success(req.user_id, "mfa_challenge", ip_address=client_ip)
 
-        if req.remember_device:
-            dev_rec, raw_dev_token = device_trust_svc.create_trusted_device(
-                user_id=req.user_id,
-                user_agent=user_agent,
-                ip_address=client_ip,
-                days_valid=30,
-            )
+        raw_dev_token = res.pop("trusted_device_token", None) or res.pop("_raw_device_token", None)
+        if raw_dev_token:
+            dev_rec = res.get("trusted_device", {})
             set_trusted_device_cookie(response, request, raw_dev_token)
-            res["trusted_device_token"] = raw_dev_token
-            res["trusted_device"] = dev_rec
 
             audit_log.record_security_event(
                 event_name="DEVICE_TRUSTED",
                 severity="INFO",
                 details={
                     "user_id": req.user_id,
-                    "device_id": dev_rec["id"],
-                    "device_label": dev_rec["device_label"],
+                    "device_id": dev_rec.get("id") if isinstance(dev_rec, dict) else "",
+                    "device_label": dev_rec.get("device_label") if isinstance(dev_rec, dict) else "",
                     "ip_address": client_ip,
                 },
             )
@@ -864,15 +849,11 @@ async def list_my_trusted_devices(
     request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    """List all active trusted devices for the authenticated user."""
     user_id = current_user["user_id"]
-    raw_cand = (
-        request.cookies.get("trusted_device")
-        or request.headers.get("X-Trusted-Device-Token")
-        or request.headers.get("x-trusted-device-token")
-        or request.headers.get("X-Device-Token")
-        or request.headers.get("x-device-token")
-    )
-    current_token = str(raw_cand).strip().strip('"').strip("'") if raw_cand else None
+    current_token = request.cookies.get("trusted_device")
+    if current_token:
+        current_token = str(current_token).strip().strip('"').strip("'")
     devices = device_trust_svc.list_trusted_devices(user_id, current_token=current_token)
     return {
         "status": "SUCCESS",
@@ -891,16 +872,28 @@ async def revoke_my_trusted_device(
     """Revoke trust for a specific device."""
     user_id = current_user["user_id"]
     client_ip = request.client.host if request.client else "unknown"
+
+    # Identify if the device being revoked is the caller's current browser device via cookie
+    current_token = request.cookies.get("trusted_device")
+    is_current = False
+    if current_token:
+        clean_curr = str(current_token).strip().strip('"').strip("'")
+        verified_curr = device_trust_svc.verify_trusted_device(user_id, clean_curr)
+        if verified_curr and verified_curr.get("id") == device_id.strip():
+            is_current = True
+
     revoked = device_trust_svc.revoke_trusted_device(user_id, device_id)
     if not revoked:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trusted device not found.")
 
-    clear_trusted_device_cookie(response, request)
+    # Clear cookie whenever current device trust is revoked
+    if is_current or current_token:
+        clear_trusted_device_cookie(response, request)
 
     audit_log.record_security_event(
         event_name="DEVICE_TRUST_REVOKED",
         severity="INFO",
-        details={"user_id": user_id, "device_id": device_id, "ip_address": client_ip},
+        details={"user_id": user_id, "device_id": device_id, "is_current": is_current, "ip_address": client_ip},
     )
     return {"status": "SUCCESS", "message": "Device trust revoked successfully."}
 
