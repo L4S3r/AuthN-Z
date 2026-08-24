@@ -261,40 +261,45 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                     VALUES ('ws_default', 'Default Workspace', 'default', 'Primary workspace for team collaboration.', ?, ?, ?)
                 """, (creator_id, now, now))
 
-            # Migrate legacy team_members table into workspace_members if team_members exists
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='team_members'")
-            if cursor.fetchone():
-                cursor.execute("SELECT * FROM team_members")
-                legacy_members = cursor.fetchall()
-                for lm in legacy_members:
-                    lm_dict = dict(lm)
-                    email = lm_dict.get("email", "").strip().lower()
-                    if not email:
-                        continue
+            # Migrate legacy team_members table into workspace_members (one-time migration only)
+            cursor.execute("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, executed_at TEXT NOT NULL);")
+            cursor.execute("SELECT 1 FROM schema_migrations WHERE name = 'legacy_team_members_migrated'")
+            if not cursor.fetchone():
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='team_members'")
+                if cursor.fetchone():
+                    cursor.execute("SELECT * FROM team_members")
+                    legacy_members = cursor.fetchall()
+                    for lm in legacy_members:
+                        lm_dict = dict(lm)
+                        email = lm_dict.get("email", "").strip().lower()
+                        if not email:
+                            continue
 
-                    # Lookup user_id if registered
-                    cursor.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,))
-                    user_row = cursor.fetchone()
-                    user_id = user_row["id"] if user_row else None
+                        # Lookup user_id if registered
+                        cursor.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,))
+                        user_row = cursor.fetchone()
+                        user_id = user_row["id"] if user_row else None
 
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO workspace_members (
-                            id, workspace_id, user_id, email, name, role, department,
-                            status, invited_by, invite_token, expires_at, invited_at
-                        ) VALUES (?, 'ws_default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        lm_dict.get("id") or str(uuid.uuid4()),
-                        user_id,
-                        email,
-                        lm_dict.get("name"),
-                        lm_dict.get("role", "viewer"),
-                        lm_dict.get("department", "General"),
-                        lm_dict.get("status", "active"),
-                        lm_dict.get("invited_by", "system"),
-                        lm_dict.get("invite_token"),
-                        lm_dict.get("expires_at"),
-                        lm_dict.get("invited_at") or now,
-                    ))
+                        cursor.execute("""
+                            INSERT OR IGNORE INTO workspace_members (
+                                id, workspace_id, user_id, email, name, role, department,
+                                status, invited_by, invite_token, expires_at, invited_at
+                            ) VALUES (?, 'ws_default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            lm_dict.get("id") or str(uuid.uuid4()),
+                            user_id,
+                            email,
+                            lm_dict.get("name"),
+                            lm_dict.get("role", "viewer"),
+                            lm_dict.get("department", "General"),
+                            lm_dict.get("status", "active"),
+                            lm_dict.get("invited_by", "system"),
+                            lm_dict.get("invite_token"),
+                            lm_dict.get("expires_at"),
+                            lm_dict.get("invited_at") or now,
+                        ))
+                    cursor.execute("DELETE FROM team_members;")
+                cursor.execute("INSERT OR IGNORE INTO schema_migrations (name, executed_at) VALUES ('legacy_team_members_migrated', ?)", (now,))
 
             # Migrate legacy tasks without workspace_id
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
@@ -935,8 +940,15 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             """
             params = [ws_id] + all_keys + all_keys + [k.lower() for k in all_keys] + [k.lower() for k in all_keys]
             cursor.execute(query, params)
+            deleted_count = cursor.rowcount
+
+            # Also delete from legacy team_members if table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='team_members'")
+            if cursor.fetchone():
+                cursor.execute(f"DELETE FROM team_members WHERE id IN ({placeholders}) OR LOWER(email) IN ({placeholders})", all_keys + [k.lower() for k in all_keys])
+
             conn.commit()
-            return cursor.rowcount > 0
+            return deleted_count > 0
 
     def count_members(self, workspace_id: str) -> Dict[str, int]:
         """Return member count breakdown by role and status for a workspace."""
