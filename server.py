@@ -2843,6 +2843,11 @@ async def list_user_workspaces(
     is_superadmin = await perm_eval.has_role(current_user["user_id"], "superadmin")
     if is_superadmin:
         workspaces = await ws_repo.list_all_workspaces()
+        for w in workspaces:
+            if not w.get("member_role"):
+                w["member_role"] = "superadmin"
+                w["role"] = "superadmin"
+                w["member_status"] = "active"
     else:
         workspaces = await ws_repo.list_workspaces_for_user(
             user_id=current_user["user_id"],
