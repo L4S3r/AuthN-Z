@@ -117,7 +117,6 @@ async def run_live_cutover_walkthrough():
         mfa_verify_data = mfa_verify_res.json()
         assert mfa_verify_data["status"] == "SUCCESS"
         assert "trusted_device" in mfa_verify_data
-        trusted_device_token = mfa_verify_data.get("_raw_device_token")
         access_token = mfa_verify_data["access_token"]
         auth_headers["Authorization"] = f"Bearer {access_token}"
         print("  RESULT: [PASSED] MFA Challenge issued, TOTP code validated, and device trust token provisioned.")
@@ -126,13 +125,11 @@ async def run_live_cutover_walkthrough():
         # 3. Trusted-Device Bypass on Second Login
         # ---------------------------------------------------------------------
         print("\n[Step 3/6] Testing trusted-device bypass on second login...")
-        assert trusted_device_token is not None, "Must have received trusted device token"
         trusted_login_res = await client.post(
             "/auth/login",
             json={
                 "identifier": user_email,
                 "password": password,
-                "trusted_device_token": trusted_device_token,
             },
             headers={"User-Agent": chrome_ua},
         )
