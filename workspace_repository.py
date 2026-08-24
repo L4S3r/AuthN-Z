@@ -324,7 +324,12 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             session.add(member)
             await session.commit()
 
-        return await self.get_workspace(str(workspace_id))  # type: ignore
+        ws_dict = await self.get_workspace(str(workspace_id))
+        if ws_dict:
+            ws_dict["role"] = "admin"
+            ws_dict["member_role"] = "admin"
+            ws_dict["member_status"] = "active"
+        return ws_dict  # type: ignore
 
     async def get_workspace(self, workspace_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve workspace by UUID."""
