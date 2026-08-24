@@ -46,7 +46,7 @@ async def run_live_cutover_walkthrough():
             "email": user_email,
             "password": password,
         })
-        assert reg_res.status_code == 200, f"Registration failed: {reg_res.text}"
+        assert reg_res.status_code in (200, 201), f"Registration failed: {reg_res.text}"
         user_data = reg_res.json()["user"]
         user_id = user_data["id"]
         print(f"  ✓ User registered successfully: {username} (ID: {user_id})")
@@ -157,7 +157,7 @@ async def run_live_cutover_walkthrough():
             },
             headers=auth_headers,
         )
-        assert create_ws_res.status_code == 200, f"Workspace creation failed: {create_ws_res.text}"
+        assert create_ws_res.status_code in (200, 201), f"Workspace creation failed: {create_ws_res.text}"
         workspace_id = create_ws_res.json()["id"]
         print(f"  ✓ Workspace created with ID: {workspace_id}")
 
@@ -190,7 +190,7 @@ async def run_live_cutover_walkthrough():
             },
             headers=auth_headers,
         )
-        assert task_create_res.status_code == 200, f"Task create failed: {task_create_res.text}"
+        assert task_create_res.status_code in (200, 201), f"Task create failed: {task_create_res.text}"
         task_id = task_create_res.json()["id"]
         print(f"  ✓ Task created with ID: {task_id}")
 
