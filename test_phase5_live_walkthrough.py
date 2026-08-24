@@ -222,10 +222,34 @@ async def run_live_cutover_walkthrough():
         # 6. Audit Logs Query
         # ---------------------------------------------------------------------
         print("\n[Step 6/6] Testing audit logs query (GET /audit/logs)...")
+        # 6a: Test unprivileged viewer access denial
+        denial_res = await client.get("/audit/logs", headers=auth_headers)
+        assert denial_res.status_code == 403, "Viewer role must receive 403 Forbidden on audit logs"
+        print("  ✓ Access denial correctly enforced for non-admin viewer role (403 Forbidden)")
+
+        # 6b: Promote user to admin and refresh token
+        from user_repository import UserRepository
+        user_repo = UserRepository()
+        await user_repo.update_user(user_id, {"roles": ["admin"]})
+
+        # Re-authenticate to issue admin token
+        admin_login_res = await client.post(
+            "/auth/login",
+            json={"identifier": user_email, "password": password},
+            headers={"User-Agent": chrome_ua},
+        )
+        assert admin_login_res.status_code == 200
+        admin_token = admin_login_res.json()["access_token"]
+        admin_headers = {
+            "Authorization": f"Bearer {admin_token}",
+            "User-Agent": chrome_ua,
+        }
+
+        # Query audit logs as admin
         audit_res = await client.get(
             "/audit/logs",
             params={"limit": 20},
-            headers=auth_headers,
+            headers=admin_headers,
         )
         assert audit_res.status_code == 200, f"Audit query failed: {audit_res.text}"
         audit_data = audit_res.json()
@@ -233,7 +257,7 @@ async def run_live_cutover_walkthrough():
         assert len(logs) > 0, "Expected non-empty audit logs"
         event_types = [l["event_type"] for l in logs]
         print(f"  ✓ Retrieved {len(logs)} recent audit logs from PostgreSQL")
-        print(f"  ✓ Recent event types: {event_types[:6]}")
+        print(f"  ✓ Verified recorded events in PostgreSQL: {list(set(event_types[:8]))}")
         print("  RESULT: [PASSED] GET /audit/logs successfully retrieved structured telemetry records from PostgreSQL.")
 
     print("\n" + "=" * 80)
