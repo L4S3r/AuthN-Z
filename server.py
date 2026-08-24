@@ -1619,7 +1619,7 @@ async def get_audit_trail(
 # =============================================================================
 # OAuth2 / OpenID Connect (OIDC) Social Login Endpoints
 # =============================================================================
-def resolve_or_create_oauth_user(
+async def resolve_or_create_oauth_user(
     profile: Dict[str, Any],
     client_ip: str,
     request: Optional[Request] = None,
@@ -1681,12 +1681,30 @@ def resolve_or_create_oauth_user(
 
         # Synchronize display name & user_id into workspace_members
         if display_name:
-            with await ws_repo._get_connection() as conn:
-                conn.execute(
-                    "UPDATE workspace_members SET user_id = ?, name = COALESCE(?, name) WHERE (user_id = ? OR LOWER(email) = LOWER(?))",
-                    (user["id"], display_name, user["id"], email.lower()),
-                )
-                conn.commit()
+            try:
+                session_factory = get_session_factory()
+                async with session_factory() as session:
+                    from models import WorkspaceMember
+                    from sqlalchemy import func, or_
+                    parsed_user_uuid = uuid.UUID(str(user["id"]).strip())
+                    clean_email = email.lower().strip()
+                    stmt = (
+                        sql_update(WorkspaceMember)
+                        .where(
+                            or_(
+                                WorkspaceMember.user_id == parsed_user_uuid,
+                                func.lower(WorkspaceMember.email) == clean_email,
+                            )
+                        )
+                        .values(
+                            user_id=parsed_user_uuid,
+                            name=func.coalesce(display_name, WorkspaceMember.name),
+                        )
+                    )
+                    await session.execute(stmt)
+                    await session.commit()
+            except Exception as exc:
+                logger.warning("Failed to sync oauth display name to workspace members: %s", exc)
     else:
         # Determine preferred username:
         # 1. profile['username'] (e.g. GitHub login handle)
@@ -1937,7 +1955,7 @@ async def oauth_callback(
             detail=f"OAuth code exchange failed: {str(exc)}",
         )
 
-    return resolve_or_create_oauth_user(
+    return await resolve_or_create_oauth_user(
         profile,
         client_ip=client_ip,
         request=request,
@@ -1983,7 +2001,7 @@ async def oauth_exchange_code(
             detail=f"OAuth exchange failed: {str(exc)}",
         )
 
-    return resolve_or_create_oauth_user(
+    return await resolve_or_create_oauth_user(
         profile,
         client_ip=client_ip,
         request=request,
