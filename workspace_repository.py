@@ -679,15 +679,15 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         identifier: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Retrieve a member record within a workspace scope by user_id, email, username, or membership ID."""
-        lookup_keys = []
+        initial_keys = []
         if identifier:
-            lookup_keys.append(unquote(identifier).strip())
+            initial_keys.append(unquote(identifier).strip())
         if user_id:
-            lookup_keys.append(unquote(user_id).strip())
+            initial_keys.append(unquote(user_id).strip())
         if email:
-            lookup_keys.append(unquote(email).strip().lower())
+            initial_keys.append(unquote(email).strip().lower())
 
-        if not lookup_keys:
+        if not initial_keys:
             return None
 
         async with self.session_factory() as session:
@@ -695,9 +695,10 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             if not ws_uuid:
                 return None
 
-            # Look up corresponding users for identifier mapping
-            extra_user_ids = []
-            for k in lookup_keys:
+            # Look up corresponding users for identifier mapping without mutating iteration list
+            extra_user_ids = set()
+            extra_emails = set()
+            for k in initial_keys:
                 try:
                     uid = uuid.UUID(k)
                     user_lookup = await session.execute(
@@ -714,20 +715,23 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                     )
                 u = user_lookup.scalars().first()
                 if u:
-                    extra_user_ids.append(u.id)
+                    extra_user_ids.add(u.id)
                     if u.email:
-                        lookup_keys.append(u.email.lower())
+                        extra_emails.add(u.email.lower())
 
             conditions = []
-            for k in lookup_keys:
+            for k in initial_keys:
                 try:
                     kid = uuid.UUID(k)
                     conditions.append(WorkspaceMember.id == kid)
                     conditions.append(WorkspaceMember.user_id == kid)
                 except (ValueError, AttributeError):
                     pass
-                conditions.append(func.lower(WorkspaceMember.email) == k.lower())
-                conditions.append(func.lower(WorkspaceMember.name) == k.lower())
+
+            all_text_keys = set(k.lower() for k in initial_keys) | extra_emails
+            for txt in all_text_keys:
+                conditions.append(func.lower(WorkspaceMember.email) == txt)
+                conditions.append(func.lower(WorkspaceMember.name) == txt)
 
             for uid in extra_user_ids:
                 conditions.append(WorkspaceMember.user_id == uid)
