@@ -104,7 +104,7 @@ async def run_live_cutover_walkthrough():
 
         # Step 2d: Complete MFA Challenge with Remember Device flag
         mfa_verify_res = await client.post(
-            "/auth/mfa/verify",
+            "/auth/mfa/complete",
             json={
                 "user_id": user_id,
                 "challenge_id": challenge_id,
