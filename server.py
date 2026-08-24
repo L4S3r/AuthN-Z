@@ -8,16 +8,17 @@ Run locally or on a server with:
     uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 """
 
+from datetime import datetime, timezone
 import hashlib
 import json
 import jwt
 import logging
 import os
 import secrets
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
@@ -136,7 +137,168 @@ auth = Authenticator(
 
 perm_eval = PermissionEvaluator(user_repo=repo, workspace_repo=ws_repo)
 
+# =============================================================================
+# Real-Time WebSocket Connection & Event Manager (Phase 4.1 / 4.2)
+# =============================================================================
+class ConnectionManager:
+    """Manages active WebSocket connections grouped by workspace and user channels."""
+    def __init__(self, redis_client: Optional[Any] = None):
+        self.active_workspace_connections: Dict[str, Set[WebSocket]] = {}
+        self.active_user_connections: Dict[str, Set[WebSocket]] = {}
+        self.redis_client = redis_client
+
+    async def connect(self, websocket: WebSocket, workspace_id: str, user_id: str):
+        await websocket.accept()
+        if workspace_id not in self.active_workspace_connections:
+            self.active_workspace_connections[workspace_id] = set()
+        self.active_workspace_connections[workspace_id].add(websocket)
+
+        if user_id not in self.active_user_connections:
+            self.active_user_connections[user_id] = set()
+        self.active_user_connections[user_id].add(websocket)
+
+    def disconnect(self, websocket: WebSocket, workspace_id: str, user_id: str):
+        if workspace_id in self.active_workspace_connections:
+            self.active_workspace_connections[workspace_id].discard(websocket)
+            if not self.active_workspace_connections[workspace_id]:
+                self.active_workspace_connections.pop(workspace_id, None)
+
+        if user_id in self.active_user_connections:
+            self.active_user_connections[user_id].discard(websocket)
+            if not self.active_user_connections[user_id]:
+                self.active_user_connections.pop(user_id, None)
+
+    async def broadcast_to_workspace(self, workspace_id: str, message: Dict[str, Any]):
+        """Broadcast a real-time event to all connected workspace participants."""
+        sockets = list(self.active_workspace_connections.get(workspace_id, set()))
+        dead_sockets = []
+        for ws in sockets:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead_sockets.append(ws)
+
+        for ws in dead_sockets:
+            if workspace_id in self.active_workspace_connections:
+                self.active_workspace_connections[workspace_id].discard(ws)
+
+        if self.redis_client is not None:
+            try:
+                channel = f"ws:workspace:{workspace_id}"
+                self.redis_client.publish(channel, json.dumps(message))
+            except Exception as exc:
+                logger.warning("Failed to publish WebSocket message to Redis channel: %s", exc)
+
+    async def send_to_user(self, user_id: str, message: Dict[str, Any]):
+        """Send a real-time event directly to a specific user across their connected devices."""
+        sockets = list(self.active_user_connections.get(user_id, set()))
+        dead_sockets = []
+        for ws in sockets:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead_sockets.append(ws)
+
+        for ws in dead_sockets:
+            if user_id in self.active_user_connections:
+                self.active_user_connections[user_id].discard(ws)
+
+        if self.redis_client is not None:
+            try:
+                channel = f"ws:user:{user_id}"
+                self.redis_client.publish(channel, json.dumps(message))
+            except Exception as exc:
+                logger.warning("Failed to publish user notification to Redis channel: %s", exc)
+
+
+ws_manager = ConnectionManager(redis_client=getattr(sess_store, "r", None))
 security = HTTPBearer(auto_error=False)
+
+# =============================================================================
+# In-App Notifications Storage & Push Service (Phase 4.2)
+# =============================================================================
+def init_notifications_table(db_file: str = "DATABASE.db"):
+    try:
+        import sqlite3
+        with sqlite3.connect(db_file, timeout=10.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    workspace_id TEXT,
+                    type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    link TEXT,
+                    is_read INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_created ON notifications(created_at);")
+            conn.commit()
+    except Exception as exc:
+        logger.warning("Failed to initialize notifications table: %s", exc)
+
+init_notifications_table("DATABASE.db")
+
+
+async def create_and_push_notification(
+    user_id: str,
+    notif_type: str,
+    title: str,
+    message: str,
+    link: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    db_file: str = "DATABASE.db",
+) -> Dict[str, Any]:
+    """Persist notification and broadcast in real-time over WebSocket."""
+    import sqlite3
+    notif_id = f"notif_{uuid.uuid4().hex[:16]}"
+    now_str = datetime.now(timezone.utc).isoformat()
+    record = {
+        "id": notif_id,
+        "user_id": user_id,
+        "workspace_id": workspace_id,
+        "type": notif_type,
+        "title": title,
+        "message": message,
+        "link": link,
+        "is_read": 0,
+        "created_at": now_str,
+    }
+    try:
+        with sqlite3.connect(db_file, timeout=10.0) as conn:
+            conn.execute("""
+                INSERT INTO notifications (id, user_id, workspace_id, type, title, message, link, is_read, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record["id"],
+                record["user_id"],
+                record["workspace_id"],
+                record["type"],
+                record["title"],
+                record["message"],
+                record["link"],
+                record["is_read"],
+                record["created_at"],
+            ))
+            conn.commit()
+    except Exception as exc:
+        logger.error("Failed to insert in-app notification: %s", exc)
+
+    # Push to active WebSocket clients for this user
+    await ws_manager.send_to_user(
+        user_id,
+        {
+            "event": "notification.received",
+            "notification": record,
+            "timestamp": now_str,
+        },
+    )
+    return record
 
 
 # =============================================================================
@@ -456,20 +618,19 @@ async def get_current_user(
     """Extract and validate Bearer token from httpOnly cookie or Authorization header."""
     token: Optional[str] = None
 
-    # 1. Check access_token httpOnly cookie
-    cookie_token = request.cookies.get("access_token")
-    if cookie_token:
-        token = str(cookie_token).strip().strip('"').strip("'")
-
-    # 2. Fallback to Authorization: Bearer header
-    if not token and credentials and credentials.credentials:
+    # 1. Prefer explicit Authorization: Bearer header if provided
+    if credentials and credentials.credentials:
         token = credentials.credentials.strip()
-
-    # 3. Direct Authorization header fallback
     if not token:
         auth_hdr = request.headers.get("authorization")
         if auth_hdr and auth_hdr.lower().startswith("bearer "):
             token = auth_hdr[7:].strip()
+
+    # 2. Fallback to access_token httpOnly cookie
+    if not token:
+        cookie_token = request.cookies.get("access_token")
+        if cookie_token:
+            token = str(cookie_token).strip().strip('"').strip("'")
 
     if not token:
         raise HTTPException(
@@ -720,10 +881,8 @@ async def refresh_tokens(
     """Exchange a valid refresh token for a new access token and rotated refresh token."""
     client_ip = request.client.host if request.client else "unknown"
 
-    # Extract refresh token from cookie or request body
-    raw_token = request.cookies.get("refresh_token")
-    if not raw_token and req and req.refresh_token:
-        raw_token = req.refresh_token
+    # Extract refresh token: explicit payload token takes precedence over cookie jar
+    raw_token = (req.refresh_token if req and req.refresh_token else None) or request.cookies.get("refresh_token")
 
     if not raw_token:
         raise HTTPException(
@@ -1910,6 +2069,33 @@ async def create_task(
                 assigned_by=assigned_by_name,
                 task_id=new_task["id"],
             )
+            # In-App Notification Push (Phase 4.2)
+            assigned_user = repo.get_by_identifier(target_email)
+            if assigned_user:
+                await create_and_push_notification(
+                    user_id=assigned_user["id"],
+                    notif_type="TASK_ASSIGNED",
+                    title="Task Assigned",
+                    message=f"You were assigned to '{new_task['title']}' by {assigned_by_name}.",
+                    link="/dashboard",
+                    workspace_id=ws_id,
+                )
+
+    # Real-time WebSocket Broadcast to workspace
+    await ws_manager.broadcast_to_workspace(
+        ws_id,
+        {
+            "event": "task.created",
+            "workspace_id": ws_id,
+            "task": new_task,
+            "actor": {
+                "id": user["id"] if user else current_user["user_id"],
+                "username": user["username"] if user else "Member",
+                "email": creator_email,
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
     return {"status": "SUCCESS", "task": new_task}
 
@@ -1983,6 +2169,33 @@ async def update_task(
                 assigned_by=assigned_by_name,
                 task_id=task_id,
             )
+            # In-App Notification Push (Phase 4.2)
+            assigned_user = repo.get_by_identifier(target_email)
+            if assigned_user:
+                await create_and_push_notification(
+                    user_id=assigned_user["id"],
+                    notif_type="TASK_ASSIGNED",
+                    title="Task Assigned",
+                    message=f"You were assigned to '{updated.get('title', existing['title'])}' by {assigned_by_name}.",
+                    link="/dashboard",
+                    workspace_id=ws_id,
+                )
+
+    # Real-time WebSocket Broadcast to workspace
+    await ws_manager.broadcast_to_workspace(
+        ws_id,
+        {
+            "event": "task.updated",
+            "workspace_id": ws_id,
+            "task": updated,
+            "actor": {
+                "id": user["id"] if user else current_user["user_id"],
+                "username": user["username"] if user else "Member",
+                "email": user["email"] if user else "",
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
     return {"status": "SUCCESS", "task": updated}
 
@@ -2030,7 +2243,181 @@ async def delete_task(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found.",
         )
+
+    # Real-time WebSocket Broadcast to workspace
+    await ws_manager.broadcast_to_workspace(
+        ws_id,
+        {
+            "event": "task.deleted",
+            "workspace_id": ws_id,
+            "task_id": task_id,
+            "actor": {
+                "id": user["id"] if user else current_user["user_id"],
+                "username": user["username"] if user else "Member",
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
     return {"status": "SUCCESS", "deleted_task_id": task_id}
+
+
+# =============================================================================
+# Real-Time WebSocket Endpoint (Phase 4.1)
+# =============================================================================
+@app.websocket("/ws/workspaces/{workspace_id}")
+async def workspace_websocket_endpoint(
+    websocket: WebSocket,
+    workspace_id: str,
+    token: Optional[str] = Query(None),
+):
+    """
+    Authenticated real-time WebSocket channel for task board synchronization and in-app notifications.
+    Authenticates via 'access_token' cookie, Authorization header, or '?token=<jwt>' query parameter.
+    """
+    raw_token = token
+    if not raw_token and "access_token" in websocket.cookies:
+        raw_token = websocket.cookies.get("access_token")
+
+    if not raw_token:
+        auth_header = websocket.headers.get("authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            raw_token = auth_header.split(" ", 1)[1]
+
+    if not raw_token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication token required")
+        return
+
+    clean_token = str(raw_token).strip().strip('"').strip("'")
+    try:
+        payload = token_svc.decode_and_verify(clean_token)
+    except Exception as exc:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=f"Invalid token: {str(exc)}")
+        return
+
+    user_id = payload.get("sub")
+    user = repo.get_by_id(user_id)
+    if not user or not user.get("is_active", 1):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="User inactive or not found")
+        return
+
+    # Verify workspace membership clearance if not superadmin
+    is_superadmin = perm_eval.has_role(user_id, "superadmin")
+    if not is_superadmin and workspace_id != "ws_default":
+        member = ws_repo.get_member(workspace_id, user_id=user_id, email=user.get("email"))
+        if not member:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Not a member of this workspace")
+            return
+
+    await ws_manager.connect(websocket, workspace_id, user_id)
+    try:
+        await websocket.send_json({
+            "event": "connected",
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        while True:
+            try:
+                data = await websocket.receive_text()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+            except Exception:
+                break
+
+            if not data or data == "close":
+                break
+            elif data == "ping":
+                try:
+                    await websocket.send_text("pong")
+                except Exception:
+                    break
+            else:
+                try:
+                    msg = json.loads(data)
+                    if msg.get("type") == "ping":
+                        await websocket.send_json({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
+                    elif msg.get("type") == "close":
+                        break
+                except Exception:
+                    pass
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    except Exception as exc:
+        logger.debug("WebSocket exception: %s", exc)
+    finally:
+        ws_manager.disconnect(websocket, workspace_id, user_id)
+
+
+
+# =============================================================================
+# In-App Notifications REST Endpoints (Phase 4.2)
+# =============================================================================
+@app.get("/notifications", tags=["In-App Notifications"])
+async def get_user_notifications(
+    limit: int = 50,
+    offset: int = 0,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Retrieve in-app notifications and unread count for current authenticated user."""
+    import sqlite3
+    user_id = current_user["user_id"]
+    with sqlite3.connect("DATABASE.db", timeout=10.0) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        unread_row = cursor.execute(
+            "SELECT COUNT(*) as count FROM notifications WHERE user_id = ? AND is_read = 0",
+            (user_id,),
+        ).fetchone()
+        unread_count = unread_row["count"] if unread_row else 0
+
+        rows = cursor.execute(
+            "SELECT * FROM notifications WHERE user_id = ? ORDER BY datetime(created_at) DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
+        ).fetchall()
+        notifications = [dict(r) for r in rows]
+
+    return {
+        "status": "SUCCESS",
+        "unread_count": unread_count,
+        "notifications": notifications,
+    }
+
+
+@app.post("/notifications/{notification_id}/read", tags=["In-App Notifications"])
+async def mark_notification_as_read(
+    notification_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Mark a specific notification as read."""
+    import sqlite3
+    user_id = current_user["user_id"]
+    with sqlite3.connect("DATABASE.db", timeout=10.0) as conn:
+        cursor = conn.execute(
+            "UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?",
+            (notification_id, user_id),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Notification not found.")
+    return {"status": "SUCCESS", "id": notification_id, "is_read": 1}
+
+
+@app.post("/notifications/read-all", tags=["In-App Notifications"])
+async def mark_all_notifications_as_read(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Mark all notifications for the authenticated user as read."""
+    import sqlite3
+    user_id = current_user["user_id"]
+    with sqlite3.connect("DATABASE.db", timeout=10.0) as conn:
+        conn.execute(
+            "UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
+            (user_id,),
+        )
+        conn.commit()
+    return {"status": "SUCCESS", "message": "All notifications marked as read."}
 
 
 
