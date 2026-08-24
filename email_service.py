@@ -125,7 +125,7 @@ class EmailService:
 
             if self.audit_logger is not None:
                 try:
-                    self.audit_logger.record_security_event(
+                    res = self.audit_logger.record_security_event(
                         event_name="SMTP_DELIVERY_FAILURE",
                         severity="WARNING",
                         details={
@@ -135,6 +135,14 @@ class EmailService:
                             "fallback": "console_log",
                         },
                     )
+                    import asyncio
+                    import inspect
+                    if inspect.isawaitable(res):
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(res)
+                        except RuntimeError:
+                            pass
                 except Exception as audit_exc:
                     logger.warning("Failed to record SMTP failure audit event: %s", audit_exc)
 

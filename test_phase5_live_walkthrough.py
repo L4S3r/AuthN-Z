@@ -198,7 +198,7 @@ async def run_live_cutover_walkthrough():
         print(f"  ✓ Task created with ID: {task_id}")
 
         # 5b: Update task
-        task_update_res = await client.put(
+        task_update_res = await client.patch(
             f"/tasks/{task_id}",
             json={"status": "in_progress", "priority": "urgent"},
             headers=auth_headers,
