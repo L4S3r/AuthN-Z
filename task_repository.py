@@ -1,93 +1,141 @@
 """
-Auth N&Z - Task and Team Repository (task_repository.py)
--------------------------------------------------------
-Persistent SQLite storage for team tasks, sprints, members, and invitations.
-Uses WAL mode for high-concurrency multi-process read/write operations.
+Auth N&Z - Task and Team Repository (PostgreSQL Async)
+-----------------------------------------------------
+Persistent PostgreSQL storage for team tasks, sprints, members, and invitations using
+async SQLAlchemy (asyncpg) with connection pooling and non-blocking I/O.
 """
 
 from datetime import datetime, timedelta, timezone
 import json
 import logging
 import secrets
-import sqlite3
 from typing import Any, Dict, List, Optional
 import uuid
+
+from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from database import get_session_factory
+from models import Task, TeamMember, User, Workspace
 
 logger = logging.getLogger("auth_nz.task_repository")
 
 
 class TaskRepository:
-    def __init__(self, db_file: str = "DATABASE.db"):
-        self.db_file = db_file
-        self._init_db()
+    def __init__(
+        self,
+        db_url: Optional[str] = None,
+        session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    ):
+        self.session_factory = session_factory or get_session_factory(db_url)
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_file, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        return conn
+    async def _resolve_workspace_id(
+        self, session: AsyncSession, ws_input: Optional[str]
+    ) -> uuid.UUID:
+        """Resolve workspace input string/UUID to a valid workspace UUID, auto-provisioning default if necessary."""
+        if ws_input:
+            clean_input = str(ws_input).strip()
+            # Try parsing as UUID
+            try:
+                parsed_uid = uuid.UUID(clean_input)
+                # Check if workspace exists
+                ws_check = await session.execute(
+                    select(Workspace.id).where(Workspace.id == parsed_uid)
+                )
+                if ws_check.scalar_one_or_none():
+                    return parsed_uid
+            except (ValueError, AttributeError):
+                pass
 
-    def _init_db(self) -> None:
-        """Initialize tasks and team_members database tables with migration checks."""
-        with self._get_connection() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY,
-                    workspace_id TEXT NOT NULL DEFAULT 'ws_default',
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    status TEXT NOT NULL DEFAULT 'todo',
-                    priority TEXT NOT NULL DEFAULT 'medium',
-                    assignee_email TEXT,
-                    assignee_name TEXT,
-                    assignees TEXT DEFAULT '[]',
-                    created_by TEXT NOT NULL,
-                    tags TEXT DEFAULT '[]',
-                    due_date TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-            """)
+            # Lookup by slug or name
+            ws_slug_check = await session.execute(
+                select(Workspace.id).where(
+                    or_(
+                        func.lower(Workspace.slug) == clean_input.lower(),
+                        func.lower(Workspace.name) == clean_input.lower(),
+                    )
+                )
+            )
+            found_id = ws_slug_check.scalar_one_or_none()
+            if found_id:
+                return found_id
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS team_members (
-                    id TEXT PRIMARY KEY,
-                    email TEXT NOT NULL UNIQUE,
-                    name TEXT,
-                    role TEXT NOT NULL DEFAULT 'viewer',
-                    department TEXT NOT NULL DEFAULT 'General',
-                    status TEXT NOT NULL DEFAULT 'active',
-                    invited_by TEXT,
-                    invite_token TEXT,
-                    expires_at TEXT,
-                    invited_at TEXT NOT NULL
-                );
-            """)
+        # Fallback to existing first workspace
+        first_ws = await session.execute(
+            select(Workspace.id).order_by(Workspace.created_at.asc()).limit(1)
+        )
+        existing_id = first_ws.scalar_one_or_none()
+        if existing_id:
+            return existing_id
 
-            # Column migrations for existing databases
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(team_members);")
-            tm_columns = [row["name"] for row in cursor.fetchall()]
-            if "invite_token" not in tm_columns:
-                cursor.execute("ALTER TABLE team_members ADD COLUMN invite_token TEXT;")
-            if "expires_at" not in tm_columns:
-                cursor.execute("ALTER TABLE team_members ADD COLUMN expires_at TEXT;")
+        # Auto-provision default workspace if none exist
+        default_uid = uuid.uuid4()
+        default_ws = Workspace(
+            id=default_uid,
+            name="Default Workspace",
+            slug="default",
+            description="Primary workspace for team collaboration.",
+            created_by="system",
+        )
+        session.add(default_ws)
+        await session.flush()
+        return default_uid
 
-            cursor.execute("PRAGMA table_info(tasks);")
-            task_columns = [row["name"] for row in cursor.fetchall()]
-            if "workspace_id" not in task_columns:
-                cursor.execute("ALTER TABLE tasks ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'ws_default';")
-            if "assignees" not in task_columns:
-                cursor.execute("ALTER TABLE tasks ADD COLUMN assignees TEXT DEFAULT '[]';")
+    @staticmethod
+    def _format_task(task: Task) -> Dict[str, Any]:
+        """Format SQLAlchemy Task instance into API response dictionary."""
+        tags = task.tags if isinstance(task.tags, list) else []
+        assignees = task.assignees if isinstance(task.assignees, list) else []
 
-            conn.commit()
+        if not assignees and task.assignee_email:
+            assignees = [
+                {
+                    "email": task.assignee_email,
+                    "name": task.assignee_name or task.assignee_email.split("@")[0],
+                }
+            ]
+
+        primary_email = task.assignee_email or (
+            assignees[0]["email"] if assignees else None
+        )
+        primary_name = task.assignee_name or (
+            assignees[0]["name"] if assignees else None
+        )
+
+        created_str = (
+            task.created_at.isoformat()
+            if isinstance(task.created_at, datetime)
+            else str(task.created_at)
+        )
+        updated_str = (
+            task.updated_at.isoformat()
+            if isinstance(task.updated_at, datetime)
+            else str(task.updated_at)
+        )
+
+        return {
+            "id": str(task.id),
+            "workspace_id": str(task.workspace_id),
+            "title": task.title,
+            "description": task.description or "",
+            "status": task.status,
+            "priority": task.priority,
+            "assignee_email": primary_email,
+            "assignee_name": primary_name,
+            "assignees": assignees,
+            "created_by": task.created_by,
+            "tags": tags,
+            "due_date": task.due_date,
+            "created_at": created_str,
+            "updated_at": updated_str,
+        }
 
     # =========================================================================
     # Task Operations
     # =========================================================================
 
-    def list_tasks(
+    async def list_tasks(
         self,
         workspace_id: Optional[str] = None,
         status: Optional[str] = None,
@@ -95,221 +143,301 @@ class TaskRepository:
         assignee_email: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """List tasks with optional workspace and attribute filtering."""
-        query = "SELECT * FROM tasks WHERE 1=1"
-        params: List[Any] = []
+        async with self.session_factory() as session:
+            stmt = select(Task).order_by(Task.created_at.desc())
 
-        if workspace_id:
-            query += " AND (workspace_id = ? OR workspace_id IS NULL)"
-            params.append(workspace_id)
-        if status:
-            query += " AND status = ?"
-            params.append(status)
-        if priority:
-            query += " AND priority = ?"
-            params.append(priority)
-        if assignee_email:
-            query += " AND (assignee_email = ? OR assignees LIKE ?)"
-            params.append(assignee_email)
-            params.append(f'%"{assignee_email}"%')
+            if workspace_id:
+                try:
+                    ws_uid = uuid.UUID(str(workspace_id).strip())
+                    stmt = stmt.where(Task.workspace_id == ws_uid)
+                except (ValueError, AttributeError):
+                    # Lookup by workspace slug
+                    ws_res = await session.execute(
+                        select(Workspace.id).where(
+                            func.lower(Workspace.slug) == workspace_id.strip().lower()
+                        )
+                    )
+                    found_ws_id = ws_res.scalar_one_or_none()
+                    if found_ws_id:
+                        stmt = stmt.where(Task.workspace_id == found_ws_id)
 
-        query += " ORDER BY datetime(created_at) DESC"
+            if status:
+                stmt = stmt.where(Task.status == status.strip())
+            if priority:
+                stmt = stmt.where(Task.priority == priority.strip())
 
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-            return [self._format_task(dict(r)) for r in rows]
+            result = await session.execute(stmt)
+            tasks = result.scalars().all()
 
-    def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
-            row = cursor.fetchone()
-            return self._format_task(dict(row)) if row else None
+        formatted: List[Dict[str, Any]] = []
+        for t in tasks:
+            task_dict = self._format_task(t)
+            if assignee_email:
+                target_email = assignee_email.strip().lower()
+                primary_match = (
+                    task_dict.get("assignee_email") or ""
+                ).strip().lower() == target_email
+                assignee_list = task_dict.get("assignees") or []
+                list_match = any(
+                    isinstance(a, dict)
+                    and (a.get("email") or "").strip().lower() == target_email
+                    for a in assignee_list
+                )
+                if not (primary_match or list_match):
+                    continue
+            formatted.append(task_dict)
 
-    def create_task(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        task_id = data.get("id") or str(uuid.uuid4())
-        workspace_id = data.get("workspace_id") or "ws_default"
-        now = datetime.now(timezone.utc).isoformat()
-        tags_json = json.dumps(data.get("tags", []))
+        return formatted
 
-        assignees = data.get("assignees") or []
+    async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a task record by UUID."""
+        if not task_id:
+            return None
+        try:
+            tid = uuid.UUID(str(task_id).strip())
+        except (ValueError, AttributeError):
+            return None
+
+        async with self.session_factory() as session:
+            stmt = select(Task).where(Task.id == tid)
+            result = await session.execute(stmt)
+            task = result.scalars().first()
+            return self._format_task(task) if task else None
+
+    async def create_task(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert a new sprint task card."""
+        task_id_raw = data.get("id")
+        if task_id_raw:
+            try:
+                task_id = uuid.UUID(str(task_id_raw).strip())
+            except (ValueError, AttributeError):
+                task_id = uuid.uuid4()
+        else:
+            task_id = uuid.uuid4()
+
+        tags_raw = data.get("tags", [])
+        if isinstance(tags_raw, str):
+            try:
+                tags = json.loads(tags_raw)
+            except Exception:
+                tags = []
+        else:
+            tags = list(tags_raw or [])
+
+        assignees_raw = data.get("assignees") or []
+        if isinstance(assignees_raw, str):
+            try:
+                assignees = json.loads(assignees_raw)
+            except Exception:
+                assignees = []
+        else:
+            assignees = list(assignees_raw or [])
+
         if not assignees and data.get("assignee_email"):
-            assignees = [{
-                "email": data["assignee_email"],
-                "name": data.get("assignee_name") or data["assignee_email"].split("@")[0],
-                "avatar_url": data.get("assignee_avatar"),
-            }]
+            assignees = [
+                {
+                    "email": data["assignee_email"],
+                    "name": data.get("assignee_name")
+                    or data["assignee_email"].split("@")[0],
+                    "avatar_url": data.get("assignee_avatar"),
+                }
+            ]
 
-        primary_email = data.get("assignee_email") or (assignees[0]["email"] if assignees else None)
-        primary_name = data.get("assignee_name") or (assignees[0]["name"] if assignees else None)
-        assignees_json = json.dumps(assignees)
+        primary_email = data.get("assignee_email") or (
+            assignees[0]["email"] if assignees else None
+        )
+        primary_name = data.get("assignee_name") or (
+            assignees[0]["name"] if assignees else None
+        )
 
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO tasks (
-                    id, workspace_id, title, description, status, priority,
-                    assignee_email, assignee_name, assignees, created_by,
-                    tags, due_date, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                task_id,
-                workspace_id,
-                data.get("title", "").strip(),
-                data.get("description", "").strip(),
-                data.get("status", "todo"),
-                data.get("priority", "medium"),
-                primary_email,
-                primary_name,
-                assignees_json,
-                data.get("created_by", "system"),
-                tags_json,
-                data.get("due_date"),
-                now,
-                now,
-            ))
-            conn.commit()
-            return self.get_task(task_id)  # type: ignore
+        async with self.session_factory() as session:
+            ws_id = await self._resolve_workspace_id(session, data.get("workspace_id"))
+            new_task = Task(
+                id=task_id,
+                workspace_id=ws_id,
+                title=data.get("title", "").strip(),
+                description=(data.get("description") or "").strip() or None,
+                status=data.get("status", "todo"),
+                priority=data.get("priority", "medium"),
+                assignee_email=primary_email,
+                assignee_name=primary_name,
+                assignees=assignees,
+                created_by=data.get("created_by", "system"),
+                tags=tags,
+                due_date=data.get("due_date"),
+            )
+            session.add(new_task)
+            await session.commit()
 
-    def update_task(self, task_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        fields = []
-        params = []
-        now = datetime.now(timezone.utc).isoformat()
+        return await self.get_task(str(task_id))  # type: ignore
 
-        for key in ["title", "description", "status", "priority", "assignee_email", "assignee_name", "due_date", "workspace_id"]:
-            if key in updates:
-                fields.append(f"{key} = ?")
-                params.append(updates[key])
+    async def update_task(
+        self, task_id: str, updates: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Update fields of an existing task."""
+        if not task_id:
+            return None
+        try:
+            tid = uuid.UUID(str(task_id).strip())
+        except (ValueError, AttributeError):
+            return None
 
-        if "tags" in updates:
-            fields.append("tags = ?")
-            params.append(json.dumps(updates["tags"]))
+        allowed_fields = {
+            "title",
+            "description",
+            "status",
+            "priority",
+            "assignee_email",
+            "assignee_name",
+            "due_date",
+            "workspace_id",
+            "tags",
+            "assignees",
+        }
+        filtered: Dict[str, Any] = {}
 
-        if "assignees" in updates:
-            fields.append("assignees = ?")
-            assignees_data = updates["assignees"]
-            params.append(json.dumps(assignees_data))
-            if assignees_data and len(assignees_data) > 0:
-                if "assignee_email" not in updates:
-                    fields.append("assignee_email = ?")
-                    params.append(assignees_data[0].get("email"))
-                if "assignee_name" not in updates:
-                    fields.append("assignee_name = ?")
-                    params.append(assignees_data[0].get("name"))
+        for key, value in updates.items():
+            if key in allowed_fields:
+                if key == "tags":
+                    if isinstance(value, str):
+                        try:
+                            filtered["tags"] = json.loads(value)
+                        except Exception:
+                            filtered["tags"] = []
+                    else:
+                        filtered["tags"] = list(value or [])
+                elif key == "assignees":
+                    if isinstance(value, str):
+                        try:
+                            assignees_data = json.loads(value)
+                        except Exception:
+                            assignees_data = []
+                    else:
+                        assignees_data = list(value or [])
+                    filtered["assignees"] = assignees_data
+                    if assignees_data:
+                        if "assignee_email" not in updates:
+                            filtered["assignee_email"] = assignees_data[0].get("email")
+                        if "assignee_name" not in updates:
+                            filtered["assignee_name"] = assignees_data[0].get("name")
+                else:
+                    filtered[key] = value
 
-        if not fields:
-            return self.get_task(task_id)
+        if not filtered:
+            return await self.get_task(task_id)
 
-        fields.append("updated_at = ?")
-        params.append(now)
-        params.append(task_id)
+        async with self.session_factory() as session:
+            if "workspace_id" in filtered:
+                filtered["workspace_id"] = await self._resolve_workspace_id(
+                    session, filtered["workspace_id"]
+                )
 
-        query = f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?"
+            stmt = (
+                update(Task)
+                .where(Task.id == tid)
+                .values(**filtered, updated_at=func.now())
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            if (result.rowcount or 0) == 0:
+                return None
 
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            conn.commit()
-            return self.get_task(task_id)
+        return await self.get_task(task_id)
 
-    def delete_task(self, task_id: str) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            conn.commit()
-            return cursor.rowcount > 0
+    async def delete_task(self, task_id: str) -> bool:
+        """Permanently remove a task card."""
+        if not task_id:
+            return False
+        try:
+            tid = uuid.UUID(str(task_id).strip())
+        except (ValueError, AttributeError):
+            return False
 
-    def _format_task(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        tags = raw.get("tags", "[]")
-        if isinstance(tags, str):
-            try:
-                raw["tags"] = json.loads(tags)
-            except Exception:
-                raw["tags"] = []
-
-        assignees = raw.get("assignees", "[]")
-        if isinstance(assignees, str):
-            try:
-                raw["assignees"] = json.loads(assignees)
-            except Exception:
-                raw["assignees"] = []
-        elif not isinstance(assignees, list):
-            raw["assignees"] = []
-
-        if not raw["assignees"] and raw.get("assignee_email"):
-            raw["assignees"] = [{
-                "email": raw["assignee_email"],
-                "name": raw.get("assignee_name") or raw["assignee_email"].split("@")[0],
-            }]
-
-        return raw
+        async with self.session_factory() as session:
+            stmt = delete(Task).where(Task.id == tid)
+            result = await session.execute(stmt)
+            await session.commit()
+            return (result.rowcount or 0) > 0
 
     # =========================================================================
     # Team Management & Invitation Operations
     # =========================================================================
 
-    def list_team_members(self) -> List[Dict[str, Any]]:
-        """List all team members and registered users combined."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, username, email, roles, metadata, created_at FROM users")
-            users = cursor.fetchall()
+    async def list_team_members(self) -> List[Dict[str, Any]]:
+        """List all registered users and pending team members combined."""
+        async with self.session_factory() as session:
+            users_res = await session.execute(select(User))
+            users = users_res.scalars().all()
 
-            cursor.execute("SELECT * FROM team_members")
-            invites = cursor.fetchall()
+            tm_res = await session.execute(select(TeamMember))
+            invites = tm_res.scalars().all()
 
         members_map: Dict[str, Dict[str, Any]] = {}
 
         for u in users:
-            roles = u["roles"]
-            if isinstance(roles, str):
-                try:
-                    roles = json.loads(roles)
-                except Exception:
-                    roles = []
-            role = "admin" if "admin" in roles else ("editor" if "editor" in roles else "viewer")
+            roles = u.roles if isinstance(u.roles, list) else []
+            role = (
+                "admin"
+                if "admin" in roles
+                else ("editor" if "editor" in roles else "viewer")
+            )
 
-            metadata = u["metadata"]
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except Exception:
-                    metadata = {}
+            meta = u.metadata_ if isinstance(u.metadata_, dict) else {}
+            dept = (
+                meta.get("department", "General")
+                if isinstance(meta, dict)
+                else "General"
+            )
+            name = (
+                meta.get("name", u.username)
+                if isinstance(meta, dict)
+                else u.username
+            )
+            avatar_url = meta.get("avatar_url") if isinstance(meta, dict) else None
 
-            dept = metadata.get("department", "General") if isinstance(metadata, dict) else "General"
-            name = metadata.get("name", u["username"]) if isinstance(metadata, dict) else u["username"]
-            avatar_url = metadata.get("avatar_url") if isinstance(metadata, dict) else None
+            created_str = (
+                u.created_at.isoformat()
+                if isinstance(u.created_at, datetime)
+                else str(u.created_at)
+            )
 
-            members_map[u["email"].lower()] = {
-                "id": u["id"],
-                "email": u["email"],
+            members_map[u.email.lower()] = {
+                "id": str(u.id),
+                "email": u.email,
                 "name": name,
                 "role": role,
                 "department": dept,
                 "avatar_url": avatar_url,
                 "status": "active",
-                "invited_at": u["created_at"],
+                "invited_at": created_str,
             }
 
         for inv in invites:
-            email = inv["email"].lower()
+            email = inv.email.lower()
             if email not in members_map:
+                inv_created = (
+                    inv.invited_at.isoformat()
+                    if isinstance(inv.invited_at, datetime)
+                    else str(inv.invited_at)
+                )
+                exp_str = (
+                    inv.expires_at.isoformat() if inv.expires_at else None
+                )
                 members_map[email] = {
-                    "id": inv["id"],
-                    "email": inv["email"],
-                    "name": inv["name"] or email.split("@")[0],
-                    "role": inv["role"],
-                    "department": inv["department"],
+                    "id": str(inv.id),
+                    "email": inv.email,
+                    "name": inv.name or email.split("@")[0],
+                    "role": inv.role,
+                    "department": inv.department,
                     "avatar_url": None,
-                    "status": inv["status"],
-                    "invited_at": inv["invited_at"],
-                    "expires_at": inv["expires_at"] if "expires_at" in inv.keys() else None,
+                    "status": inv.status,
+                    "invited_at": inv_created,
+                    "expires_at": exp_str,
                 }
 
         return list(members_map.values())
 
-    def invite_member(
+    async def invite_member(
         self,
         email: str,
         name: str,
@@ -318,85 +446,127 @@ class TaskRepository:
         invited_by: str = "admin",
         expires_days: int = 7,
     ) -> Dict[str, Any]:
-        """Record a secure invitation token for a new team member."""
-        member_id = str(uuid.uuid4())
+        """Record a secure invitation token for a new team member using ON CONFLICT DO UPDATE."""
+        clean_email = email.strip().lower()
+        clean_name = name.strip()
+        member_id = uuid.uuid4()
         invite_token = secrets.token_urlsafe(32)
         now = datetime.now(timezone.utc)
-        expires_at = (now + timedelta(days=expires_days)).isoformat()
-        now_str = now.isoformat()
+        expires_at = now + timedelta(days=expires_days)
 
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO team_members (id, email, name, role, department, status, invited_by, invite_token, expires_at, invited_at)
-                VALUES (?, ?, ?, ?, ?, 'invited', ?, ?, ?, ?)
-                ON CONFLICT(email) DO UPDATE SET
-                    name=excluded.name,
-                    role=excluded.role,
-                    department=excluded.department,
-                    invite_token=excluded.invite_token,
-                    expires_at=excluded.expires_at,
-                    invited_at=excluded.invited_at
-            """, (member_id, email.strip().lower(), name.strip(), role, department, invited_by, invite_token, expires_at, now_str))
-            conn.commit()
+        stmt = pg_insert(TeamMember).values(
+            id=member_id,
+            email=clean_email,
+            name=clean_name,
+            role=role,
+            department=department,
+            status="invited",
+            invited_by=invited_by,
+            invite_token=invite_token,
+            expires_at=expires_at,
+            invited_at=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[TeamMember.email],
+            set_={
+                "name": stmt.excluded.name,
+                "role": stmt.excluded.role,
+                "department": stmt.excluded.department,
+                "invite_token": stmt.excluded.invite_token,
+                "expires_at": stmt.excluded.expires_at,
+                "invited_at": stmt.excluded.invited_at,
+                "status": "invited",
+            },
+        )
+
+        async with self.session_factory() as session:
+            await session.execute(stmt)
+            await session.commit()
 
         return {
-            "id": member_id,
-            "email": email.strip().lower(),
-            "name": name.strip(),
+            "id": str(member_id),
+            "email": clean_email,
+            "name": clean_name,
             "role": role,
             "department": department,
             "status": "invited",
             "invited_by": invited_by,
             "invite_token": invite_token,
-            "expires_at": expires_at,
-            "invited_at": now_str,
+            "expires_at": expires_at.isoformat(),
+            "invited_at": now.isoformat(),
         }
 
-    def get_invitation_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+    async def get_invitation_by_token(self, token: str) -> Optional[Dict[str, Any]]:
         """Resolve and validate an invitation by token."""
-        if not token:
+        clean_token = (token or "").strip()
+        if not clean_token:
             return None
 
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM team_members WHERE invite_token = ?", (token.strip(),))
-            row = cursor.fetchone()
-            if not row:
+        async with self.session_factory() as session:
+            stmt = select(TeamMember).where(TeamMember.invite_token == clean_token)
+            result = await session.execute(stmt)
+            inv = result.scalars().first()
+            if not inv:
                 return None
 
-            data = dict(row)
-            expires_at = data.get("expires_at")
-            if expires_at:
-                try:
-                    exp_dt = datetime.fromisoformat(expires_at)
-                    if datetime.now(timezone.utc) > exp_dt:
-                        data["is_expired"] = True
-                    else:
-                        data["is_expired"] = False
-                except Exception:
-                    data["is_expired"] = False
+            inv_created = (
+                inv.invited_at.isoformat()
+                if isinstance(inv.invited_at, datetime)
+                else str(inv.invited_at)
+            )
+            exp_str = inv.expires_at.isoformat() if inv.expires_at else None
+
+            data: Dict[str, Any] = {
+                "id": str(inv.id),
+                "email": inv.email,
+                "name": inv.name,
+                "role": inv.role,
+                "department": inv.department,
+                "status": inv.status,
+                "invited_by": inv.invited_by,
+                "invite_token": inv.invite_token,
+                "expires_at": exp_str,
+                "invited_at": inv_created,
+            }
+
+            if inv.expires_at:
+                exp_dt = (
+                    inv.expires_at
+                    if inv.expires_at.tzinfo
+                    else inv.expires_at.replace(tzinfo=timezone.utc)
+                )
+                data["is_expired"] = datetime.now(timezone.utc) > exp_dt
             else:
                 data["is_expired"] = False
 
             return data
 
-    def accept_invitation(self, token: str) -> bool:
+    async def accept_invitation(self, token: str) -> bool:
         """Mark invitation as accepted and active."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE team_members
-                SET status = 'active', invite_token = NULL
-                WHERE invite_token = ?
-            """, (token.strip(),))
-            conn.commit()
-            return cursor.rowcount > 0
+        clean_token = (token or "").strip()
+        if not clean_token:
+            return False
 
-    def remove_member(self, email: str) -> bool:
+        async with self.session_factory() as session:
+            stmt = (
+                update(TeamMember)
+                .where(TeamMember.invite_token == clean_token)
+                .values(status="active", invite_token=None)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return (result.rowcount or 0) > 0
+
+    async def remove_member(self, email: str) -> bool:
         """Remove a team member or cancel an invitation."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM team_members WHERE LOWER(email) = LOWER(?)", (email.strip(),))
-            conn.commit()
-            return cursor.rowcount > 0
+        clean_email = (email or "").strip().lower()
+        if not clean_email:
+            return False
+
+        async with self.session_factory() as session:
+            stmt = delete(TeamMember).where(
+                func.lower(TeamMember.email) == clean_email
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return (result.rowcount or 0) > 0
