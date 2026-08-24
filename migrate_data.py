@@ -250,77 +250,105 @@ async def execute_migration(sqlite_path: str = SQLITE_DB_PATH) -> Dict[str, Any]
     stats: Dict[str, Dict[str, int]] = {}
 
     async with session_factory() as session:
+        # Pre-fetch existing PostgreSQL users and workspaces to handle ID / slug / email collisions
+        existing_users_res = await session.execute(select(User.id, User.email, User.username))
+        existing_users_by_email: Dict[str, uuid.UUID] = {r.email.lower(): r.id for r in existing_users_res.all()}
+        existing_users_by_id: Set[uuid.UUID] = {r.id for r in existing_users_res.all()}
+
+        existing_ws_res = await session.execute(select(Workspace.id, Workspace.slug))
+        existing_ws_by_slug: Dict[str, uuid.UUID] = {r.slug.lower(): r.id for r in existing_ws_res.all()}
+        existing_ws_by_id: Set[uuid.UUID] = {r.id for r in existing_ws_res.all()}
+
+        user_id_map: Dict[str, uuid.UUID] = {}
+        ws_id_map: Dict[str, uuid.UUID] = {}
+
         # =====================================================================
         # 1. Migrate Users
         # =====================================================================
         cursor.execute("SELECT * FROM users")
         user_rows = cursor.fetchall()
-        migrated_users = 0
         for r in user_rows:
-            uid = to_uuid(r["id"])
+            raw_id = r["id"]
+            email = r["email"].strip().lower()
+            username = r["username"].strip()
+            derived_uid = to_uuid(raw_id)
             roles = parse_json_safely(r["roles"], list)
             meta = parse_json_safely(r["metadata"], dict)
             created_at = parse_datetime_safely(r["created_at"])
             is_active = bool(r["is_active"]) if r["is_active"] is not None else True
 
-            stmt = pg_insert(User).values(
-                id=uid,
-                username=r["username"].strip(),
-                email=r["email"].strip().lower(),
-                hashed_password=r["hashed_password"],
-                is_active=is_active,
-                created_at=created_at,
-                roles=roles,
-                metadata_=meta,
-            ).on_conflict_do_nothing(index_elements=[User.id])
-            await session.execute(stmt)
-            migrated_users += 1
+            if email in existing_users_by_email:
+                target_uid = existing_users_by_email[email]
+                user_id_map[raw_id] = target_uid
+            elif derived_uid in existing_users_by_id:
+                target_uid = derived_uid
+                user_id_map[raw_id] = target_uid
+            else:
+                target_uid = derived_uid
+                user_id_map[raw_id] = target_uid
+                stmt = pg_insert(User).values(
+                    id=target_uid,
+                    username=username,
+                    email=email,
+                    hashed_password=r["hashed_password"],
+                    is_active=is_active,
+                    created_at=created_at,
+                    roles=roles,
+                    metadata_=meta,
+                ).on_conflict_do_nothing(index_elements=[User.email])
+                await session.execute(stmt)
+                existing_users_by_email[email] = target_uid
+                existing_users_by_id.add(target_uid)
 
         # =====================================================================
         # 2. Migrate Workspaces
         # =====================================================================
         cursor.execute("SELECT * FROM workspaces")
         ws_rows = cursor.fetchall()
-        migrated_workspaces = 0
         for r in ws_rows:
-            wid = to_uuid(r["id"])
+            raw_id = r["id"]
+            slug = r["slug"].strip().lower()
+            derived_wid = to_uuid(raw_id)
             created_at = parse_datetime_safely(r["created_at"])
             updated_at = parse_datetime_safely(r["updated_at"])
 
-            stmt = pg_insert(Workspace).values(
-                id=wid,
-                name=r["name"].strip(),
-                slug=r["slug"].strip(),
-                description=r["description"],
-                created_by=str(r["created_by"]),
-                created_at=created_at,
-                updated_at=updated_at,
-            ).on_conflict_do_nothing(index_elements=[Workspace.id])
-            await session.execute(stmt)
-            migrated_workspaces += 1
+            if slug in existing_ws_by_slug:
+                target_wid = existing_ws_by_slug[slug]
+                ws_id_map[raw_id] = target_wid
+            elif derived_wid in existing_ws_by_id:
+                target_wid = derived_wid
+                ws_id_map[raw_id] = target_wid
+            else:
+                target_wid = derived_wid
+                ws_id_map[raw_id] = target_wid
+                stmt = pg_insert(Workspace).values(
+                    id=target_wid,
+                    name=r["name"].strip(),
+                    slug=slug,
+                    description=r["description"],
+                    created_by=str(r["created_by"]),
+                    created_at=created_at,
+                    updated_at=updated_at,
+                ).on_conflict_do_nothing(index_elements=[Workspace.slug])
+                await session.execute(stmt)
+                existing_ws_by_slug[slug] = target_wid
+                existing_ws_by_id.add(target_wid)
 
         # =====================================================================
         # 3. Migrate Workspace Members
         # =====================================================================
         cursor.execute("SELECT * FROM workspace_members")
         wm_rows = cursor.fetchall()
-        migrated_wm = 0
-        skipped_wm = 0
         for r in wm_rows:
-            wid = to_uuid(r["workspace_id"])
-            # Validate workspace exists in target
-            ws_check = await session.execute(select(Workspace.id).where(Workspace.id == wid))
-            if not ws_check.scalar_one_or_none():
-                skipped_wm += 1
+            raw_ws_id = r["workspace_id"]
+            wid = ws_id_map.get(raw_ws_id, to_uuid(raw_ws_id))
+            if not wid or wid not in existing_ws_by_id:
                 continue
 
-            # Validate user_id exists in target or set NULL
             raw_user_id = r["user_id"]
-            parsed_user_id = to_uuid(raw_user_id) if raw_user_id else None
-            if parsed_user_id:
-                u_check = await session.execute(select(User.id).where(User.id == parsed_user_id))
-                if not u_check.scalar_one_or_none():
-                    parsed_user_id = None  # Orphan user_id safely converted to NULL
+            parsed_user_id = user_id_map.get(raw_user_id, to_uuid(raw_user_id)) if raw_user_id else None
+            if parsed_user_id and parsed_user_id not in existing_users_by_id:
+                parsed_user_id = None  # Orphan user_id safely converted to NULL
 
             member_id = to_uuid(r["id"])
             created_at = parse_datetime_safely(r["invited_at"])
@@ -341,22 +369,18 @@ async def execute_migration(sqlite_path: str = SQLITE_DB_PATH) -> Dict[str, Any]
                 invited_at=created_at,
             ).on_conflict_do_nothing(constraint="uq_workspace_members_workspace_email")
             await session.execute(stmt)
-            migrated_wm += 1
 
         # =====================================================================
         # 4. Migrate Tasks
         # =====================================================================
         cursor.execute("SELECT * FROM tasks")
         task_rows = cursor.fetchall()
-        migrated_tasks = 0
         for r in task_rows:
             tid = to_uuid(r["id"])
-            wid = to_uuid(r["workspace_id"])
-            # Fallback if workspace missing: check first workspace
-            ws_check = await session.execute(select(Workspace.id).where(Workspace.id == wid))
-            if not ws_check.scalar_one_or_none():
-                first_ws = await session.execute(select(Workspace.id).limit(1))
-                wid = first_ws.scalar_one()
+            raw_ws_id = r["workspace_id"]
+            wid = ws_id_map.get(raw_ws_id, to_uuid(raw_ws_id))
+            if not wid or wid not in existing_ws_by_id:
+                wid = next(iter(existing_ws_by_id))
 
             tags = parse_json_safely(r["tags"], list)
             assignees = parse_json_safely(r["assignees"], list)
@@ -380,14 +404,12 @@ async def execute_migration(sqlite_path: str = SQLITE_DB_PATH) -> Dict[str, Any]
                 updated_at=updated_at,
             ).on_conflict_do_nothing(index_elements=[Task.id])
             await session.execute(stmt)
-            migrated_tasks += 1
 
         # =====================================================================
         # 5. Migrate Team Members (Legacy)
         # =====================================================================
         cursor.execute("SELECT * FROM team_members")
         tm_rows = cursor.fetchall()
-        migrated_tm = 0
         for r in tm_rows:
             tmid = to_uuid(r["id"])
             created_at = parse_datetime_safely(r["invited_at"])
@@ -406,18 +428,16 @@ async def execute_migration(sqlite_path: str = SQLITE_DB_PATH) -> Dict[str, Any]
                 invited_at=created_at,
             ).on_conflict_do_nothing(index_elements=[TeamMember.id])
             await session.execute(stmt)
-            migrated_tm += 1
 
         # =====================================================================
         # 6. Migrate Trusted Devices
         # =====================================================================
         cursor.execute("SELECT * FROM trusted_devices")
         td_rows = cursor.fetchall()
-        migrated_td = 0
         for r in td_rows:
-            uid = to_uuid(r["user_id"])
-            u_check = await session.execute(select(User.id).where(User.id == uid))
-            if not u_check.scalar_one_or_none():
+            raw_user_id = r["user_id"]
+            uid = user_id_map.get(raw_user_id, to_uuid(raw_user_id))
+            if not uid or uid not in existing_users_by_id:
                 continue
 
             did = to_uuid(r["id"])
@@ -437,18 +457,16 @@ async def execute_migration(sqlite_path: str = SQLITE_DB_PATH) -> Dict[str, Any]
                 last_used_at=last_used_at,
             ).on_conflict_do_nothing(index_elements=[TrustedDevice.id])
             await session.execute(stmt)
-            migrated_td += 1
 
         # =====================================================================
         # 7. Migrate Password Reset Tokens
         # =====================================================================
         cursor.execute("SELECT * FROM password_reset_tokens")
         prt_rows = cursor.fetchall()
-        migrated_prt = 0
         for r in prt_rows:
-            uid = to_uuid(r["user_id"])
-            u_check = await session.execute(select(User.id).where(User.id == uid))
-            if not u_check.scalar_one_or_none():
+            raw_user_id = r["user_id"]
+            uid = user_id_map.get(raw_user_id, to_uuid(raw_user_id))
+            if not uid or uid not in existing_users_by_id:
                 continue
 
             prtid = to_uuid(r["id"])
@@ -466,31 +484,25 @@ async def execute_migration(sqlite_path: str = SQLITE_DB_PATH) -> Dict[str, Any]
                 ip_address=r["ip_address"],
             ).on_conflict_do_nothing(index_elements=[PasswordResetToken.id])
             await session.execute(stmt)
-            migrated_prt += 1
 
         # =====================================================================
         # 8. Migrate Notifications
         # =====================================================================
         cursor.execute("SELECT * FROM notifications")
         notif_rows = cursor.fetchall()
-        migrated_notif = 0
         for r in notif_rows:
-            uid = to_uuid(r["user_id"])
-            u_check = await session.execute(select(User.id).where(User.id == uid))
-            if not u_check.scalar_one_or_none():
+            raw_user_id = r["user_id"]
+            uid = user_id_map.get(raw_user_id, to_uuid(raw_user_id))
+            if not uid or uid not in existing_users_by_id:
                 continue
 
-            wid = to_uuid(r["workspace_id"]) if r["workspace_id"] else None
-            if wid:
-                ws_check = await session.execute(select(Workspace.id).where(Workspace.id == wid))
-                if not ws_check.scalar_one_or_none():
-                    wid = None
+            raw_ws_id = r["workspace_id"]
+            wid = ws_id_map.get(raw_ws_id, to_uuid(raw_ws_id)) if raw_ws_id else None
+            if wid and wid not in existing_ws_by_id:
+                wid = None
 
-            tid = to_uuid(r["task_id"]) if r["task_id"] else None
-            if tid:
-                t_check = await session.execute(select(Task.id).where(Task.id == tid))
-                if not t_check.scalar_one_or_none():
-                    tid = None
+            raw_task_id = r["task_id"]
+            tid = to_uuid(raw_task_id) if raw_task_id else None
 
             nid = to_uuid(r["id"])
             created_at = parse_datetime_safely(r["created_at"])
@@ -509,20 +521,17 @@ async def execute_migration(sqlite_path: str = SQLITE_DB_PATH) -> Dict[str, Any]
                 created_at=created_at,
             ).on_conflict_do_nothing(index_elements=[Notification.id])
             await session.execute(stmt)
-            migrated_notif += 1
 
         # =====================================================================
         # 9. Migrate Audit Logs
         # =====================================================================
         cursor.execute("SELECT * FROM audit_logs")
         audit_rows = cursor.fetchall()
-        migrated_audit = 0
         for r in audit_rows:
-            wid = to_uuid(r["workspace_id"]) if r["workspace_id"] else None
-            if wid:
-                ws_check = await session.execute(select(Workspace.id).where(Workspace.id == wid))
-                if not ws_check.scalar_one_or_none():
-                    wid = None  # Orphaned workspace_id in audit logs set to NULL
+            raw_ws_id = r["workspace_id"]
+            wid = ws_id_map.get(raw_ws_id, to_uuid(raw_ws_id)) if raw_ws_id else None
+            if wid and wid not in existing_ws_by_id:
+                wid = None
 
             aid = to_uuid(r["id"])
             meta = parse_json_safely(r["metadata"], dict)
@@ -543,7 +552,6 @@ async def execute_migration(sqlite_path: str = SQLITE_DB_PATH) -> Dict[str, Any]
                 timestamp=ts,
             ).on_conflict_do_nothing(index_elements=[AuditLog.id])
             await session.execute(stmt)
-            migrated_audit += 1
 
         await session.commit()
 
