@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import asyncio
+import asyncpg
 import json
 import os
 import sys
