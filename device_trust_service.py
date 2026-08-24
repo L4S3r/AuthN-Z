@@ -229,6 +229,24 @@ class DeviceTrustService(abstractDeviceTrustService):
                 except Exception:
                     return None
 
+            # Device binding: Verify presented User-Agent matches enrolled device profile
+            stored_ua = (device.get("user_agent") or "").strip()
+            presented_ua = (user_agent or "").strip()
+            if stored_ua:
+                if stored_ua != presented_ua:
+                    stored_label = parse_device_label(stored_ua)
+                    presented_label = parse_device_label(presented_ua)
+                    if stored_label != presented_label or presented_label == "Unknown Browser / Device":
+                        logger.warning(
+                            "Trusted device user-agent mismatch for user %s (stored: '%s' [%s], presented: '%s' [%s]). Rejecting trust.",
+                            user_id,
+                            stored_ua,
+                            stored_label,
+                            presented_ua,
+                            presented_label,
+                        )
+                        return None
+
             # Update last_used_at and IP
             cursor.execute("""
                 UPDATE trusted_devices
