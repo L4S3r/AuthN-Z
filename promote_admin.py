@@ -1,8 +1,8 @@
 """
-Auth N&Z - User Promotion Utility (promote_admin.py)
----------------------------------------------------
+Auth N&Z - User Promotion Utility (promote_admin.py) (PostgreSQL Async)
+-----------------------------------------------------------------------
 Promotes an existing registered user account to Superadmin or Administrator role,
-assigns security clearance, and records a structured audit event.
+assigns security clearance, and records a structured audit event in PostgreSQL.
 
 Usage (Interactive):
     python promote_admin.py
@@ -13,6 +13,7 @@ Usage (CLI Arguments):
 """
 
 import argparse
+import asyncio
 import json
 import sys
 from typing import Optional
@@ -21,9 +22,8 @@ from user_repository import UserRepository
 from audit_logger import AuditLogger
 
 
-def promote_user_to_admin(
+async def promote_user_to_admin(
     identifier: str,
-    db_file: str = "DATABASE.db",
     role: str = "admin",
     department: str = "Security",
     clearance: int = 3,
@@ -34,22 +34,20 @@ def promote_user_to_admin(
         print("Error: Identifier cannot be empty.", file=sys.stderr)
         return None
 
-    # Normalize role
     clean_role = role.strip().lower()
     if clean_role in ("super-admin", "super_admin", "superadmin", "root"):
         target_role = "superadmin"
     else:
         target_role = clean_role
 
-    repo = UserRepository(db_file=db_file)
-    audit = AuditLogger(db_file=db_file)
+    repo = UserRepository()
+    audit = AuditLogger()
 
-    user = repo.get_by_identifier(clean_id)
+    user = await repo.get_by_identifier(clean_id)
     if not user:
         print(f"Error: No user found matching '{clean_id}'.", file=sys.stderr)
         return None
 
-    # Parse existing roles
     roles = user.get("roles", [])
     if isinstance(roles, str):
         try:
@@ -60,117 +58,141 @@ def promote_user_to_admin(
     if target_role not in roles:
         roles.append(target_role)
 
-    # Parse and update metadata
-    metadata = user.get("metadata", {})
-    if isinstance(metadata, str):
+    raw_meta = user.get("metadata", {})
+    if isinstance(raw_meta, str):
         try:
-            metadata = json.loads(metadata)
+            metadata = json.loads(raw_meta)
         except Exception:
             metadata = {}
+    elif isinstance(raw_meta, dict):
+        metadata = dict(raw_meta)
+    else:
+        metadata = {}
 
     metadata["department"] = department
     metadata["clearance"] = clearance
 
-    success = repo.update_user(
+    updated_user = await repo.update_user(
         user["id"],
         {
             "roles": roles,
             "metadata": metadata,
-            "is_active": 1,
         },
     )
 
-    if not success:
-        print("Error: Failed to update user record in database.", file=sys.stderr)
-        return None
-
-    # Record security audit event
-    audit.record_security_event(
-        event_name="ADMIN_ROLE_GRANTED",
-        severity="INFO",
+    await audit.record_security_event(
+        event_name="USER_PROMOTED_TO_ADMIN",
+        severity="WARNING",
         details={
             "user_id": user["id"],
             "username": user["username"],
-            "target_role": target_role,
-            "roles": roles,
+            "email": user["email"],
+            "assigned_role": target_role,
+            "department": department,
             "clearance": clearance,
-            "source": "CLI_PROMOTE_SCRIPT",
+            "all_roles": roles,
         },
     )
 
-    updated_user = repo.get_by_id(user["id"])
     return updated_user
+
+
+def interactive_prompt():
+    print("=" * 60)
+    print("  Auth N&Z - User Promotion Utility (PostgreSQL)")
+    print("=" * 60)
+
+    identifier = input("Enter username or email of user to promote: ").strip()
+    if not identifier:
+        print("Aborted: identifier is required.")
+        return
+
+    print("\nSelect role:")
+    print("  1) admin       - Standard administrator")
+    print("  2) superadmin  - Full system superadmin")
+    role_choice = input("Enter choice [1/2, default: 1]: ").strip()
+    target_role = "superadmin" if role_choice == "2" else "admin"
+
+    dept = input("Enter department [default: Security]: ").strip() or "Security"
+    clearance_input = input("Enter clearance level (1-5) [default: 3]: ").strip()
+    try:
+        clearance = int(clearance_input) if clearance_input else 3
+    except ValueError:
+        clearance = 3
+
+    print(f"\nPromoting '{identifier}' to {target_role} (Dept: {dept}, Clearance: {clearance})...")
+    res = asyncio.run(promote_user_to_admin(
+        identifier=identifier,
+        role=target_role,
+        department=dept,
+        clearance=clearance,
+    ))
+
+    if res:
+        print("\nSUCCESS! User updated successfully.")
+        print(f"  User ID:    {res['id']}")
+        print(f"  Username:   {res['username']}")
+        print(f"  Email:      {res['email']}")
+        print(f"  Roles:      {res.get('roles')}")
+        print(f"  Metadata:   {res.get('metadata')}")
+    else:
+        print("\nFAILED: User could not be promoted.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Auth N&Z - Promote Existing User to Superadmin or Administrator"
+        description="Promote an existing user to Administrator or Superadmin in PostgreSQL."
     )
     parser.add_argument(
-        "--identifier",
-        "-i",
+        "-i", "--identifier",
         type=str,
-        help="Username or email address of the existing user",
-    )
-    parser.add_argument(
-        "--role",
-        "-r",
-        type=str,
-        default="admin",
-        help="Role to assign: admin, superadmin, developer, editor, viewer (default: admin)",
+        help="Username or email address of the user to promote.",
     )
     parser.add_argument(
         "--super",
-        "-s",
         action="store_true",
-        help="Shorthand flag to promote directly to superadmin role",
+        help="Shorthand flag to promote to 'superadmin' role.",
     )
     parser.add_argument(
-        "--db",
+        "-r", "--role",
         type=str,
-        default="DATABASE.db",
-        help="Path to SQLite database file (default: DATABASE.db)",
+        default="admin",
+        help="Role to assign: 'admin' or 'superadmin' (default: admin).",
     )
     parser.add_argument(
-        "--department",
-        "-d",
+        "-d", "--department",
         type=str,
         default="Security",
-        help="Department name to assign (default: Security)",
+        help="Department metadata (default: Security).",
     )
     parser.add_argument(
-        "--clearance",
-        "-c",
+        "-c", "--clearance",
         type=int,
         default=3,
-        help="Security clearance level (default: 3)",
+        help="Security clearance level 1-5 (default: 3).",
     )
 
     args = parser.parse_args()
 
-    identifier = args.identifier
-    if not identifier:
-        print("--- Auth N&Z User Promotion Utility ---")
-        identifier = input("Enter username or email of existing user: ").strip()
+    if not args.identifier:
+        interactive_prompt()
+        return
 
     target_role = "superadmin" if args.super else args.role
 
-    result = promote_user_to_admin(
-        identifier=identifier,
-        db_file=args.db,
+    res = asyncio.run(promote_user_to_admin(
+        identifier=args.identifier,
         role=target_role,
         department=args.department,
         clearance=args.clearance,
-    )
+    ))
 
-    if result:
-        print(f"\nUser successfully promoted with '{target_role}' clearance.")
-        print(f"User ID:     {result['id']}")
-        print(f"Username:    {result['username']}")
-        print(f"Email:       {result['email']}")
-        print(f"Roles:       {result['roles']}")
-        print(f"Metadata:    {result['metadata']}")
-        print(f"Active:      {bool(result['is_active'])}")
+    if res:
+        print(f"[SUCCESS] User '{args.identifier}' successfully promoted to '{target_role}'.")
+        print(f"  ID:         {res['id']}")
+        print(f"  Username:   {res['username']}")
+        print(f"  Roles:      {res.get('roles')}")
+        print(f"  Metadata:   {res.get('metadata')}")
     else:
         sys.exit(1)
 

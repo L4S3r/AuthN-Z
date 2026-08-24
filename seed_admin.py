@@ -1,8 +1,8 @@
 """
-Auth N&Z - Admin Account Bootstrap Script (seed_admin.py)
----------------------------------------------------------
+Auth N&Z - Admin Account Bootstrap Script (seed_admin.py) (PostgreSQL Async)
+----------------------------------------------------------------------------
 Interactive and CLI-argument utility for provisioning the root administrator
-account directly on the server without exposing any HTTP endpoints.
+account directly in PostgreSQL without exposing any HTTP endpoints.
 
 Usage (Interactive):
     python seed_admin.py
@@ -12,6 +12,7 @@ Usage (Non-Interactive / Arguments):
 """
 
 import argparse
+import asyncio
 import getpass
 import sys
 from typing import Optional
@@ -21,15 +22,14 @@ from user_repository import UserRepository
 from audit_logger import AuditLogger
 
 
-def create_admin_user(
+async def create_admin_user(
     username: str,
     email: str,
     password: str,
-    db_file: str = "DATABASE.db",
     department: str = "Security",
     clearance: int = 3,
 ) -> Optional[dict]:
-    """Create a new root administrator account."""
+    """Create a new root administrator account in PostgreSQL."""
     if len(username) < 3:
         print("Error: Username must be at least 3 characters long.", file=sys.stderr)
         return None
@@ -42,12 +42,12 @@ def create_admin_user(
         print("Error: Invalid email address format.", file=sys.stderr)
         return None
 
-    repo = UserRepository(db_file=db_file)
+    repo = UserRepository()
     hasher = PasswordHasher()
-    audit = AuditLogger(db_file=db_file)
+    audit = AuditLogger()
 
     # Check for existing user
-    existing_user = repo.get_by_identifier(username) or repo.get_by_identifier(email)
+    existing_user = await repo.get_by_identifier(username) or await repo.get_by_identifier(email)
     if existing_user:
         print(
             f"Error: A user with username '{username}' or email '{email}' already exists.",
@@ -56,77 +56,105 @@ def create_admin_user(
         return None
 
     hashed_password = hasher.hash(password)
-    new_user = repo.create_user({
+    new_user = await repo.create_user({
         "username": username,
         "email": email,
         "hashed_password": hashed_password,
-        "roles": ["admin"],
+        "roles": ["superadmin", "admin"],
         "metadata": {
             "department": department,
             "clearance": clearance,
         },
     })
 
-    audit.record_security_event(
-        event_name="ADMIN_BOOTSTRAPPED",
-        severity="INFO",
+    # Log security audit event
+    await audit.record_security_event(
+        event_name="ADMIN_BOOTSTRAP_CREATED",
+        severity="WARNING",
         details={
             "user_id": new_user["id"],
             "username": new_user["username"],
-            "source": "CLI_SEED_SCRIPT",
+            "email": new_user["email"],
+            "method": "cli_seed_script",
+            "department": department,
+            "clearance": clearance,
         },
     )
 
     return new_user
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Auth N&Z Administrator Bootstrap Utility")
-    parser.add_argument("--username", "-u", type=str, help="Admin username")
-    parser.add_argument("--email", "-e", type=str, help="Admin email address")
-    parser.add_argument("--password", "-p", type=str, help="Admin password (plain text)")
-    parser.add_argument("--db", type=str, default="DATABASE.db", help="Path to SQLite database file")
-    parser.add_argument("--department", type=str, default="Security", help="Admin department name")
-    parser.add_argument("--clearance", type=int, default=3, help="Security clearance level (default 3)")
+def interactive_prompt():
+    print("=" * 60)
+    print("  Auth N&Z - Admin Provisioning Utility (PostgreSQL)")
+    print("=" * 60)
 
-    args = parser.parse_args()
+    username = input("Enter admin username [default: rootadmin]: ").strip() or "rootadmin"
+    email = input("Enter admin email [default: admin@l4s3r.site]: ").strip() or "admin@l4s3r.site"
 
-    username = args.username
-    email = args.email
-    password = args.password
+    while True:
+        password = getpass.getpass("Enter strong admin password: ")
+        if len(password) < 8:
+            print("Password must be at least 8 characters long. Try again.\n")
+            continue
+        confirm = getpass.getpass("Confirm password: ")
+        if password != confirm:
+            print("Passwords do not match. Try again.\n")
+            continue
+        break
 
-    # Interactive mode if arguments are omitted
-    if not (username and email and password):
-        print("--- Auth N&Z Administrator Provisioning ---")
-        if not username:
-            username = input("Enter admin username: ").strip()
-        if not email:
-            email = input("Enter admin email: ").strip()
-        if not password:
-            password = getpass.getpass("Enter admin password (hidden): ")
-            confirm_password = getpass.getpass("Confirm admin password: ")
-            if password != confirm_password:
-                print("Error: Passwords do not match.", file=sys.stderr)
-                sys.exit(1)
+    dept = input("Enter department [default: Security]: ").strip() or "Security"
+    clearance_input = input("Enter clearance level (1-5) [default: 3]: ").strip()
+    try:
+        clearance = int(clearance_input) if clearance_input else 3
+    except ValueError:
+        clearance = 3
 
-    result = create_admin_user(
+    print("\nCreating administrator account in PostgreSQL...")
+    user = asyncio.run(create_admin_user(
         username=username,
         email=email,
         password=password,
-        db_file=args.db,
-        department=args.department,
-        clearance=args.clearance,
-    )
+        department=dept,
+        clearance=clearance,
+    ))
 
-    if result:
-        print("\nAdmin account created successfully.")
-        print(f"User ID:    {result['id']}")
-        print(f"Username:   {result['username']}")
-        print(f"Email:      {result['email']}")
-        print(f"Roles:      {result['roles']}")
-        print(f"Metadata:   {result['metadata']}")
+    if user:
+        print("\nSUCCESS! Admin account created successfully.")
+        print(f"  User ID:    {user['id']}")
+        print(f"  Username:   {user['username']}")
+        print(f"  Email:      {user['email']}")
+        print(f"  Roles:      {user['roles']}")
+        print(f"  Department: {user['metadata'].get('department')}")
+        print(f"  Clearance:  {user['metadata'].get('clearance')}")
     else:
-        sys.exit(1)
+        print("\nFAILED: Admin account creation was unsuccessful.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Provision root administrator account in PostgreSQL.")
+    parser.add_argument("--username", type=str, help="Administrator username")
+    parser.add_argument("--email", type=str, help="Administrator email address")
+    parser.add_argument("--password", type=str, help="Administrator password")
+    parser.add_argument("--department", type=str, default="Security", help="Department metadata")
+    parser.add_argument("--clearance", type=int, default=3, help="Clearance level (1-5)")
+
+    args = parser.parse_args()
+
+    if args.username and args.email and args.password:
+        user = asyncio.run(create_admin_user(
+            username=args.username,
+            email=args.email,
+            password=args.password,
+            department=args.department,
+            clearance=args.clearance,
+        ))
+        if user:
+            print(f"[SUCCESS] Admin account '{user['username']}' provisioned successfully (ID: {user['id']}).")
+        else:
+            sys.exit(1)
+    else:
+        interactive_prompt()
 
 
 if __name__ == "__main__":

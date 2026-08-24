@@ -1,8 +1,8 @@
 """
-Auth N&Z - Database Management & Inspection CLI (db_manager.py)
---------------------------------------------------------------
-Inspect, query, and safely manage database tables live on your server.
-Works safely with SQLite in WAL mode without requiring service stoppage.
+Auth N&Z - PostgreSQL Database Management & Inspection CLI (db_manager.py)
+-------------------------------------------------------------------------
+Inspect, query, and safely manage PostgreSQL tables live on your server.
+Uses async SQLAlchemy and the configured connection pool.
 
 Usage:
     python db_manager.py stats
@@ -12,51 +12,65 @@ Usage:
     python db_manager.py devices [-u USER]
     python db_manager.py users [-r ROLE]
     python db_manager.py tasks [-w WORKSPACE]
-    python db_manager.py purge-audit
-    python db_manager.py purge-devices
-    python db_manager.py purge-tasks
-    python db_manager.py purge-all
-    python db_manager.py reset-db
+    python db_manager.py purge-audit [--yes]
+    python db_manager.py purge-devices [--yes]
+    python db_manager.py purge-tasks [--yes]
+    python db_manager.py purge-all [--yes]
+    python db_manager.py reset-db [--yes]
 """
 
 import argparse
+import asyncio
 import json
 import os
-import sqlite3
 import sys
+import uuid
 from typing import Any, Dict, List, Optional
 
-DB_FILE = os.getenv("AUTH_NZ_DB_PATH", "DATABASE.db")
+from sqlalchemy import select, func, delete, text
+from database import get_session_factory, get_engine
+from models import (
+    User,
+    Workspace,
+    WorkspaceMember,
+    Task,
+    TeamMember,
+    TrustedDevice,
+    PasswordResetToken,
+    Notification,
+    AuditLog,
+)
 
 
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-
-def show_stats() -> None:
-    """Print high-level statistics across all database tables."""
+async def show_stats() -> None:
+    """Print high-level statistics across all PostgreSQL database tables."""
     print("=" * 65)
-    print(f"  Auth N&Z Database Overview: {DB_FILE}")
-    print("=" * 65)
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [r["name"] for r in cursor.fetchall() if not r["name"].startswith("sqlite_")]
-
-        for table in sorted(tables):
-            cursor.execute(f"SELECT COUNT(*) as count FROM {table};")
-            count = cursor.fetchone()["count"]
-            print(f"  * Table '{table}': {count:>5} records")
-
+    print("  Auth N&Z PostgreSQL Database Overview")
     print("=" * 65)
 
+    session_factory = get_session_factory()
+    models = [
+        ("users", User),
+        ("workspaces", Workspace),
+        ("workspace_members", WorkspaceMember),
+        ("tasks", Task),
+        ("team_members", TeamMember),
+        ("trusted_devices", TrustedDevice),
+        ("password_reset_tokens", PasswordResetToken),
+        ("notifications", Notification),
+        ("audit_logs", AuditLog),
+    ]
 
-def list_audit_logs(
+    async with session_factory() as session:
+        for tbl_name, model_cls in models:
+            res = await session.execute(select(func.count(model_cls.id)))
+            count = res.scalar_one() or 0
+            print(f"  * Table '{tbl_name}': {count:>5} records")
+
+    print("=" * 65)
+
+
+async def list_audit_logs(
     limit: int = 25,
     workspace_id: Optional[str] = None,
     severity: Optional[str] = None,
@@ -64,518 +78,336 @@ def list_audit_logs(
     subject_id: Optional[str] = None,
     output_json: bool = False,
 ) -> None:
-    """Display and filter security telemetry audit entries from the database."""
-    query = "SELECT * FROM audit_logs WHERE 1=1"
-    params: List[Any] = []
+    """Display and filter security telemetry audit entries from PostgreSQL."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        stmt = select(AuditLog).order_by(AuditLog.timestamp.desc())
 
-    if workspace_id:
-        # Resolve slug or workspace_id
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT id FROM workspaces WHERE id = ? OR slug = ?", (workspace_id, workspace_id))
-            row = c.fetchone()
-            resolved_ws = row["id"] if row else workspace_id
-        query += " AND (workspace_id = ? OR workspace_id IS NULL)"
-        params.append(resolved_ws)
+        if workspace_id:
+            try:
+                ws_uuid = uuid.UUID(workspace_id.strip())
+                stmt = stmt.where(AuditLog.workspace_id == ws_uuid)
+            except Exception:
+                stmt = stmt.where(AuditLog.workspace_slug == workspace_id.strip())
 
-    if severity:
-        query += " AND UPPER(severity) = UPPER(?)"
-        params.append(severity.strip())
+        if severity:
+            stmt = stmt.where(AuditLog.severity == severity.strip().upper())
 
-    if event_type:
-        query += " AND UPPER(event_type) LIKE UPPER(?)"
-        params.append(f"%{event_type.strip()}%")
+        if event_type:
+            stmt = stmt.where(AuditLog.event_type.ilike(f"%{event_type.strip()}%"))
 
-    if subject_id:
-        query += " AND (subject_id = ? OR LOWER(metadata) LIKE LOWER(?))"
-        params.extend([subject_id.strip(), f"%{subject_id.strip()}%"])
+        if subject_id:
+            stmt = stmt.where(AuditLog.subject_id == subject_id.strip())
 
-    query += " ORDER BY datetime(timestamp) DESC LIMIT ?"
-    params.append(limit)
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+        stmt = stmt.limit(limit)
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
 
     if output_json:
-        results = [dict(r) for r in rows]
-        for r in results:
-            if isinstance(r.get("metadata"), str):
-                try:
-                    r["metadata"] = json.loads(r["metadata"])
-                except Exception:
-                    pass
-        print(json.dumps(results, indent=2))
+        data = [
+            {
+                "id": str(r.id),
+                "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+                "event_type": r.event_type,
+                "severity": r.severity,
+                "subject_id": r.subject_id,
+                "workspace_id": str(r.workspace_id) if r.workspace_id else None,
+                "workspace_slug": r.workspace_slug,
+                "metadata": r.metadata_payload,
+            }
+            for r in rows
+        ]
+        print(json.dumps(data, indent=2))
         return
 
-    print("\n" + "=" * 80)
-    print(f"  Security Audit Telemetry Logs (Showing up to {limit} entries)")
-    print("=" * 80)
-
-    if not rows:
-        print("  No audit logs found matching criteria.")
-        print("=" * 80 + "\n")
-        return
+    print("=" * 115)
+    print(f"{'TIMESTAMP (UTC)':<24} | {'SEVERITY':<8} | {'EVENT TYPE':<28} | {'SUBJECT':<20} | {'WORKSPACE'}")
+    print("-" * 115)
 
     for r in rows:
-        timestamp = r["timestamp"]
-        sev = (r["severity"] or "INFO").upper()
-        event = r["event_type"]
-        ws = r["workspace_id"] or "global"
-        subject = r["subject_id"] or "system"
-        action = r["action"] or "-"
-        resource = r["resource"] or "-"
-        ip = r["ip_address"] or "-"
-        meta_raw = r["metadata"]
+        ts = r.timestamp.strftime("%Y-%m-%d %H:%M:%S") if r.timestamp else "N/A"
+        ws_info = r.workspace_slug or (str(r.workspace_id)[:8] if r.workspace_id else "global")
+        subj = (r.subject_id or "system")[:20]
+        print(f"{ts:<24} | {r.severity:<8} | {r.event_type:<28} | {subj:<20} | {ws_info}")
 
-        # Severity tag formatting
-        sev_tag = f"[{sev}]"
-        if sev == "CRITICAL":
-            sev_tag = "[CRITICAL!]"
-        elif sev == "WARNING":
-            sev_tag = "[WARN]"
+    print("=" * 115)
+    print(f"Total shown: {len(rows)}")
 
-        print(f"{timestamp}  {sev_tag:<12} {event:<32} WS: {ws}")
-        print(f"    * Subject:   {subject}")
-        if action != "-":
-            print(f"    * Action:    {action}")
-        if resource != "-":
-            print(f"    * Resource:  {resource}")
-        if ip != "-":
-            print(f"    * IP / Host: {ip}")
 
-        if meta_raw and meta_raw != "{}":
+async def list_workspaces() -> None:
+    """Display all workspaces with member counts and creation dates."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        stmt = (
+            select(
+                Workspace.id,
+                Workspace.name,
+                Workspace.slug,
+                Workspace.created_at,
+                func.count(WorkspaceMember.id).label("member_count"),
+            )
+            .outerjoin(WorkspaceMember, Workspace.id == WorkspaceMember.workspace_id)
+            .group_by(Workspace.id, Workspace.name, Workspace.slug, Workspace.created_at)
+            .order_by(Workspace.created_at.asc())
+        )
+        result = await session.execute(stmt)
+        rows = result.all()
+
+    print("=" * 95)
+    print(f"{'ID':<38} | {'SLUG':<20} | {'MEMBERS':<7} | {'NAME'}")
+    print("-" * 95)
+
+    for r in rows:
+        print(f"{str(r.id):<38} | {r.slug:<20} | {r.member_count:<7} | {r.name}")
+
+    print("=" * 95)
+    print(f"Total workspaces: {len(rows)}")
+
+
+async def list_members(workspace_id: Optional[str] = None) -> None:
+    """Display members across workspaces."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        stmt = (
+            select(
+                WorkspaceMember.id,
+                WorkspaceMember.workspace_id,
+                Workspace.name.label("workspace_name"),
+                WorkspaceMember.user_id,
+                WorkspaceMember.email,
+                WorkspaceMember.role,
+                WorkspaceMember.status,
+            )
+            .join(Workspace, WorkspaceMember.workspace_id == Workspace.id)
+            .order_by(Workspace.name.asc(), WorkspaceMember.role.asc())
+        )
+
+        if workspace_id:
             try:
-                meta_obj = json.loads(meta_raw)
-                meta_str = json.dumps(meta_obj)
-                if len(meta_str) > 100:
-                    meta_str = meta_str[:97] + "..."
-                print(f"    * Metadata:  {meta_str}")
+                ws_uuid = uuid.UUID(workspace_id.strip())
+                stmt = stmt.where(WorkspaceMember.workspace_id == ws_uuid)
             except Exception:
-                print(f"    * Metadata:  {meta_raw}")
+                stmt = stmt.where(Workspace.slug == workspace_id.strip())
 
-        print("-" * 80)
+        result = await session.execute(stmt)
+        rows = result.all()
 
-    print()
-
-
-def list_workspaces() -> None:
-    """List all workspaces, slug endpoints, creators, and membership counts."""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT w.*,
-                   (SELECT COUNT(*) FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.status = 'active') as active_members,
-                   (SELECT COUNT(*) FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.status = 'invited') as invited_members,
-                   (SELECT COUNT(*) FROM tasks t WHERE t.workspace_id = w.id) as task_count
-            FROM workspaces w
-            ORDER BY datetime(w.created_at) ASC;
-        """)
-        rows = cursor.fetchall()
-
-    print("\n" + "=" * 75)
-    print("  Registered Multi-Tenant Workspaces")
-    print("=" * 75)
-
-    if not rows:
-        print("  No workspaces found.")
-        print("=" * 75 + "\n")
-        return
+    print("=" * 115)
+    print(f"{'WORKSPACE':<22} | {'EMAIL':<30} | {'ROLE':<12} | {'STATUS':<8} | {'USER ID'}")
+    print("-" * 115)
 
     for r in rows:
-        print(f"Workspace: '{r['name']}' (Slug: /{r['slug']})")
-        print(f"  ID:          {r['id']}")
-        print(f"  Description: {r['description'] or 'None'}")
-        print(f"  Members:     {r['active_members']} active ({r['invited_members']} pending invites)")
-        print(f"  Tasks:       {r['task_count']} sprint tasks")
-        print(f"  Created By:  {r['created_by']} at {r['created_at']}")
-        print("-" * 75)
-    print()
+        uid_str = str(r.user_id) if r.user_id else "pending"
+        print(f"{r.workspace_name[:20]:<22} | {r.email:<30} | {r.role:<12} | {r.status:<8} | {uid_str}")
+
+    print("=" * 115)
+    print(f"Total members: {len(rows)}")
 
 
-def list_workspace_members(workspace_id: Optional[str] = None) -> None:
-    """List members and invitations across workspaces."""
-    query = """
-        SELECT wm.*, w.name as workspace_name, w.slug as workspace_slug, u.username
-        FROM workspace_members wm
-        INNER JOIN workspaces w ON wm.workspace_id = w.id
-        LEFT JOIN users u ON wm.user_id = u.id
-        WHERE 1=1
-    """
-    params: List[Any] = []
-    if workspace_id:
-        query += " AND (wm.workspace_id = ? OR w.slug = ?)"
-        params.extend([workspace_id.strip(), workspace_id.strip()])
+async def list_users(role_filter: Optional[str] = None) -> None:
+    """Display registered users and their role assignments."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        stmt = select(User).order_by(User.created_at.asc())
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
 
-    query += " ORDER BY wm.workspace_id, wm.status, wm.role ASC;"
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-
-    print("\n" + "=" * 75)
-    print("  Workspace Members & Invitations")
-    print("=" * 75)
-
-    if not rows:
-        print("  No members found matching criteria.")
-        print("=" * 75 + "\n")
-        return
-
-    current_ws = None
-    for r in rows:
-        if r["workspace_name"] != current_ws:
-            current_ws = r["workspace_name"]
-            print(f"\n>> Workspace: {current_ws} (/{r['workspace_slug']})")
-
-        status_tag = "[ACTIVE]" if r["status"] == "active" else "[INVITED]"
-        username = f"(@{r['username']})" if r["username"] else ""
-        print(f"  {status_tag:<10} {r['name']} {username} <{r['email']}>")
-        print(f"    * Member ID:   {r['id']}")
-        print(f"    * Role:        {r['role'].upper()} (Dept: {r['department']})")
-        if r["status"] == "invited":
-            print(f"    * Token Hash:  {r['invite_token'][:16]}... (Expires: {r['expires_at']})")
-            print(f"    * Invited By:  {r['invited_by']} at {r['invited_at']}")
-        print("  " + "-" * 70)
-    print()
-
-
-def list_trusted_devices(user_filter: Optional[str] = None) -> None:
-    """List all registered trusted devices for MFA scoping."""
-    query = """
-        SELECT td.*, u.username, u.email
-        FROM trusted_devices td
-        LEFT JOIN users u ON td.user_id = u.id
-        WHERE 1=1
-    """
-    params: List[Any] = []
-    if user_filter:
-        query += " AND (td.user_id = ? OR LOWER(u.username) = LOWER(?) OR LOWER(u.email) = LOWER(?))"
-        params.extend([user_filter.strip(), user_filter.strip(), user_filter.strip()])
-
-    query += " ORDER BY datetime(td.last_used_at) DESC;"
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trusted_devices'")
-        if not cursor.fetchone():
-            print("\nNo trusted_devices table found in database.")
-            return
-
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-
-    print("\n" + "=" * 75)
-    print("  Recognized Trusted Devices (MFA Bypass Scopes)")
-    print("=" * 75)
-
-    if not rows:
-        print("  No trusted devices found.")
-        print("=" * 75 + "\n")
-        return
-
-    for r in rows:
-        user_display = f"@{r['username']} ({r['email']})" if r["username"] else r["user_id"]
-        print(f"Device: {r['device_label']}")
-        print(f"  ID:          {r['id']}")
-        print(f"  User:        {user_display}")
-        print(f"  IP Address:  {r['ip_address'] or 'Unknown'}")
-        print(f"  Created:     {r['created_at']}")
-        print(f"  Expires:     {r['expires_at']}")
-        print(f"  Last Used:   {r['last_used_at']}")
-        print("-" * 75)
-    print()
-
-
-def list_users(role_filter: Optional[str] = None) -> None:
-    """List all registered user accounts and security clearances."""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, username, email, roles, is_active, metadata, created_at FROM users ORDER BY datetime(created_at) ASC;")
-        rows = cursor.fetchall()
-
-    print("\n" + "=" * 75)
-    print("  Registered User Accounts")
-    print("=" * 75)
-
-    if not rows:
-        print("  No users found.")
-        print("=" * 75 + "\n")
-        return
+    print("=" * 110)
+    print(f"{'ID':<38} | {'USERNAME':<18} | {'EMAIL':<28} | {'ROLES'}")
+    print("-" * 110)
 
     count = 0
-    for r in rows:
-        roles = r["roles"]
-        if isinstance(roles, str):
-            try:
-                roles = json.loads(roles)
-            except Exception:
-                roles = []
-
-        if role_filter and role_filter.lower() not in [x.lower() for x in roles]:
+    for u in rows:
+        roles_list = u.roles if isinstance(u.roles, list) else []
+        if role_filter and role_filter.lower() not in [str(r).lower() for r in roles_list]:
             continue
-
         count += 1
-        meta = r["metadata"]
-        if isinstance(meta, str):
+        roles_str = ", ".join(roles_list)
+        print(f"{str(u.id):<38} | {u.username:<18} | {u.email:<28} | {roles_str}")
+
+    print("=" * 110)
+    print(f"Total users: {count}")
+
+
+async def list_tasks(workspace_id: Optional[str] = None) -> None:
+    """Display tasks."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        stmt = select(Task).order_by(Task.created_at.desc())
+        if workspace_id:
             try:
-                meta = json.loads(meta)
+                ws_uuid = uuid.UUID(workspace_id.strip())
+                stmt = stmt.where(Task.workspace_id == ws_uuid)
             except Exception:
-                meta = {}
+                pass
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
 
-        mfa_status = "Active" if meta.get("mfa_enabled") else "Disabled"
-        dept = meta.get("department", "General")
-        clearance = meta.get("clearance", 1)
+    print("=" * 105)
+    print(f"{'ID':<38} | {'STATUS':<12} | {'PRIORITY':<8} | {'ASSIGNEE':<20} | {'TITLE'}")
+    print("-" * 105)
 
-        print(f"User: @{r['username']} <{r['email']}>")
-        print(f"  ID:          {r['id']}")
-        print(f"  Roles:       {roles}")
-        print(f"  Department:  {dept} (Clearance: {clearance})")
-        print(f"  MFA (2FA):   {mfa_status}")
-        print(f"  Account:     {'Active' if r['is_active'] else 'Suspended/Inactive'}")
-        print(f"  Created At:  {r['created_at']}")
-        print("-" * 75)
+    for t in rows:
+        assignee = (t.assignee_email or "Unassigned")[:20]
+        print(f"{str(t.id):<38} | {t.status:<12} | {t.priority:<8} | {assignee:<20} | {t.title}")
 
-    if role_filter and count == 0:
-        print(f"  No users found with role '{role_filter}'.")
-        print("=" * 75 + "\n")
-    print()
+    print("=" * 105)
+    print(f"Total tasks: {len(rows)}")
 
 
-def list_tasks(workspace_id: Optional[str] = None) -> None:
-    """List all sprint deliverables and task cards with workspace scope."""
-    query = """
-        SELECT t.*, w.name as workspace_name, w.slug as workspace_slug
-        FROM tasks t
-        LEFT JOIN workspaces w ON t.workspace_id = w.id
-        WHERE 1=1
-    """
-    params: List[Any] = []
-    if workspace_id:
-        query += " AND (t.workspace_id = ? OR w.slug = ?)"
-        params.extend([workspace_id.strip(), workspace_id.strip()])
-
-    query += " ORDER BY datetime(t.created_at) DESC;"
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-
-    print("\n" + "=" * 75)
-    print("  Sprint Tasks & Deliverables")
-    print("=" * 75)
-
-    if not rows:
-        print("  No tasks found.")
-        print("=" * 75 + "\n")
-        return
-
-    for r in rows:
-        ws_info = f"[{r['workspace_name'] or r['workspace_id'] or 'General'}]"
-        print(f"{ws_info} [{r['status'].upper()}] ({r['priority']}) {r['title']}")
-        print(f"  Task ID:     {r['id']}")
-        print(f"  Assignee:    {r['assignee_email'] or 'Unassigned'}")
-        print(f"  Created By:  {r['created_by']} at {r['created_at']}")
-        if r["due_date"]:
-            print(f"  Due Date:    {r['due_date']}")
-        print("-" * 75)
-    print()
-
-
-def purge_audit_logs() -> None:
+async def purge_audit_logs() -> None:
     """Purge all security audit telemetry logs."""
-    confirm = input("Are you sure you want to PURGE ALL AUDIT LOGS? (yes/no): ").strip().lower()
-    if confirm != "yes":
-        print("Aborted.")
-        return
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM audit_logs;")
-        count = cursor.rowcount
-        conn.commit()
-    print(f"Successfully purged {count} audit log record(s).")
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        await session.execute(delete(AuditLog))
+        await session.commit()
+    print("[SUCCESS] Audit logs table purged successfully.")
 
 
-def purge_trusted_devices() -> None:
-    """Purge all remembered trusted devices (forcing MFA for all users)."""
-    confirm = input("Are you sure you want to REVOKE ALL TRUSTED DEVICES? (yes/no): ").strip().lower()
-    if confirm != "yes":
-        print("Aborted.")
-        return
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trusted_devices'")
-        if cursor.fetchone():
-            cursor.execute("DELETE FROM trusted_devices;")
-            count = cursor.rowcount
-            conn.commit()
-            print(f"Successfully revoked {count} trusted device(s).")
-        else:
-            print("trusted_devices table does not exist.")
+async def purge_trusted_devices() -> None:
+    """Purge all enrolled trusted devices."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        await session.execute(delete(TrustedDevice))
+        await session.commit()
+    print("[SUCCESS] Trusted devices table purged successfully.")
 
 
-def purge_tasks() -> None:
-    """Delete all task cards from the database."""
-    confirm = input("Are you sure you want to PURGE ALL TASKS? (yes/no): ").strip().lower()
-    if confirm != "yes":
-        print("Aborted.")
-        return
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM tasks;")
-        deleted = cursor.rowcount
-        conn.commit()
-    print(f"Successfully deleted {deleted} task records.")
+async def purge_tasks() -> None:
+    """Purge all tasks."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        await session.execute(delete(Task))
+        await session.commit()
+    print("[SUCCESS] Tasks table purged successfully.")
 
 
-def purge_all() -> None:
-    """Purge tasks, audit logs, trusted devices, and workspaces while keeping root users."""
-    confirm = input("Are you sure you want to PURGE tasks, audit logs, devices, and workspaces? (yes/no): ").strip().lower()
-    if confirm != "yes":
-        print("Aborted.")
-        return
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM tasks;")
-        tasks_count = cursor.rowcount
-        cursor.execute("DELETE FROM audit_logs;")
-        audit_count = cursor.rowcount
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trusted_devices'")
-        devices_count = 0
-        if cursor.fetchone():
-            cursor.execute("DELETE FROM trusted_devices;")
-            devices_count = cursor.rowcount
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='workspace_members'")
-        members_count = 0
-        if cursor.fetchone():
-            cursor.execute("DELETE FROM workspace_members;")
-            members_count = cursor.rowcount
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='workspaces'")
-        ws_count = 0
-        if cursor.fetchone():
-            cursor.execute("DELETE FROM workspaces WHERE id != 'ws_default';")
-            ws_count = cursor.rowcount
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='team_members'")
-        team_count = 0
-        if cursor.fetchone():
-            cursor.execute("DELETE FROM team_members;")
-            team_count = cursor.rowcount
-
-        conn.commit()
-
-    print(f"Purge complete: {tasks_count} tasks, {audit_count} audit logs, {devices_count} devices, {members_count} members, and {ws_count} workspaces deleted.")
-
-
-def reset_entire_database() -> None:
-    """Completely wipe all records from all tables."""
-    confirm = input("CRITICAL: This will wipe ALL USERS, WORKSPACES, TASKS, LOGS, AND DEVICES. Proceed? (yes/no): ").strip().lower()
-    if confirm != "yes":
-        print("Aborted.")
-        return
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [r["name"] for r in cursor.fetchall() if not r["name"].startswith("sqlite_")]
-        for t in tables:
-            cursor.execute(f"DELETE FROM {t};")
-        conn.commit()
-
-    print("Entire database wiped clean. Run 'python seed_admin.py' to bootstrap a new admin user.")
+async def purge_all_data() -> None:
+    """Purge all tables in PostgreSQL with CASCADE."""
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "TRUNCATE TABLE tasks, team_members, workspace_members, workspaces, trusted_devices, password_reset_tokens, notifications, audit_logs, users CASCADE;"
+        ))
+    print("[SUCCESS] All PostgreSQL application tables have been purged clean.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Auth N&Z Database Management & Telemetry Inspection CLI"
+        description="Auth N&Z - PostgreSQL Database Management CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="action", help="Action to perform on the database")
+    subparsers = parser.add_subparsers(dest="command", help="Available sub-commands")
 
     # stats
-    subparsers.add_parser("stats", help="Show database overview and record counts")
+    subparsers.add_parser("stats", help="Display record counts across all tables")
 
     # audit
-    audit_p = subparsers.add_parser("audit", help="Inspect security audit telemetry logs")
-    audit_p.add_argument("-n", "--limit", type=int, default=25, help="Number of records to show (default: 25)")
-    audit_p.add_argument("-w", "--workspace", type=str, help="Filter by workspace ID or slug")
-    audit_p.add_argument("-s", "--severity", type=str, help="Filter by severity (INFO, WARNING, CRITICAL)")
-    audit_p.add_argument("-e", "--event", type=str, help="Filter by event type substring (e.g. LOGIN, WORKSPACE)")
-    audit_p.add_argument("-u", "--user", type=str, help="Filter by subject ID or user email")
-    audit_p.add_argument("--json", action="store_true", help="Output raw JSON format")
+    p_audit = subparsers.add_parser("audit", help="Query and filter security audit telemetry logs")
+    p_audit.add_argument("-n", "--limit", type=int, default=25, help="Number of records to display (default: 25)")
+    p_audit.add_argument("-w", "--workspace", type=str, help="Filter by workspace ID or slug")
+    p_audit.add_argument("-s", "--severity", type=str, help="Filter by severity (INFO, WARNING, CRITICAL)")
+    p_audit.add_argument("-e", "--event", type=str, help="Filter by event type substring")
+    p_audit.add_argument("-u", "--user", type=str, help="Filter by subject user ID")
+    p_audit.add_argument("--json", action="store_true", help="Output results in JSON format")
 
     # workspaces
-    subparsers.add_parser("workspaces", help="List all registered workspaces")
+    subparsers.add_parser("workspaces", help="List all workspaces")
 
     # members
-    members_p = subparsers.add_parser("members", help="List workspace members and invitations")
-    members_p.add_argument("-w", "--workspace", type=str, help="Filter by workspace ID or slug")
+    p_members = subparsers.add_parser("members", help="List workspace members")
+    p_members.add_argument("-w", "--workspace", type=str, help="Filter by workspace ID or slug")
 
     # devices
-    devices_p = subparsers.add_parser("devices", help="List recognized trusted devices (remember-device scopes)")
-    devices_p.add_argument("-u", "--user", type=str, help="Filter by user ID, username, or email")
+    p_devices = subparsers.add_parser("devices", help="List active trusted devices")
+    p_devices.add_argument("-u", "--user", type=str, help="Filter by user ID")
 
     # users
-    users_p = subparsers.add_parser("users", help="List registered user accounts")
-    users_p.add_argument("-r", "--role", type=str, help="Filter by role (superadmin, admin, developer, editor, viewer)")
+    p_users = subparsers.add_parser("users", help="List registered users")
+    p_users.add_argument("-r", "--role", type=str, help="Filter by role")
 
     # tasks
-    tasks_p = subparsers.add_parser("tasks", help="List sprint tasks")
-    tasks_p.add_argument("-w", "--workspace", type=str, help="Filter by workspace ID or slug")
+    p_tasks = subparsers.add_parser("tasks", help="List tasks")
+    p_tasks.add_argument("-w", "--workspace", type=str, help="Filter by workspace ID")
 
-    # Purges
-    subparsers.add_parser("purge-audit", help="Purge all audit telemetry logs")
-    subparsers.add_parser("purge-devices", help="Revoke all trusted devices")
-    subparsers.add_parser("purge-tasks", help="Purge all sprint tasks")
-    subparsers.add_parser("purge-all", help="Purge tasks, audit logs, devices, and workspaces (retaining users)")
-    subparsers.add_parser("reset-db", help="Completely wipe all records from all tables")
+    # purge commands
+    p_purge_audit = subparsers.add_parser("purge-audit", help="Delete all audit logs")
+    p_purge_audit.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
+    p_purge_dev = subparsers.add_parser("purge-devices", help="Delete all trusted devices")
+    p_purge_dev.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
+    p_purge_tasks = subparsers.add_parser("purge-tasks", help="Delete all tasks")
+    p_purge_tasks.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
+    p_purge_all = subparsers.add_parser("purge-all", help="Purge all tables in PostgreSQL (full reset)")
+    p_purge_all.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
+    p_reset = subparsers.add_parser("reset-db", help="Purge all tables and bootstrap default admin account")
+    p_reset.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
 
     args = parser.parse_args()
 
-    if not args.action:
+    if not args.command:
         parser.print_help()
         sys.exit(0)
 
-    if args.action == "stats":
-        show_stats()
-    elif args.action == "audit":
-        list_audit_logs(
+    if args.command == "stats":
+        asyncio.run(show_stats())
+    elif args.command == "audit":
+        asyncio.run(list_audit_logs(
             limit=args.limit,
             workspace_id=args.workspace,
             severity=args.severity,
             event_type=args.event,
             subject_id=args.user,
             output_json=args.json,
-        )
-    elif args.action == "workspaces":
-        list_workspaces()
-    elif args.action == "members":
-        list_workspace_members(workspace_id=args.workspace)
-    elif args.action == "devices":
-        list_trusted_devices(user_filter=args.user)
-    elif args.action == "users":
-        list_users(role_filter=args.role)
-    elif args.action == "tasks":
-        list_tasks(workspace_id=args.workspace)
-    elif args.action == "purge-audit":
-        purge_audit_logs()
-    elif args.action == "purge-devices":
-        purge_trusted_devices()
-    elif args.action == "purge-tasks":
-        purge_tasks()
-    elif args.action == "purge-all":
-        purge_all()
-    elif args.action == "reset-db":
-        reset_entire_database()
+        ))
+    elif args.command == "workspaces":
+        asyncio.run(list_workspaces())
+    elif args.command == "members":
+        asyncio.run(list_members(workspace_id=args.workspace))
+    elif args.command == "users":
+        asyncio.run(list_users(role_filter=args.role))
+    elif args.command == "tasks":
+        asyncio.run(list_tasks(workspace_id=args.workspace))
+    elif args.command == "purge-audit":
+        if not args.yes:
+            conf = input("Are you sure you want to purge all audit logs? (y/N): ").strip().lower()
+            if conf != "y":
+                print("Aborted.")
+                return
+        asyncio.run(purge_audit_logs())
+    elif args.command == "purge-devices":
+        if not args.yes:
+            conf = input("Are you sure you want to purge all trusted devices? (y/N): ").strip().lower()
+            if conf != "y":
+                print("Aborted.")
+                return
+        asyncio.run(purge_trusted_devices())
+    elif args.command == "purge-tasks":
+        if not args.yes:
+            conf = input("Are you sure you want to purge all tasks? (y/N): ").strip().lower()
+            if conf != "y":
+                print("Aborted.")
+                return
+        asyncio.run(purge_tasks())
+    elif args.command == "purge-all":
+        if not args.yes:
+            conf = input("CAUTION: This will purge ALL data in PostgreSQL. Are you sure? (y/N): ").strip().lower()
+            if conf != "y":
+                print("Aborted.")
+                return
+        asyncio.run(purge_all_data())
+    elif args.command == "reset-db":
+        if not args.yes:
+            conf = input("This will purge all data and prepare for admin seeding. Proceed? (y/N): ").strip().lower()
+            if conf != "y":
+                print("Aborted.")
+                return
+        asyncio.run(purge_all_data())
+        from seed_admin import interactive_prompt
+        interactive_prompt()
 
 
 if __name__ == "__main__":
