@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 import uuid
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -1084,19 +1084,19 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             stmt = select(
                 func.count().label("total"),
                 func.sum(
-                    func.case((WorkspaceMember.status == "active", 1), else_=0)
+                    case((WorkspaceMember.status == "active", 1), else_=0)
                 ).label("active"),
                 func.sum(
-                    func.case((WorkspaceMember.status == "invited", 1), else_=0)
+                    case((WorkspaceMember.status == "invited", 1), else_=0)
                 ).label("invited"),
                 func.sum(
-                    func.case((WorkspaceMember.role == "admin", 1), else_=0)
+                    case((WorkspaceMember.role == "admin", 1), else_=0)
                 ).label("admins"),
                 func.sum(
-                    func.case((WorkspaceMember.role == "editor", 1), else_=0)
+                    case((WorkspaceMember.role == "editor", 1), else_=0)
                 ).label("editors"),
                 func.sum(
-                    func.case((WorkspaceMember.role == "viewer", 1), else_=0)
+                    case((WorkspaceMember.role == "viewer", 1), else_=0)
                 ).label("viewers"),
             ).where(WorkspaceMember.workspace_id == ws_uuid)
             result = await session.execute(stmt)
