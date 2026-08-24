@@ -11,10 +11,13 @@ system from specific database engines (e.g., PostgreSQL, MongoDB, DynamoDB).
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
-import sqlite3
-import uuid
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
+import secrets
+import sqlite3
+from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 class abstractUserRepository(ABC):
     """Abstract interface defining persistence and retrieval operations for user identities and profile state."""
@@ -129,6 +132,26 @@ class abstractUserRepository(ABC):
         """
         ...
 
+    @abstractmethod
+    def create_password_reset_token(
+        self,
+        user_id: str,
+        ip_address: Optional[str] = None,
+        expires_in_minutes: int = 15,
+    ) -> str:
+        """Issue and record a high-entropy password reset token for a user."""
+        ...
+
+    @abstractmethod
+    def verify_password_reset_token(self, raw_token: str) -> Optional[Dict[str, Any]]:
+        """Verify token hash against stored active, unexpired, and unused reset records."""
+        ...
+
+    @abstractmethod
+    def consume_password_reset_token(self, raw_token: str, new_hashed_password: str) -> Optional[str]:
+        """Atomically mark token as consumed and update the user's hashed password."""
+        ...
+
 class UserRepository(abstractUserRepository):
     def __init__(self, db_file: str = "DATABASE.db"):
         self.db_file = db_file
@@ -141,26 +164,52 @@ class UserRepository(abstractUserRepository):
             print(f"Connection error: {e}")
             raise
 
+    def close(self) -> None:
+        """Close SQLite database connection."""
+        if hasattr(self, "conn") and self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        self.close()
+
     def _create_table(self) -> None:
-        """Create the user table and configure concurrent WAL journal mode."""
+        """Create the user and password reset tables and configure concurrent WAL journal mode."""
         if self.db_file != ":memory:":
             self.conn.execute("PRAGMA journal_mode=WAL;")
             self.conn.execute("PRAGMA synchronous=NORMAL;")
 
-        query = """
+        users_query = """
         CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        hashed_password TEXT NOT NULL,
-        is_active INTEGER DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        roles TEXT DEFAULT '[]',
-        metadata TEXT DEFAULT '{}'
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            hashed_password TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            roles TEXT DEFAULT '[]',
+            metadata TEXT DEFAULT '{}'
+        );
+        """
+        reset_tokens_query = """
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            used_at TEXT,
+            ip_address TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
         """
         with self.conn:
-            self.conn.execute(query)
+            self.conn.execute(users_query)
+            self.conn.execute(reset_tokens_query)
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prt_user ON password_reset_tokens(user_id);")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prt_hash ON password_reset_tokens(token_hash);")
 
     
     def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -329,6 +378,106 @@ class UserRepository(abstractUserRepository):
             roles = [r for r in roles if r != clean_role]
             return self.update_user(user_id, {"roles": roles})
         return True
+
+    @staticmethod
+    def _hash_reset_token(raw_token: str) -> str:
+        """Compute SHA-256 digest of a raw reset token."""
+        return hashlib.sha256((raw_token or "").strip().encode("utf-8")).hexdigest()
+
+    def create_password_reset_token(
+        self,
+        user_id: str,
+        ip_address: Optional[str] = None,
+        expires_in_minutes: int = 15,
+    ) -> str:
+        """Issue and record a high-entropy password reset token, invalidating prior tokens for the user."""
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = self._hash_reset_token(raw_token)
+        now = datetime.now(timezone.utc)
+        now_str = now.isoformat()
+        expires_at = (now + timedelta(minutes=expires_in_minutes)).isoformat()
+        token_id = f"prt_{uuid.uuid4().hex[:16]}"
+
+        with self.conn:
+            # Invalidate any previously unused reset tokens for this user
+            self.conn.execute(
+                "UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
+                (now_str, str(user_id)),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO password_reset_tokens (
+                    id, user_id, token_hash, expires_at, created_at, used_at, ip_address
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (token_id, str(user_id), token_hash, expires_at, now_str, ip_address or ""),
+            )
+
+        return raw_token
+
+    def verify_password_reset_token(self, raw_token: str) -> Optional[Dict[str, Any]]:
+        """Verify token hash against stored active, unexpired, and unused reset records."""
+        clean_token = (raw_token or "").strip()
+        if not clean_token:
+            return None
+
+        token_hash = self._hash_reset_token(clean_token)
+        now_utc = datetime.now(timezone.utc)
+
+        cursor = self.conn.cursor()
+        query = """
+            SELECT prt.id, prt.user_id, prt.expires_at, prt.created_at, prt.used_at,
+                   u.username, u.email, u.is_active
+            FROM password_reset_tokens prt
+            JOIN users u ON prt.user_id = u.id
+            WHERE prt.token_hash = ? AND prt.used_at IS NULL
+        """
+        cursor.execute(query, (token_hash,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        record = dict(row)
+        if not record.get("is_active", 1):
+            return None
+
+        expires_at_str = record.get("expires_at")
+        if expires_at_str:
+            try:
+                exp_dt = datetime.fromisoformat(expires_at_str)
+                if now_utc > exp_dt:
+                    return None
+            except Exception:
+                return None
+
+        return record
+
+    def consume_password_reset_token(self, raw_token: str, new_hashed_password: str) -> Optional[str]:
+        """Atomically mark token as consumed and update the user's hashed password."""
+        verified = self.verify_password_reset_token(raw_token)
+        if not verified:
+            return None
+
+        user_id = verified["user_id"]
+        token_id = verified["id"]
+        now_str = datetime.now(timezone.utc).isoformat()
+
+        try:
+            with self.conn:
+                cursor = self.conn.execute(
+                    "UPDATE password_reset_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL",
+                    (now_str, token_id),
+                )
+                if cursor.rowcount == 0:
+                    return None
+
+                self.conn.execute(
+                    "UPDATE users SET hashed_password = ? WHERE id = ?",
+                    (new_hashed_password, str(user_id)),
+                )
+            return str(user_id)
+        except sqlite3.Error:
+            return None
 
 
 concreteUserRepository = UserRepository

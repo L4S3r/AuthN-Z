@@ -175,6 +175,95 @@ class Authenticator(abstractAuthenticator):
         self.mfa_provider = mfa_provider or MFAProvider()
         self.device_trust_service = device_trust_service or DeviceTrustService()
         self._pending_mfa_challenges: Dict[str, Dict[str, Any]] = {}
+        self._in_memory_failed_attempts: Dict[str, int] = {}
+        self._in_memory_lockouts: Dict[str, int] = {}
+
+    def _get_redis(self):
+        """Helper to get active Redis connection if available."""
+        if self.session_store and getattr(self.session_store, "r", None):
+            return self.session_store.r
+        return None
+
+    def _check_account_lockout(self, user_id: str) -> Optional[int]:
+        """Check if account is currently locked. Returns remaining seconds if locked, else None."""
+        r = self._get_redis()
+        lock_key = f"lockout:{user_id}"
+        if r is not None:
+            try:
+                ttl = r.ttl(lock_key)
+                if ttl > 0:
+                    return ttl
+            except Exception:
+                pass
+        
+        lock_exp = self._in_memory_lockouts.get(user_id)
+        if lock_exp:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            if lock_exp > now_ts:
+                return lock_exp - now_ts
+            else:
+                self._in_memory_lockouts.pop(user_id, None)
+        return None
+
+    def _record_failed_attempt(self, user_id: str) -> Dict[str, Any]:
+        """Increment failed attempts for a user; apply exponential lockout if threshold exceeded."""
+        r = self._get_redis()
+        fail_key = f"failed_logins:{user_id}"
+        lock_key = f"lockout:{user_id}"
+        window_seconds = 300  # 5 minute sliding window for counting failures
+
+        attempts = 1
+        if r is not None:
+            try:
+                attempts = r.incr(fail_key)
+                if attempts == 1:
+                    r.expire(fail_key, window_seconds)
+            except Exception:
+                attempts = self._in_memory_failed_attempts.get(user_id, 0) + 1
+                self._in_memory_failed_attempts[user_id] = attempts
+        else:
+            attempts = self._in_memory_failed_attempts.get(user_id, 0) + 1
+            self._in_memory_failed_attempts[user_id] = attempts
+
+        locked = False
+        newly_locked = False
+        lockout_seconds = 0
+        if attempts >= 5:
+            # 5-9 attempts: 15 mins (900s); 10+ attempts: 60 mins (3600s)
+            lockout_seconds = 900 if attempts < 10 else 3600
+            locked = True
+            if attempts == 5 or attempts == 10:
+                newly_locked = True
+            if r is not None:
+                try:
+                    r.set(lock_key, str(attempts), ex=lockout_seconds)
+                except Exception:
+                    pass
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            self._in_memory_lockouts[user_id] = now_ts + lockout_seconds
+
+        return {
+            "locked": locked,
+            "newly_locked": newly_locked,
+            "attempts": attempts,
+            "lockout_seconds": lockout_seconds,
+        }
+
+    def _clear_failed_attempts(self, user_id: str) -> None:
+        """Clear failed login attempts and lockout state upon successful authentication or password reset."""
+        r = self._get_redis()
+        if r is not None:
+            try:
+                r.delete(f"failed_logins:{user_id}", f"lockout:{user_id}")
+            except Exception:
+                pass
+        self._in_memory_failed_attempts.pop(user_id, None)
+        self._in_memory_lockouts.pop(user_id, None)
+
+    def unlock_account(self, user_id: str) -> bool:
+        """Explicitly unlock an account by clearing lockout flags."""
+        self._clear_failed_attempts(user_id)
+        return True
 
     def _get_mfa_challenge(self, challenge_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve challenge data from Redis with fallback to in-memory store."""
@@ -221,7 +310,7 @@ class Authenticator(abstractAuthenticator):
         user_agent: Optional[str] = None,
         ip_address: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Verify primary identity credentials (username/email and password)."""
+        """Verify primary identity credentials (username/email and password) with lockout protection."""
         user = self.user_repo.get_by_identifier(identifier)
 
         # Constant-time side-channel mitigation: verify against dummy hash if user is absent
@@ -239,12 +328,42 @@ class Authenticator(abstractAuthenticator):
                 "reason": "ACCOUNT_INACTIVE",
             }
 
+        # Check if account is currently locked due to prior excessive failed attempts
+        remaining_lock = self._check_account_lockout(user["id"])
+        if remaining_lock is not None and remaining_lock > 0:
+            remaining_mins = max(1, (remaining_lock + 59) // 60)
+            return {
+                "status": "LOCKED",
+                "reason": "ACCOUNT_LOCKED",
+                "user_id": user["id"],
+                "lockout_seconds": remaining_lock,
+                "lockout_minutes": remaining_mins,
+                "newly_locked": False,
+            }
+
         # Verify password
         if not self.hasher.verify(plain_password, user["hashed_password"]):
+            lockout_info = self._record_failed_attempt(user["id"])
+            if lockout_info["locked"]:
+                remaining_mins = max(1, (lockout_info["lockout_seconds"] + 59) // 60)
+                return {
+                    "status": "LOCKED",
+                    "reason": "ACCOUNT_LOCKED",
+                    "user_id": user["id"],
+                    "lockout_seconds": lockout_info["lockout_seconds"],
+                    "lockout_minutes": remaining_mins,
+                    "attempts": lockout_info["attempts"],
+                    "newly_locked": lockout_info["newly_locked"],
+                }
             return {
                 "status": "FAILED",
                 "reason": "INVALID_CREDENTIALS",
+                "attempts": lockout_info["attempts"],
+                "remaining_attempts": max(0, 5 - lockout_info["attempts"]),
             }
+
+        # Password is correct! Clear failed attempts
+        self._clear_failed_attempts(user["id"])
 
         # Check if password needs rehash
         if self.hasher.needs_rehash(user["hashed_password"]):

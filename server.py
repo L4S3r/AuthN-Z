@@ -10,9 +10,12 @@ Run locally or on a server with:
 
 import hashlib
 import json
+import jwt
+import logging
+import os
+import secrets
 from typing import Any, Dict, List, Optional
 import uuid
-import secrets
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +31,9 @@ from authenticator import Authenticator
 from permission_evaluator import PermissionEvaluator
 from audit_logger import AuditLogger
 from device_trust_service import DeviceTrustService
+
+logger = logging.getLogger("auth_nz.server")
+DUMMY_BCRYPT_HASH = "$2b$12$e8YkZ7G4t9I1mPqLwK9ZCe8YkZ7G4t9I1mPqLwK9ZCe8YkZ7G4t9I"
 
 
 # =============================================================================
@@ -232,6 +238,15 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+    new_password: str = Field(..., min_length=8)
+
+
 class OAuthExchangeRequest(BaseModel):
     code: str
     code_verifier: Optional[str] = None
@@ -278,17 +293,96 @@ def check_rate_limit(key: str, max_requests: int, window_seconds: int) -> bool:
     return True
 
 
-def set_trusted_device_cookie(response: Response, request: Request, raw_token: str) -> None:
-    """Set scoped HttpOnly trusted device cookie with path=/auth, samesite=lax, gated by server ENVIRONMENT config."""
+def get_cookie_domain_and_tls(request: Request) -> Tuple[Optional[str], bool]:
+    """Determine domain and TLS configuration based on ENVIRONMENT and request."""
     if ENVIRONMENT == "production":
-        # Production: Strictly enforce HTTPS and cross-subdomain sharing
         is_https = True
         domain = ".l4s3r.site"
     else:
-        # Development / Testing: Request-aware TLS without forced domain
         proto = (request.headers.get("x-forwarded-proto") or "").lower()
         is_https = request.url.scheme == "https" or proto == "https"
         domain = None
+    return domain, is_https
+
+
+def set_auth_cookies(
+    response: Response,
+    request: Request,
+    access_token: str,
+    refresh_token: Optional[str] = None,
+    csrf_token: Optional[str] = None,
+) -> None:
+    """Set secure, scoped httpOnly cookies for access and refresh tokens, plus an anti-CSRF token."""
+    domain, is_https = get_cookie_domain_and_tls(request)
+
+    # 1. Set Access Token Cookie (15 min TTL, path=/)
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        max_age=900,
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+        domain=domain,
+        path="/",
+    )
+
+    # 2. Set Refresh Token Cookie (7 day TTL, scoped to path=/auth)
+    if refresh_token:
+        response.set_cookie(
+            key="refresh_token",
+            value=refresh_token,
+            max_age=7 * 86400,
+            httponly=True,
+            samesite="lax",
+            secure=is_https,
+            domain=domain,
+            path="/auth",
+        )
+
+    # 3. Set Readable Anti-CSRF Token Cookie (httponly=False so JS client can read and pass in X-CSRF-Token header)
+    if not csrf_token:
+        csrf_token = secrets.token_urlsafe(32)
+    response.set_cookie(
+        key="csrf_token",
+        value=csrf_token,
+        max_age=7 * 86400,
+        httponly=False,
+        samesite="lax",
+        secure=is_https,
+        domain=domain,
+        path="/",
+    )
+
+
+def clear_auth_cookies(response: Response, request: Request) -> None:
+    """Clear all authentication and session cookies across all domain and path scopes."""
+    domain, is_https = get_cookie_domain_and_tls(request)
+
+    for key, path in [
+        ("access_token", "/"),
+        ("refresh_token", "/auth"),
+        ("refresh_token", "/"),
+        ("csrf_token", "/"),
+    ]:
+        response.delete_cookie(
+            key=key,
+            domain=domain,
+            path=path,
+            samesite="lax",
+            secure=is_https,
+        )
+        response.delete_cookie(
+            key=key,
+            path=path,
+            samesite="lax",
+            secure=is_https,
+        )
+
+
+def set_trusted_device_cookie(response: Response, request: Request, raw_token: str) -> None:
+    """Set scoped HttpOnly trusted device cookie with path=/auth, samesite=lax, gated by server ENVIRONMENT config."""
+    domain, is_https = get_cookie_domain_and_tls(request)
 
     # Clear legacy unscoped (path=/) cookie from previous deployments to prevent stale duplicates in browser
     response.delete_cookie(
@@ -319,13 +413,7 @@ def set_trusted_device_cookie(response: Response, request: Request, raw_token: s
 
 def clear_trusted_device_cookie(response: Response, request: Request) -> None:
     """Clear trusted device cookie across all domain and path scopes."""
-    if ENVIRONMENT == "production":
-        is_https = True
-        domain = ".l4s3r.site"
-    else:
-        proto = (request.headers.get("x-forwarded-proto") or "").lower()
-        is_https = request.url.scheme == "https" or proto == "https"
-        domain = None
+    domain, is_https = get_cookie_domain_and_tls(request)
 
     # Clear scoped cookie at path="/auth"
     response.delete_cookie(
@@ -362,17 +450,35 @@ def clear_trusted_device_cookie(response: Response, request: Request) -> None:
 # Security Dependency: Current Authenticated User Context
 # =============================================================================
 async def get_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> Dict[str, Any]:
-    """Extract and validate Bearer token from the Authorization header."""
-    if not credentials:
+    """Extract and validate Bearer token from httpOnly cookie or Authorization header."""
+    token: Optional[str] = None
+
+    # 1. Check access_token httpOnly cookie
+    cookie_token = request.cookies.get("access_token")
+    if cookie_token:
+        token = str(cookie_token).strip().strip('"').strip("'")
+
+    # 2. Fallback to Authorization: Bearer header
+    if not token and credentials and credentials.credentials:
+        token = credentials.credentials.strip()
+
+    # 3. Direct Authorization header fallback
+    if not token:
+        auth_hdr = request.headers.get("authorization")
+        if auth_hdr and auth_hdr.lower().startswith("bearer "):
+            token = auth_hdr[7:].strip()
+
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Authorization Bearer token.",
+            detail="Missing Authorization token (access_token cookie or Bearer token required).",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    res = auth.authenticate_token(credentials.credentials)
+    res = auth.authenticate_token(token)
     if res["status"] != "SUCCESS":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -546,56 +652,183 @@ async def login(req: LoginRequest, request: Request, response: Response):
                 res["user"]["name"] = user_name
                 res["user"]["avatar_url"] = user_avatar
 
+        if "access_token" in res:
+            set_auth_cookies(response, request, res["access_token"], res.get("refresh_token"))
+
         return res
     elif res["status"] == "MFA_REQUIRED":
         return res
+    elif res["status"] == "LOCKED":
+        user_id = res.get("user_id")
+        audit_log.record_security_event(
+            event_name="ACCOUNT_LOCKOUT",
+            severity="CRITICAL",
+            details={
+                "identifier": req.identifier,
+                "user_id": user_id,
+                "lockout_seconds": res.get("lockout_seconds"),
+                "ip_address": client_ip,
+            },
+        )
+        if user_id and res.get("newly_locked"):
+            user = repo.get_by_id(user_id)
+            if user:
+                try:
+                    email_svc.send_security_alert_email(
+                        recipient_email=user["email"],
+                        recipient_name=user.get("username", "User"),
+                        event_name="Account Temporarily Locked",
+                        severity="CRITICAL",
+                        details={
+                            "reason": f"Account temporarily locked due to {res.get('attempts', 5)} consecutive failed login attempts.",
+                            "lockout_duration": f"{res.get('lockout_minutes', 15)} minutes",
+                            "ip_address": client_ip,
+                        },
+                        ip_address=client_ip,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to dispatch account lockout email: %s", exc)
+
+        lockout_mins = res.get("lockout_minutes", 15)
+        raise HTTPException(
+            status_code=status.HTTP_423_LOCKED,
+            detail=f"Account is temporarily locked due to excessive failed login attempts. Please try again in {lockout_mins} minute(s) or reset your password.",
+            headers={"Retry-After": str(res.get("lockout_seconds", 900))},
+        )
     else:
         audit_log.record_auth_failure(
             identifier=req.identifier,
             reason=res.get("reason", "INVALID_CREDENTIALS"),
             ip_address=client_ip,
         )
+        remaining = res.get("remaining_attempts")
+        detail = "Invalid credentials provided."
+        if remaining is not None and remaining <= 3 and remaining > 0:
+            detail = f"Invalid credentials provided. Warning: {remaining} attempt(s) remaining before temporary account lockout."
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials provided.",
+            detail=detail,
         )
 
 
 @app.post("/auth/refresh", tags=["Authentication"])
-async def refresh_tokens(req: RefreshRequest, request: Request):
+async def refresh_tokens(
+    request: Request,
+    response: Response,
+    req: Optional[RefreshRequest] = None,
+):
     """Exchange a valid refresh token for a new access token and rotated refresh token."""
     client_ip = request.client.host if request.client else "unknown"
-    try:
-        payload = token_svc.decode_and_verify(req.refresh_token)
-    except ValueError as e:
-        audit_log.record_auth_failure(
-            identifier="refresh_token",
-            reason=f"INVALID_REFRESH_TOKEN: {str(e)}",
-            ip_address=client_ip,
+
+    # Extract refresh token from cookie or request body
+    raw_token = request.cookies.get("refresh_token")
+    if not raw_token and req and req.refresh_token:
+        raw_token = req.refresh_token
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing refresh token (refresh_token cookie or payload required).",
         )
+
+    clean_token = str(raw_token).strip().strip('"').strip("'")
+    try:
+        payload = jwt.decode(
+            clean_token,
+            token_svc.secret_key,
+            algorithms=[token_svc.algorithm],
+            options={"require": ["sub", "exp", "iat", "jti"]},
+        )
+    except jwt.ExpiredSignatureError:
+        clear_auth_cookies(response, request)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has expired.",
+        )
+    except jwt.InvalidTokenError as e:
+        clear_auth_cookies(response, request)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid refresh token: {str(e)}",
         )
 
     if payload.get("type") != "refresh":
+        clear_auth_cookies(response, request)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Provided token is not a refresh token.",
         )
 
     user_id = payload.get("sub")
+    jti = payload.get("jti")
+    family_id = payload.get("family_id")
+
+    # 1. Check if token family is already revoked
+    if family_id and token_svc.is_family_revoked(family_id):
+        clear_auth_cookies(response, request)
+        audit_log.record_security_event(
+            event_name="REVOKED_TOKEN_FAMILY_ATTEMPT",
+            severity="CRITICAL",
+            details={"user_id": user_id, "family_id": family_id, "ip_address": client_ip},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token family revoked due to previous security violation.",
+        )
+
+    # 2. Check if this specific JTI was already revoked -> TOKEN REUSE DETECTED!
+    if jti and token_svc.is_token_revoked(jti):
+        # Invalidate entire token family immediately
+        if family_id:
+            token_svc.revoke_family(family_id)
+        if user_id:
+            sess_store.delete_all_user_sessions(user_id)
+
+        clear_auth_cookies(response, request)
+        audit_log.record_security_event(
+            event_name="REFRESH_TOKEN_REUSE_DETECTED",
+            severity="CRITICAL",
+            details={
+                "user_id": user_id,
+                "jti": jti,
+                "family_id": family_id,
+                "ip_address": client_ip,
+            },
+        )
+
+        user = repo.get_by_id(user_id) if user_id else None
+        if user:
+            try:
+                email_svc.send_security_alert_email(
+                    recipient_email=user["email"],
+                    recipient_name=user.get("username", "User"),
+                    event_name="Suspicious Authentication Activity Detected",
+                    severity="CRITICAL",
+                    details={
+                        "reason": "An attempt was made to reuse an already-rotated refresh token. All active sessions in this family were revoked for your security.",
+                        "ip_address": client_ip,
+                    },
+                    ip_address=client_ip,
+                )
+            except Exception as exc:
+                logger.warning("Failed to dispatch token reuse alert email: %s", exc)
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Security violation: Refresh token reuse detected. All tokens in this family have been revoked.",
+        )
+
     user = repo.get_by_id(user_id)
     if not user or not user.get("is_active", 1):
+        clear_auth_cookies(response, request)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User account is inactive or no longer exists.",
         )
 
-    # Invalidate the old refresh token (Token Rotation)
-    old_jti = payload.get("jti")
-    if old_jti:
-        token_svc.revoke_token(old_jti, expires_at=int(payload.get("exp", 0)))
+    # 3. Rotate token: Invalidate the old refresh token JTI
+    if jti:
+        token_svc.revoke_token(jti, expires_at=int(payload.get("exp", 0)))
 
     roles = user.get("roles", [])
     if isinstance(roles, str):
@@ -604,13 +837,17 @@ async def refresh_tokens(req: RefreshRequest, request: Request):
         except Exception:
             roles = []
 
+    # 4. Mint new access token and rotated refresh token bound to the SAME family_id
     new_access_token = token_svc.create_access_token(user_id, claims={"roles": roles})
-    new_refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles})
+    new_refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles}, family_id=family_id)
+
+    # Set updated httpOnly cookies
+    set_auth_cookies(response, request, new_access_token, new_refresh_token)
 
     audit_log.record_security_event(
         event_name="TOKEN_REFRESHED",
         severity="INFO",
-        details={"user_id": user_id, "ip_address": client_ip},
+        details={"user_id": user_id, "family_id": family_id, "ip_address": client_ip},
     )
 
     return {
@@ -623,12 +860,12 @@ async def refresh_tokens(req: RefreshRequest, request: Request):
 
 @app.post("/auth/logout", tags=["Authentication"])
 async def logout(
+    request: Request,
+    response: Response,
     req: LogoutRequest = LogoutRequest(),
-    request: Request = None,
-    response: Response = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Invalidate caller's JWT access token and active session (single-device or all devices)."""
+    """Invalidate caller's JWT access token, clear httpOnly cookies, and delete active session."""
     user_id = current_user["user_id"]
     claims = current_user.get("claims", {})
     client_ip = request.client.host if request and request.client else "unknown"
@@ -638,13 +875,15 @@ async def logout(
     if jti:
         token_svc.revoke_token(jti, expires_at=int(claims.get("exp", 0)))
 
+    # Clear auth cookies (access_token, refresh_token, csrf_token)
+    clear_auth_cookies(response, request)
+
     # Invalidate session in Redis
     sessions_deleted = 0
     if req.logout_all_devices:
         sessions_deleted = sess_store.delete_all_user_sessions(user_id)
         device_trust_svc.revoke_all_trusted_devices(user_id)
-        if response and request:
-            clear_trusted_device_cookie(response, request)
+        clear_trusted_device_cookie(response, request)
     elif req.session_id:
         sess_store.delete_session(req.session_id)
         sessions_deleted = 1
@@ -670,6 +909,157 @@ async def logout(
     }
 
 
+@app.post("/auth/forgot-password", tags=["Authentication"])
+async def forgot_password(req: ForgotPasswordRequest, request: Request):
+    """Initiate self-service password reset flow with constant-time response and rate limiting."""
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "")
+    clean_email = req.email.strip().lower()
+
+    # Rate limiting: max 5 forgot-password requests/min per IP, max 3/min per target email
+    if not check_rate_limit(f"forgot_pw_ip:{client_ip}", max_requests=5, window_seconds=60) or \
+       not check_rate_limit(f"forgot_pw_email:{clean_email}", max_requests=3, window_seconds=60):
+        audit_log.record_security_event(
+            event_name="FORGOT_PASSWORD_RATE_LIMITED",
+            severity="WARNING",
+            details={"email": clean_email, "ip_address": client_ip},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many password reset requests. Please wait a few moments before trying again.",
+        )
+
+    user = repo.get_by_identifier(clean_email)
+    if user and user.get("is_active", 1):
+        raw_token = repo.create_password_reset_token(
+            user_id=user["id"],
+            ip_address=client_ip,
+            expires_in_minutes=15,
+        )
+        try:
+            email_svc.send_password_reset_email(
+                recipient_email=user["email"],
+                recipient_name=user.get("username"),
+                reset_token=raw_token,
+                expires_in_minutes=15,
+                ip_address=client_ip,
+                user_agent=user_agent,
+            )
+        except Exception as exc:
+            logger.warning("Failed to dispatch password reset email: %s", exc)
+
+        audit_log.record_security_event(
+            event_name="PASSWORD_RESET_REQUESTED",
+            severity="INFO",
+            details={"user_id": user["id"], "email": clean_email, "ip_address": client_ip},
+        )
+    else:
+        # Dummy verification to prevent timing side-channel user enumeration
+        hasher.verify("dummy_password_timing_pad", DUMMY_BCRYPT_HASH)
+
+    return {
+        "status": "SUCCESS",
+        "message": "If an account matching that email address exists, password reset instructions have been sent.",
+    }
+
+
+@app.get("/auth/verify-reset-token", tags=["Authentication"])
+async def verify_reset_token(token: str):
+    """Verify if a password reset token is valid, active, and unexpired."""
+    record = repo.verify_password_reset_token(token)
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password reset link is invalid, expired, or has already been used.",
+        )
+
+    raw_email = record.get("email", "")
+    parts = raw_email.split("@")
+    if len(parts) == 2:
+        masked_user = parts[0][:2] + "***" if len(parts[0]) > 2 else "***"
+        masked_email = f"{masked_user}@{parts[1]}"
+    else:
+        masked_email = "***"
+
+    return {
+        "status": "SUCCESS",
+        "valid": True,
+        "username": record.get("username", ""),
+        "masked_email": masked_email,
+    }
+
+
+@app.post("/auth/reset-password", tags=["Authentication"])
+async def reset_password(req: ResetPasswordRequest, request: Request, response: Response):
+    """Consume a valid password reset token and update account password with session invalidation."""
+    client_ip = request.client.host if request.client else "unknown"
+
+    if not check_rate_limit(f"reset_pw_ip:{client_ip}", max_requests=10, window_seconds=60):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many password reset attempts. Please wait before retrying.",
+        )
+
+    # Complexity validation
+    if len(req.new_password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters long.",
+        )
+
+    # Verify token before hashing
+    token_record = repo.verify_password_reset_token(req.token)
+    if not token_record:
+        audit_log.record_security_event(
+            event_name="PASSWORD_RESET_FAILED",
+            severity="WARNING",
+            details={"reason": "INVALID_OR_EXPIRED_TOKEN", "ip_address": client_ip},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password reset link is invalid, expired, or has already been used.",
+        )
+
+    user_id = token_record["user_id"]
+    new_hashed_password = hasher.hash(req.new_password)
+
+    consumed_user_id = repo.consume_password_reset_token(req.token, new_hashed_password)
+    if not consumed_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to apply password reset. The token may have already been consumed.",
+        )
+
+    # Security posture: Invalidate all existing active sessions, trusted devices, and clear lockout for this user
+    sess_store.delete_all_user_sessions(user_id)
+    device_trust_svc.revoke_all_trusted_devices(user_id)
+    auth.unlock_account(user_id)
+    clear_trusted_device_cookie(response, request)
+    clear_auth_cookies(response, request)
+
+    # Send security notification email
+    try:
+        email_svc.send_security_alert_email(
+            recipient_email=token_record["email"],
+            recipient_name=token_record.get("username"),
+            event_name="Password Successfully Reset",
+            severity="HIGH",
+            details={"ip_address": client_ip, "action": "Password changed via reset token"},
+            ip_address=client_ip,
+        )
+    except Exception as exc:
+        logger.warning("Failed to send password reset confirmation alert email: %s", exc)
+
+    audit_log.record_security_event(
+        event_name="PASSWORD_RESET_SUCCESS",
+        severity="INFO",
+        details={"user_id": user_id, "ip_address": client_ip},
+    )
+
+    return {
+        "status": "SUCCESS",
+        "message": "Your password has been successfully reset. Please sign in with your new credentials.",
+    }
 
 
 @app.post("/auth/mfa/setup", tags=["MFA Enrollment"])
@@ -832,6 +1222,9 @@ async def complete_mfa(req: MFACompleteRequest, request: Request, response: Resp
             if "user" in res and isinstance(res["user"], dict):
                 res["user"]["name"] = res["name"]
                 res["user"]["avatar_url"] = res["avatar_url"]
+
+        if "access_token" in res:
+            set_auth_cookies(response, request, res["access_token"], res.get("refresh_token"))
 
         return res
     else:
@@ -1270,6 +1663,9 @@ def resolve_or_create_oauth_user(
             "created_at": trusted_dev.get("created_at"),
             "expires_at": trusted_dev.get("expires_at"),
         }
+
+    if response and request and access_token:
+        set_auth_cookies(response, request, access_token, refresh_token)
 
     return resp
 
@@ -1742,6 +2138,7 @@ async def verify_team_invitation(token: str):
 async def accept_team_invitation(
     req: TeamAcceptInviteRequest,
     request: Request,
+    response: Response,
 ):
     """Accept an invitation, register credentials, activate workspace clearance, and log in."""
     invite = task_repo.get_invitation_by_token(req.token)
@@ -1823,6 +2220,9 @@ async def accept_team_invitation(
     access_token = token_svc.create_access_token(user_id, claims={"roles": roles})
     refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles})
     session_id = sess_store.create_session(user_id, session_data={"roles": roles})
+
+    # Set httpOnly cookies on response
+    set_auth_cookies(response, request, access_token, refresh_token)
 
     safe_meta = user.get("metadata", {})
     if isinstance(safe_meta, str):
@@ -2358,6 +2758,9 @@ async def accept_workspace_invitation(
     refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles, "workspace_id": workspace_id})
     session_id = sess_store.create_session(user_id, session_data={"roles": roles, "workspace_id": workspace_id})
 
+    # Set httpOnly cookies on response
+    set_auth_cookies(response, request, access_token, refresh_token)
+
     safe_meta = user.get("metadata", {})
     if isinstance(safe_meta, str):
         try:
@@ -2401,6 +2804,8 @@ async def accept_workspace_invitation(
 @app.post("/auth/workspaces/switch", tags=["Workspaces", "Authentication"])
 async def switch_active_workspace(
     req: WorkspaceSwitchRequest,
+    request: Request,
+    response: Response,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Switch the authenticated user's active tenant workspace context, returning refreshed scoped JWT tokens."""
@@ -2432,6 +2837,9 @@ async def switch_active_workspace(
     access_token = token_svc.create_access_token(user_id, claims={"roles": roles, "workspace_id": target_ws_id})
     refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles, "workspace_id": target_ws_id})
     session_id = sess_store.create_session(user_id, session_data={"roles": roles, "workspace_id": target_ws_id})
+
+    # Set rotated httpOnly cookies for the new workspace scope
+    set_auth_cookies(response, request, access_token, refresh_token)
 
     audit_log.record_security_event(
         event_name="WORKSPACE_SWITCHED",

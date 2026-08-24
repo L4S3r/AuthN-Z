@@ -60,43 +60,27 @@ class abstractTokenService(ABC):
         subject_id: str,
         claims: Optional[Dict[str, Any]] = None,
         lifetime_seconds: int = 604800,
+        family_id: Optional[str] = None,
     ) -> str:
         """
-        Mint a long-lived refresh token used to obtain new access tokens without requiring re-authentication.
-
-        Args:
-            subject_id: Unique identifier of the authenticated user or entity.
-            claims: Optional dictionary of metadata associated with the refresh token (e.g., token family ID, device ID).
-            lifetime_seconds: Token validity duration in seconds (default is 7 days / 604,800 seconds).
-
-        Returns:
-            A cryptographically secure refresh token string or signed token.
-
-        Edge Cases to Consider:
-            - Implementing token family tracking for refresh token rotation detection.
-            - Storage requirements if refresh tokens are stateful/opaque vs. self-contained signed tokens.
+        Mint a long-lived refresh token associated with a token family for rotation and reuse detection.
         """
+        ...
+
+    @abstractmethod
+    def revoke_family(self, family_id: str, lifetime_seconds: int = 604800) -> bool:
+        """Revoke an entire token family upon token reuse / theft detection."""
+        ...
+
+    @abstractmethod
+    def is_family_revoked(self, family_id: str) -> bool:
+        """Check if a token family has been revoked."""
         ...
 
     @abstractmethod
     def decode_and_verify(self, token: str) -> Dict[str, Any]:
         """
         Validate token signature, expiration, issuer, and return the decoded payload/claims dictionary.
-
-        Args:
-            token: The raw token string provided in authorization headers (e.g., 'Bearer <token>').
-
-        Returns:
-            A dictionary of verified claims extracted from the token payload.
-
-        Raises:
-            Exception (or custom TokenError): If the token is malformed, has an invalid signature,
-                                              is expired, or has not yet reached its valid time ('nbf').
-
-        Edge Cases to Consider:
-            - Expired tokens (verifying clock skew/drift tolerances).
-            - Algorithm confusion attacks (e.g., 'none' algorithm or RSA public key used as HMAC secret).
-            - Truncated, tampered, or garbage token strings.
         """
         ...
 
@@ -169,6 +153,7 @@ class TokenService(abstractTokenService):
                 "Install with `python -m pip install redis` to enable shared Redis persistence."
             )
         self._in_memory_blocklist: Set[str] = set()
+        self._in_memory_revoked_families: Set[str] = set()
 
 
     def _get_or_generate_secret_key(self, key_name: str = "JWT_SECRET_KEY") -> str:
@@ -213,15 +198,18 @@ class TokenService(abstractTokenService):
         subject_id: str,
         claims: Optional[Dict[str, Any]] = None,
         lifetime_seconds: int = 604800,
+        family_id: Optional[str] = None,
     ) -> str:
-        """Mint a long-lived refresh token."""
+        """Mint a long-lived refresh token associated with a token family."""
         now = datetime.now(timezone.utc)
         exp = now + timedelta(seconds=lifetime_seconds)
+        fid = family_id or str(uuid.uuid4())
         payload = {
             "sub": str(subject_id),
             "iat": now,
             "exp": exp,
             "jti": str(uuid.uuid4()),
+            "family_id": fid,
             "type": "refresh",
         }
 
@@ -232,7 +220,7 @@ class TokenService(abstractTokenService):
         return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
 
     def decode_and_verify(self, token: str) -> Dict[str, Any]:
-        """Validate token signature, expiration, issuer, and return decoded payload/claims dictionary."""
+        """Validate token signature, expiration, issuer, family, and return decoded payload/claims dictionary."""
         try:
             payload = jwt.decode(
                 token,
@@ -242,6 +230,11 @@ class TokenService(abstractTokenService):
             )
             if self.is_token_revoked(payload["jti"]):
                 raise ValueError("Token has been revoked")
+            
+            fid = payload.get("family_id")
+            if fid and self.is_family_revoked(fid):
+                raise ValueError("Token family has been revoked due to security violation")
+
             return payload
         except jwt.ExpiredSignatureError:
             raise ValueError("Token has expired")
@@ -249,7 +242,7 @@ class TokenService(abstractTokenService):
             raise ValueError(f"Invalid token: {e}")
 
     def revoke_token(self, token_identifier: str, expires_at: Optional[int] = None) -> bool:
-        """Add a token's jti to the Redis revocation blocklist with matching TTL."""
+        """Add a token jti to the Redis revocation blocklist with matching TTL."""
         ttl = 604800  # Default 7 days fallback
         if expires_at is not None:
             now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -270,7 +263,7 @@ class TokenService(abstractTokenService):
         return True
 
     def is_token_revoked(self, token_identifier: str) -> bool:
-        """Check if a token's jti is in the Redis or fallback revocation blocklist."""
+        """Check if a token jti is in the Redis or fallback revocation blocklist."""
         if self.r is not None:
             try:
                 key = f"revoked_token:{token_identifier}"
@@ -281,6 +274,34 @@ class TokenService(abstractTokenService):
                     exc,
                 )
         return token_identifier in self._in_memory_blocklist
+
+    def revoke_family(self, family_id: str, lifetime_seconds: int = 604800) -> bool:
+        """Revoke an entire token family upon token reuse / theft detection."""
+        if self.r is not None:
+            try:
+                key = f"revoked_family:{family_id}"
+                self.r.set(key, "1", ex=lifetime_seconds)
+                return True
+            except Exception as exc:
+                logger.error(
+                    "Failed to record family revocation in Redis (%s). Falling back to memory.",
+                    exc,
+                )
+        self._in_memory_revoked_families.add(family_id)
+        return True
+
+    def is_family_revoked(self, family_id: str) -> bool:
+        """Check if a token family has been revoked."""
+        if self.r is not None:
+            try:
+                key = f"revoked_family:{family_id}"
+                return bool(self.r.exists(key))
+            except Exception as exc:
+                logger.error(
+                    "Failed to query family revocation in Redis (%s). Falling back to memory.",
+                    exc,
+                )
+        return family_id in self._in_memory_revoked_families
 
 
 

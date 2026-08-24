@@ -568,3 +568,111 @@ https://l4s3r.site
 </html>
 """
         return self._dispatch_mime_email(clean_recipient, subject, text_content, html_content)
+
+    def send_password_reset_email(
+        self,
+        recipient_email: str,
+        recipient_name: Optional[str] = None,
+        reset_token: str = "",
+        expires_in_minutes: int = 15,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Dispatch a secure, time-bounded password reset link email."""
+        clean_recipient = (recipient_email or "").strip()
+        safe_name = (recipient_name or clean_recipient.split("@")[0] or "User").strip()
+        safe_ip = (ip_address or "Unknown IP").strip()
+        reset_url = f"{self.frontend_url}/reset-password?token={reset_token}"
+
+        subject = "Reset Your Password - Auth N&Z Security"
+
+        text_content = f"""Hello {safe_name},
+
+We received a request to reset the password for your Auth N&Z account.
+
+To choose a new password, click the link below or copy and paste it into your browser:
+{reset_url}
+
+Security Information:
+- Requested from IP: {safe_ip}
+- Expiration: This password reset link is valid for {expires_in_minutes} minutes only.
+- Single-Use: Once used or expired, this link becomes permanently invalid.
+
+If you did NOT request a password reset, please ignore this email. Your password will remain unchanged and your account is secure.
+
+---
+Auth N&Z Security Operations
+https://l4s3r.site
+"""
+
+        escaped_subject = html.escape(subject)
+        escaped_name = html.escape(safe_name)
+        escaped_ip = html.escape(safe_ip)
+        escaped_url = html.escape(reset_url)
+        escaped_mins = str(expires_in_minutes)
+
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{escaped_subject}</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f8fafc; margin: 0; padding: 30px 15px; color: #0f172a;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+      <td align="center">
+        <table width="560" border="0" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
+          <tr>
+            <td style="padding: 28px 32px 20px; background-color: #0f172a; text-align: left;">
+              <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: #38bdf8; margin-bottom: 4px;">Auth N&Z Identity Security</div>
+              <h1 style="color: #ffffff; font-size: 18px; font-weight: 700; margin: 0;">Password Reset Request</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 32px;">
+              <h2 style="font-size: 17px; font-weight: 700; color: #0f172a; margin: 0 0 12px;">Hello {escaped_name},</h2>
+              <p style="font-size: 14px; line-height: 1.6; color: #334155; margin: 0 0 20px;">
+                We received a request to reset the password associated with your account (requested from IP: <code>{escaped_ip}</code>). Click the button below to choose a new password:
+              </p>
+              <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td align="center" style="padding: 8px 0 24px;">
+                    <a href="{escaped_url}" style="background-color: #2563eb; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 10px; font-size: 14px; font-weight: 600; display: inline-block; box-shadow: 0 2px 6px rgba(37,99,235,0.3);">
+                      Reset Password &rarr;
+                    </a>
+                  </td>
+                </tr>
+              </table>
+              <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f1f5f9; border-radius: 10px; margin-bottom: 20px;">
+                <tr>
+                  <td style="padding: 14px 16px;">
+                    <div style="font-size: 12px; color: #475569; line-height: 1.5;">
+                      <strong>Security Note:</strong> This reset link expires in <strong>{escaped_mins} minutes</strong> and can only be used once.
+                    </div>
+                  </td>
+                </tr>
+              </table>
+              <p style="font-size: 12px; line-height: 1.5; color: #64748b; margin: 0 0 12px;">
+                Or copy and paste this link into your browser:<br>
+                <a href="{escaped_url}" style="color: #2563eb; word-break: break-all;">{escaped_url}</a>
+              </p>
+              <p style="font-size: 12px; line-height: 1.5; color: #94a3b8; margin: 0;">
+                If you did not make this request, you can safely ignore this email. Your current password will remain unchanged.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 16px 32px; background-color: #f8fafc; border-top: 1px solid #e2e8f0; font-size: 11px; color: #94a3b8; text-align: center;">
+              Auth N&Z Automated Identity & Access Management.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+        res = self._dispatch_mime_email(clean_recipient, subject, text_content, html_content)
+        res["reset_url"] = reset_url
+        return res
