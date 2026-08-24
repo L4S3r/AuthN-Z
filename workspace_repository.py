@@ -523,12 +523,10 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         """Delete a workspace and cascade delete its members and tasks."""
         if not workspace_id:
             return False
-        try:
-            wid = uuid.UUID(str(workspace_id).strip())
-        except (ValueError, AttributeError):
-            return False
-
         async with self.session_factory() as session:
+            wid = await self._resolve_ws_uuid(session, workspace_id)
+            if not wid:
+                return False
             stmt = delete(Workspace).where(Workspace.id == wid)
             result = await session.execute(stmt)
             await session.commit()
