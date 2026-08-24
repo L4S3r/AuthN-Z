@@ -1,24 +1,31 @@
 """
-Component Role: Security Audit Logger (audit_logger.py)
-------------------------------------------------------
+Component Role: Security Audit Logger (PostgreSQL Async)
+--------------------------------------------------------
 Provides structured, tamper-evident recording of security-critical identity,
-authentication, authorization, and multi-tenant workspace events.
+authentication, authorization, and multi-tenant workspace events using async SQLAlchemy (asyncpg).
 """
 
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
-from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import json
-import sqlite3
+import logging
+from typing import Any, Dict, List, Optional
 import uuid
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from database import get_session_factory
+from models import AuditLog, Workspace
+
+logger = logging.getLogger("auth_nz.audit_logger")
 
 
 class abstractAuditLogger(ABC):
     """Abstract interface defining structured audit event logging, security telemetry, and historical querying."""
 
     @abstractmethod
-    def record_auth_success(
+    async def record_auth_success(
         self,
         subject_id: str,
         method: str,
@@ -31,7 +38,7 @@ class abstractAuditLogger(ABC):
         pass
 
     @abstractmethod
-    def record_auth_failure(
+    async def record_auth_failure(
         self,
         identifier: str,
         reason: str,
@@ -44,7 +51,7 @@ class abstractAuditLogger(ABC):
         pass
 
     @abstractmethod
-    def record_access_denial(
+    async def record_access_denial(
         self,
         subject_id: str,
         action: str,
@@ -57,7 +64,7 @@ class abstractAuditLogger(ABC):
         pass
 
     @abstractmethod
-    def record_security_event(
+    async def record_security_event(
         self,
         event_name: str,
         severity: str,
@@ -68,66 +75,75 @@ class abstractAuditLogger(ABC):
         pass
 
     @abstractmethod
-    def query_events(
+    async def query_events(
         self,
         filter_criteria: Dict[str, Any],
         limit: int = 100,
         offset: int = 0,
+        include_global: bool = False,
     ) -> List[Dict[str, Any]]:
         """Retrieve historical audit log records matching specific filtering criteria."""
         pass
 
 
 class AuditLogger(abstractAuditLogger):
-    def __init__(self, db_file: str = "DATABASE.db"):
-        self.db_file = db_file
-        self._create_table()
+    """PostgreSQL Async implementation of Security Audit Logger."""
 
-    @contextmanager
-    def _get_connection(self):
-        conn = sqlite3.connect(self.db_file, timeout=10.0)
-        conn.row_factory = sqlite3.Row
+    def __init__(
+        self,
+        db_url: Optional[str] = None,
+        session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    ):
+        self.session_factory = session_factory or get_session_factory(db_url)
+
+    async def _resolve_workspace_uuid(
+        self, session: AsyncSession, ws_input: Optional[str]
+    ) -> Optional[uuid.UUID]:
+        """Resolve workspace input string/UUID to a valid workspace UUID, or None."""
+        if not ws_input:
+            return None
+        clean = str(ws_input).strip()
         try:
-            yield conn
-        finally:
-            conn.close()
+            parsed_uid = uuid.UUID(clean)
+            check = await session.execute(
+                select(Workspace.id).where(Workspace.id == parsed_uid)
+            )
+            if check.scalar_one_or_none():
+                return parsed_uid
+        except (ValueError, AttributeError):
+            pass
 
-    def _create_table(self) -> None:
-        """Create audit_logs table, configure WAL mode, and ensure workspace_id column exists."""
-        with self._get_connection() as conn:
-            if self.db_file != ":memory:":
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.executescript("""
-            CREATE TABLE IF NOT EXISTS audit_logs (
-                id TEXT PRIMARY KEY,
-                workspace_id TEXT,
-                event_type TEXT NOT NULL,
-                severity TEXT DEFAULT 'INFO',
-                subject_id TEXT,
-                action TEXT,
-                resource TEXT,
-                reason TEXT,
-                ip_address TEXT,
-                user_agent TEXT,
-                metadata TEXT DEFAULT '{}',
-                timestamp TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_logs(subject_id);
-            CREATE INDEX IF NOT EXISTS idx_audit_event ON audit_logs(event_type);
-            CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
-            """)
+        # Lookup by slug
+        slug_check = await session.execute(
+            select(Workspace.id).where(func.lower(Workspace.slug) == clean.lower())
+        )
+        return slug_check.scalar_one_or_none()
 
-            # Schema migration check: ensure workspace_id column exists in pre-existing DBs
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(audit_logs)")
-            cols = [c["name"] for c in cursor.fetchall()]
-            if "workspace_id" not in cols:
-                cursor.execute("ALTER TABLE audit_logs ADD COLUMN workspace_id TEXT")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_workspace ON audit_logs(workspace_id)")
-            conn.commit()
+    @staticmethod
+    def _format_log(log: AuditLog) -> Dict[str, Any]:
+        """Format SQLAlchemy AuditLog instance into dictionary matching previous repository shape."""
+        meta = log.metadata_ if isinstance(log.metadata_, dict) else {}
+        ts_str = (
+            log.timestamp.isoformat()
+            if isinstance(log.timestamp, datetime)
+            else str(log.timestamp)
+        )
+        return {
+            "id": str(log.id),
+            "workspace_id": str(log.workspace_id) if log.workspace_id else None,
+            "event_type": log.event_type,
+            "severity": log.severity,
+            "subject_id": log.subject_id,
+            "action": log.action,
+            "resource": log.resource,
+            "reason": log.reason,
+            "ip_address": log.ip_address,
+            "user_agent": log.user_agent,
+            "metadata": meta,
+            "timestamp": ts_str,
+        }
 
-    def _insert_event(
+    async def _insert_event(
         self,
         event_type: str,
         severity: str,
@@ -140,36 +156,31 @@ class AuditLogger(abstractAuditLogger):
         metadata: Optional[Dict[str, Any]] = None,
         workspace_id: Optional[str] = None,
     ) -> None:
-        """Helper to insert a structured audit record."""
+        """Insert a structured audit record into PostgreSQL."""
         meta = dict(metadata or {})
-        ws_id = workspace_id or meta.get("workspace_id")
-        meta_json = json.dumps(meta)
+        ws_raw = workspace_id or meta.get("workspace_id")
 
-        with self._get_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO audit_logs (
-                    id, workspace_id, event_type, severity, subject_id, action, resource, reason,
-                    ip_address, user_agent, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    ws_id,
-                    event_type,
-                    severity,
-                    subject_id,
-                    action,
-                    resource,
-                    reason,
-                    ip_address,
-                    user_agent,
-                    meta_json,
-                ),
+        async with self.session_factory() as session:
+            ws_uid = await self._resolve_workspace_uuid(session, ws_raw)
+
+            log_entry = AuditLog(
+                id=uuid.uuid4(),
+                workspace_id=ws_uid,
+                event_type=event_type,
+                severity=severity,
+                subject_id=subject_id,
+                action=action,
+                resource=resource,
+                reason=reason,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                metadata_=meta,
+                timestamp=datetime.now(timezone.utc),
             )
-            conn.commit()
+            session.add(log_entry)
+            await session.commit()
 
-    def record_auth_success(
+    async def record_auth_success(
         self,
         subject_id: str,
         method: str,
@@ -181,7 +192,7 @@ class AuditLogger(abstractAuditLogger):
         """Record a successful authentication event."""
         extra_meta = dict(metadata or {})
         extra_meta["auth_method"] = method
-        self._insert_event(
+        await self._insert_event(
             event_type="AUTH_SUCCESS",
             severity="INFO",
             subject_id=subject_id,
@@ -193,7 +204,7 @@ class AuditLogger(abstractAuditLogger):
             workspace_id=workspace_id,
         )
 
-    def record_auth_failure(
+    async def record_auth_failure(
         self,
         identifier: str,
         reason: str,
@@ -203,7 +214,7 @@ class AuditLogger(abstractAuditLogger):
         workspace_id: Optional[str] = None,
     ) -> None:
         """Record a failed authentication attempt."""
-        self._insert_event(
+        await self._insert_event(
             event_type="AUTH_FAILED",
             severity="WARNING",
             subject_id=identifier,
@@ -216,7 +227,7 @@ class AuditLogger(abstractAuditLogger):
             workspace_id=workspace_id,
         )
 
-    def record_access_denial(
+    async def record_access_denial(
         self,
         subject_id: str,
         action: str,
@@ -226,7 +237,7 @@ class AuditLogger(abstractAuditLogger):
         workspace_id: Optional[str] = None,
     ) -> None:
         """Record an authorization denial (403 Forbidden event)."""
-        self._insert_event(
+        await self._insert_event(
             event_type="ACCESS_DENIAL",
             severity="WARNING",
             subject_id=subject_id,
@@ -237,7 +248,7 @@ class AuditLogger(abstractAuditLogger):
             workspace_id=workspace_id,
         )
 
-    def record_security_event(
+    async def record_security_event(
         self,
         event_name: str,
         severity: str,
@@ -246,7 +257,7 @@ class AuditLogger(abstractAuditLogger):
     ) -> None:
         """Record general security events (e.g., account lockouts, privilege changes, password changes)."""
         ws_id = workspace_id or details.get("workspace_id")
-        self._insert_event(
+        await self._insert_event(
             event_type=event_name,
             severity=severity.upper(),
             subject_id=details.get("user_id") or details.get("subject_id"),
@@ -259,63 +270,69 @@ class AuditLogger(abstractAuditLogger):
             workspace_id=ws_id,
         )
 
-    def query_events(
+    async def query_events(
         self,
-        filter_criteria: Dict[str, Any],
+        filter_criteria: Optional[Dict[str, Any]] = None,
         limit: int = 100,
         offset: int = 0,
         include_global: bool = False,
     ) -> List[Dict[str, Any]]:
         """Retrieve historical audit log records matching specific filtering criteria."""
-        allowed_columns = {
-            "workspace_id",
-            "event_type",
-            "severity",
-            "subject_id",
-            "action",
-            "resource",
-            "reason",
-            "ip_address",
-        }
-        query = "SELECT * FROM audit_logs"
-        conditions = []
-        params = []
+        criteria = dict(filter_criteria or {})
+        inc_global = include_global or criteria.pop("include_global", False)
 
-        inc_global = include_global or (filter_criteria and filter_criteria.get("include_global", False))
+        async with self.session_factory() as session:
+            stmt = select(AuditLog).order_by(AuditLog.timestamp.desc())
 
-        for key, val in (filter_criteria or {}).items():
-            if key == "include_global":
-                continue
-            if key == "workspace_id" and val is not None:
-                if inc_global:
-                    conditions.append("(workspace_id = ? OR workspace_id IS NULL OR workspace_id = '')")
-                    params.append(val)
-                else:
-                    conditions.append("workspace_id = ?")
-                    params.append(val)
-            elif key in allowed_columns and val is not None:
-                conditions.append(f"{key} = ?")
-                params.append(val)
+            conditions = []
+            if "workspace_id" in criteria:
+                ws_filter = criteria.pop("workspace_id")
+                if ws_filter is not None:
+                    ws_uid = await self._resolve_workspace_uuid(session, ws_filter)
+                    if inc_global:
+                        conditions.append(
+                            or_(
+                                AuditLog.workspace_id == ws_uid,
+                                AuditLog.workspace_id.is_(None),
+                            )
+                        )
+                    else:
+                        conditions.append(AuditLog.workspace_id == ws_uid)
 
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
+            if "event_type" in criteria and criteria["event_type"]:
+                conditions.append(
+                    AuditLog.event_type.ilike(f"%{criteria['event_type'].strip()}%")
+                )
 
-        # Reverse-chronological order
-        query += " ORDER BY datetime(timestamp) DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
+            if "severity" in criteria and criteria["severity"]:
+                conditions.append(
+                    func.upper(AuditLog.severity) == criteria["severity"].strip().upper()
+                )
 
-        with self._get_connection() as conn:
-            rows = conn.execute(query, params).fetchall()
-            results = []
-            for row in rows:
-                record = dict(row)
-                if isinstance(record.get("metadata"), str):
-                    try:
-                        record["metadata"] = json.loads(record["metadata"])
-                    except Exception:
-                        pass
-                results.append(record)
-        return results
+            if "subject_id" in criteria and criteria["subject_id"]:
+                conditions.append(
+                    AuditLog.subject_id == str(criteria["subject_id"]).strip()
+                )
+
+            if "action" in criteria and criteria["action"]:
+                conditions.append(AuditLog.action == criteria["action"].strip())
+
+            if "resource" in criteria and criteria["resource"]:
+                conditions.append(AuditLog.resource == criteria["resource"].strip())
+
+            if "ip_address" in criteria and criteria["ip_address"]:
+                conditions.append(
+                    AuditLog.ip_address == criteria["ip_address"].strip()
+                )
+
+            if conditions:
+                stmt = stmt.where(*conditions)
+
+            stmt = stmt.limit(limit).offset(offset)
+            result = await session.execute(stmt)
+            logs = result.scalars().all()
+
+        return [self._format_log(log) for log in logs]
 
 
 concreteAuditLogger = AuditLogger
