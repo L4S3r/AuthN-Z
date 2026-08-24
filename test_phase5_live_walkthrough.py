@@ -162,15 +162,17 @@ async def run_live_cutover_walkthrough():
 
         # Switch workspace
         switch_res = await client.post(
-            "/workspaces/switch",
+            "/auth/workspaces/switch",
             json={"workspace_id": workspace_id},
             headers=auth_headers,
         )
         assert switch_res.status_code == 200, f"Workspace switch failed: {switch_res.text}"
         switch_data = switch_res.json()
         assert switch_data["status"] == "SUCCESS"
-        assert switch_data["active_workspace_id"] == workspace_id
-        print(f"  ✓ Active workspace switched to: {switch_data['workspace_name']} (Role: {switch_data['role']})")
+        assert switch_data["active_workspace"]["id"] == workspace_id
+        if "access_token" in switch_data:
+            auth_headers["Authorization"] = f"Bearer {switch_data['access_token']}"
+        print(f"  ✓ Active workspace switched to: {switch_data['active_workspace']['name']} (Role: {switch_data['active_workspace']['role']})")
         print("  RESULT: [PASSED] Workspace switch updated session context and validated membership role clearance.")
 
         # ---------------------------------------------------------------------
