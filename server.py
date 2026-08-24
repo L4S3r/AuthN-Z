@@ -768,9 +768,9 @@ async def login(req: LoginRequest, request: Request, response: Response):
     user_agent = request.headers.get("user-agent", "")
     clean_ident = req.identifier.strip().lower()
 
-    # Rate limiting: max 15 requests per minute per IP, max 5 per minute per identifier
-    if not check_rate_limit(f"login_ip:{client_ip}", max_requests=15, window_seconds=60) or \
-       not check_rate_limit(f"login_user:{clean_ident}", max_requests=5, window_seconds=60):
+    # Rate limiting: max 30 requests per minute per IP, max 10 per minute per identifier
+    if not check_rate_limit(f"login_ip:{client_ip}", max_requests=30, window_seconds=60) or \
+       not check_rate_limit(f"login_user:{clean_ident}", max_requests=10, window_seconds=60):
         audit_log.record_security_event(
             event_name="LOGIN_RATE_LIMITED",
             severity="WARNING",

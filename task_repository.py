@@ -34,6 +34,7 @@ class TaskRepository:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL DEFAULT 'ws_default',
                     title TEXT NOT NULL,
                     description TEXT,
                     status TEXT NOT NULL DEFAULT 'todo',
@@ -75,6 +76,8 @@ class TaskRepository:
 
             cursor.execute("PRAGMA table_info(tasks);")
             task_columns = [row["name"] for row in cursor.fetchall()]
+            if "workspace_id" not in task_columns:
+                cursor.execute("ALTER TABLE tasks ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'ws_default';")
             if "assignees" not in task_columns:
                 cursor.execute("ALTER TABLE tasks ADD COLUMN assignees TEXT DEFAULT '[]';")
 
