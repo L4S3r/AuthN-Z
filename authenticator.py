@@ -1,37 +1,44 @@
 """
-Component Role: Authenticator
-----------------------------
+Component Role: Authenticator (PostgreSQL Async)
+------------------------------------------------
 This component acts as the primary orchestrator for verifying user identity across various
-mechanisms (primary credentials, stateless bearer tokens, stateful session cookies, and MFA challenges).
-
-System Relationship:
-The Authenticator sits at the front entry door of the authentication layer. It coordinates between
-the UserRepository (to look up user identity and account status), the PasswordHasher (to verify secrets),
-the MFAProvider (to handle second-factor verification), and the TokenService / SessionStore (to issue
-authenticated artifacts on success). It also reports outcomes to the AuditLogger.
+mechanisms (primary credentials, stateless bearer tokens, stateful session cookies, and MFA challenges)
+using async repositories.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
-from datetime import datetime,timezone,timedelta
-import secrets
-from typing import Any,Dict,Optional
-import uuid
+from datetime import datetime, timedelta, timezone
+import inspect
 import json
+import logging
+import secrets
+from typing import Any, Dict, Optional, Tuple
+import uuid
 
-from password_hasher import PasswordHasher
-from user_repository import UserRepository
-from token_service import TokenService
-from session_store import SessionStore
-from mfa_provider import MFAProvider
 from device_trust_service import DeviceTrustService
+from mfa_provider import MFAProvider
+from password_hasher import PasswordHasher
+from session_store import SessionStore
+from token_service import TokenService
+from user_repository import UserRepository
+
+logger = logging.getLogger("auth_nz.authenticator")
+
+DUMMY_BCRYPT_HASH = "$2b$12$e8YkZ7G4t9I1mPqLwK9ZCe8YkZ7G4t9I1mPqLwK9ZCe8YkZ7G4t9I"
+
+
+async def _maybe_await(val: Any) -> Any:
+    """Helper to await a coroutine if async, or return value directly if sync."""
+    if inspect.isawaitable(val):
+        return await val
+    return val
 
 
 class abstractAuthenticator(ABC):
     """Abstract interface orchestrating authentication flows across credentials, sessions, tokens, and MFA."""
 
     @abstractmethod
-    def authenticate_credentials(
+    async def authenticate_credentials(
         self,
         identifier: str,
         plain_password: str,
@@ -39,89 +46,30 @@ class abstractAuthenticator(ABC):
         user_agent: Optional[str] = None,
         ip_address: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Verify primary identity credentials (username/email and password).
-
-        Args:
-            identifier: The username, email, or identity handle submitted by the user.
-            plain_password: The raw password submitted by the user.
-
-        Returns:
-            A dictionary describing the authentication outcome. For example:
-            - On success (MFA not required): {'status': 'SUCCESS', 'user_id': '...', 'user_data': {...}}
-            - On success (MFA required): {'status': 'MFA_REQUIRED', 'user_id': '...', 'challenge_id': '...'}
-            - On failure: {'status': 'FAILED', 'reason': 'INVALID_CREDENTIALS'}
-
-        Edge Cases to Consider:
-            - Account locked, suspended, or inactive states.
-            - Rate limiting / brute-force throttling across repeated failures.
-            - Consistent response times to avoid user enumeration via timing discrepancies.
-            - Identifying whether the user's password hash requires upgrading upon successful verification.
-        """
+        """Verify primary identity credentials (username/email and password)."""
         ...
 
     @abstractmethod
-    def authenticate_token(self, token: str) -> Dict[str, Any]:
-        """
-        Validate a bearer token and produce the authenticated subject's execution context.
-
-        Args:
-            token: The raw access token extracted from the Authorization HTTP header.
-
-        Returns:
-            A dictionary containing the authenticated subject's context (e.g., {'status': 'SUCCESS', 'user_id': '...', 'claims': {...}}),
-            or a failure status dictionary if invalid, expired, or revoked.
-
-        Edge Cases to Consider:
-            - Stripping 'Bearer ' prefix correctly if included.
-            - Blacklisted / revoked tokens.
-            - Handling token expiration vs. invalid signature distinctly in telemetry while returning safe errors to callers.
-        """
+    async def authenticate_token(self, token: str) -> Dict[str, Any]:
+        """Validate a bearer token and produce the authenticated subject's execution context."""
         ...
 
     @abstractmethod
-    def authenticate_session(self, session_id: str) -> Dict[str, Any]:
-        """
-        Validate an active session ID and resolve the current authenticated user context.
-
-        Args:
-            session_id: The session ID cookie string passed by the client.
-
-        Returns:
-            A dictionary containing the session data and associated user identifier, or failure details if expired or invalid.
-
-        Edge Cases to Consider:
-            - Inactive or expired session IDs.
-            - Automatic sliding session TTL extension upon valid access.
-            - Handling concurrent access by suspended accounts.
-        """
+    async def authenticate_session(self, session_id: str) -> Dict[str, Any]:
+        """Validate an active session ID and resolve the current authenticated user context."""
         ...
 
     @abstractmethod
-    def initiate_mfa_challenge(
+    async def initiate_mfa_challenge(
         self,
         user_id: str,
         challenge_type: str = "totp",
     ) -> Dict[str, Any]:
-        """
-        Create and record an active pending MFA challenge during an in-progress authentication flow.
-
-        Args:
-            user_id: The identifier of the user who passed primary authentication.
-            challenge_type: The type of secondary factor (e.g., 'totp', 'sms_otp', 'email_otp').
-
-        Returns:
-            A dictionary containing challenge metadata (e.g., challenge_id, expiry_timestamp, masked destination).
-
-        Edge Cases to Consider:
-            - Preventing duplicate concurrent challenges from spamming users.
-            - Setting an appropriate short lifetime for the challenge (e.g., 3-5 minutes).
-            - Verifying that the user actually has the requested factor enrolled.
-        """
+        """Initiate and store an active MFA challenge."""
         ...
 
     @abstractmethod
-    def complete_mfa_challenge(
+    async def complete_mfa_challenge(
         self,
         user_id: str,
         challenge_id: str,
@@ -130,32 +78,8 @@ class abstractAuthenticator(ABC):
         user_agent: Optional[str] = None,
         ip_address: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Validate a submitted second-factor code to finalize an authentication workflow.
-
-        Args:
-            user_id: The identifier of the user completing the challenge.
-            challenge_id: The identifier of the pending challenge being answered.
-            response_code: The 6-8 digit code or backup code submitted by the user.
-            remember_device: Whether to issue and persist a 30-day trusted device token.
-            user_agent: The browser User-Agent header of the caller.
-            ip_address: The client IP address.
-
-        Returns:
-            A dictionary indicating final authentication success (with user context/tokens) or failure with retry details.
-
-        Edge Cases to Consider:
-            - Maximum attempt limits per challenge before invalidating the entire login attempt.
-            - Expired challenges.
-            - Distinguishing between standard TOTP codes and emergency backup codes.
-        """
+        """Complete an active MFA challenge with submitted response code."""
         ...
-
-import logging
-
-logger = logging.getLogger("auth_nz.authenticator")
-
-DUMMY_BCRYPT_HASH = "$2b$12$e8YkZ7G4t9I1mPqLwK9ZCe8YkZ7G4t9I1mPqLwK9ZCe8YkZ7G4t9I"
 
 
 class Authenticator(abstractAuthenticator):
@@ -195,22 +119,23 @@ class Authenticator(abstractAuthenticator):
                     return ttl
             except Exception:
                 pass
-        
-        lock_exp = self._in_memory_lockouts.get(user_id)
+
+        lock_exp = self._in_memory_lockouts.get(str(user_id))
         if lock_exp:
             now_ts = int(datetime.now(timezone.utc).timestamp())
             if lock_exp > now_ts:
                 return lock_exp - now_ts
             else:
-                self._in_memory_lockouts.pop(user_id, None)
+                self._in_memory_lockouts.pop(str(user_id), None)
         return None
 
     def _record_failed_attempt(self, user_id: str) -> Dict[str, Any]:
         """Increment failed attempts for a user; apply exponential lockout if threshold exceeded."""
         r = self._get_redis()
-        fail_key = f"failed_logins:{user_id}"
-        lock_key = f"lockout:{user_id}"
-        window_seconds = 300  # 5 minute sliding window for counting failures
+        uid_str = str(user_id)
+        fail_key = f"failed_logins:{uid_str}"
+        lock_key = f"lockout:{uid_str}"
+        window_seconds = 300  # 5 minute sliding window
 
         attempts = 1
         if r is not None:
@@ -219,17 +144,16 @@ class Authenticator(abstractAuthenticator):
                 if attempts == 1:
                     r.expire(fail_key, window_seconds)
             except Exception:
-                attempts = self._in_memory_failed_attempts.get(user_id, 0) + 1
-                self._in_memory_failed_attempts[user_id] = attempts
+                attempts = self._in_memory_failed_attempts.get(uid_str, 0) + 1
+                self._in_memory_failed_attempts[uid_str] = attempts
         else:
-            attempts = self._in_memory_failed_attempts.get(user_id, 0) + 1
-            self._in_memory_failed_attempts[user_id] = attempts
+            attempts = self._in_memory_failed_attempts.get(uid_str, 0) + 1
+            self._in_memory_failed_attempts[uid_str] = attempts
 
         locked = False
         newly_locked = False
         lockout_seconds = 0
         if attempts >= 5:
-            # 5-9 attempts: 15 mins (900s); 10+ attempts: 60 mins (3600s)
             lockout_seconds = 900 if attempts < 10 else 3600
             locked = True
             if attempts == 5 or attempts == 10:
@@ -240,7 +164,7 @@ class Authenticator(abstractAuthenticator):
                 except Exception:
                     pass
             now_ts = int(datetime.now(timezone.utc).timestamp())
-            self._in_memory_lockouts[user_id] = now_ts + lockout_seconds
+            self._in_memory_lockouts[uid_str] = now_ts + lockout_seconds
 
         return {
             "locked": locked,
@@ -250,15 +174,16 @@ class Authenticator(abstractAuthenticator):
         }
 
     def _clear_failed_attempts(self, user_id: str) -> None:
-        """Clear failed login attempts and lockout state upon successful authentication or password reset."""
+        """Clear failed login attempts and lockout state."""
         r = self._get_redis()
+        uid_str = str(user_id)
         if r is not None:
             try:
-                r.delete(f"failed_logins:{user_id}", f"lockout:{user_id}")
+                r.delete(f"failed_logins:{uid_str}", f"lockout:{uid_str}")
             except Exception:
                 pass
-        self._in_memory_failed_attempts.pop(user_id, None)
-        self._in_memory_lockouts.pop(user_id, None)
+        self._in_memory_failed_attempts.pop(uid_str, None)
+        self._in_memory_lockouts.pop(uid_str, None)
 
     def unlock_account(self, user_id: str) -> bool:
         """Explicitly unlock an account by clearing lockout flags."""
@@ -273,23 +198,23 @@ class Authenticator(abstractAuthenticator):
                 if raw:
                     return json.loads(raw)
             except Exception as exc:
-                logger.warning(
-                    "Failed to query MFA challenge from Redis (%s). Falling back to in-memory dictionary.",
-                    exc,
-                )
+                logger.warning("Failed to query MFA challenge from Redis (%s).", exc)
         return self._pending_mfa_challenges.get(challenge_id)
 
-    def _save_mfa_challenge(self, challenge_id: str, data: Dict[str, Any], ttl_seconds: int = 300) -> None:
+    def _save_mfa_challenge(
+        self, challenge_id: str, data: Dict[str, Any], ttl_seconds: int = 300
+    ) -> None:
         """Store challenge data in Redis with 5-minute TTL, fallback to memory."""
         if self.session_store and getattr(self.session_store, "r", None):
             try:
-                self.session_store.r.set(f"mfa_challenge:{challenge_id}", json.dumps(data), ex=ttl_seconds)
+                self.session_store.r.set(
+                    f"mfa_challenge:{challenge_id}",
+                    json.dumps(data),
+                    ex=ttl_seconds,
+                )
                 return
             except Exception as exc:
-                logger.warning(
-                    "Failed to store MFA challenge in Redis (%s). Falling back to in-memory dictionary.",
-                    exc,
-                )
+                logger.warning("Failed to store MFA challenge in Redis (%s).", exc)
         self._pending_mfa_challenges[challenge_id] = data
 
     def _delete_mfa_challenge(self, challenge_id: str) -> None:
@@ -301,8 +226,7 @@ class Authenticator(abstractAuthenticator):
                 logger.warning("Failed to delete MFA challenge from Redis (%s).", exc)
         self._pending_mfa_challenges.pop(challenge_id, None)
 
-
-    def authenticate_credentials(
+    async def authenticate_credentials(
         self,
         identifier: str,
         plain_password: str,
@@ -311,9 +235,8 @@ class Authenticator(abstractAuthenticator):
         ip_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Verify primary identity credentials (username/email and password) with lockout protection."""
-        user = self.user_repo.get_by_identifier(identifier)
+        user = await _maybe_await(self.user_repo.get_by_identifier(identifier))
 
-        # Constant-time side-channel mitigation: verify against dummy hash if user is absent
         if not user:
             self.hasher.verify(plain_password, DUMMY_BCRYPT_HASH)
             return {
@@ -321,27 +244,24 @@ class Authenticator(abstractAuthenticator):
                 "reason": "INVALID_CREDENTIALS",
             }
 
-        # Check if account is active
         if not user.get("is_active", 1):
             return {
                 "status": "FAILED",
                 "reason": "ACCOUNT_INACTIVE",
             }
 
-        # Check if account is currently locked due to prior excessive failed attempts
         remaining_lock = self._check_account_lockout(user["id"])
         if remaining_lock is not None and remaining_lock > 0:
             remaining_mins = max(1, (remaining_lock + 59) // 60)
             return {
                 "status": "LOCKED",
                 "reason": "ACCOUNT_LOCKED",
-                "user_id": user["id"],
+                "user_id": str(user["id"]),
                 "lockout_seconds": remaining_lock,
                 "lockout_minutes": remaining_mins,
                 "newly_locked": False,
             }
 
-        # Verify password
         if not self.hasher.verify(plain_password, user["hashed_password"]):
             lockout_info = self._record_failed_attempt(user["id"])
             if lockout_info["locked"]:
@@ -349,7 +269,7 @@ class Authenticator(abstractAuthenticator):
                 return {
                     "status": "LOCKED",
                     "reason": "ACCOUNT_LOCKED",
-                    "user_id": user["id"],
+                    "user_id": str(user["id"]),
                     "lockout_seconds": lockout_info["lockout_seconds"],
                     "lockout_minutes": remaining_mins,
                     "attempts": lockout_info["attempts"],
@@ -362,15 +282,14 @@ class Authenticator(abstractAuthenticator):
                 "remaining_attempts": max(0, 5 - lockout_info["attempts"]),
             }
 
-        # Password is correct! Clear failed attempts
         self._clear_failed_attempts(user["id"])
 
-        # Check if password needs rehash
         if self.hasher.needs_rehash(user["hashed_password"]):
             new_hash = self.hasher.hash(plain_password)
-            self.user_repo.update_user(user["id"], {"hashed_password": new_hash})
+            await _maybe_await(
+                self.user_repo.update_user(user["id"], {"hashed_password": new_hash})
+            )
 
-        # Check MFA requirement
         metadata = user.get("metadata", {})
         if isinstance(metadata, str):
             try:
@@ -382,24 +301,27 @@ class Authenticator(abstractAuthenticator):
         trusted_dev_rec = None
         if metadata.get("mfa_enabled") and metadata.get("mfa_secret"):
             if trusted_device_token and self.device_trust_service:
-                trusted_dev_rec = self.device_trust_service.verify_trusted_device(
-                    user_id=user["id"],
-                    raw_token=trusted_device_token,
-                    user_agent=user_agent,
-                    ip_address=ip_address,
+                trusted_dev_rec = await _maybe_await(
+                    self.device_trust_service.verify_trusted_device(
+                        user_id=str(user["id"]),
+                        raw_token=trusted_device_token,
+                        user_agent=user_agent,
+                        ip_address=ip_address,
+                    )
                 )
                 if trusted_dev_rec:
                     mfa_skipped = True
 
             if not mfa_skipped:
-                challenge = self.initiate_mfa_challenge(user["id"], challenge_type="totp")
+                challenge = await _maybe_await(
+                    self.initiate_mfa_challenge(str(user["id"]), challenge_type="totp")
+                )
                 return {
                     "status": "MFA_REQUIRED",
-                    "user_id": user["id"],
+                    "user_id": str(user["id"]),
                     "challenge_id": challenge["challenge_id"],
                 }
 
-        # Issue tokens and session
         roles = user.get("roles", [])
         if isinstance(roles, str):
             try:
@@ -407,23 +329,28 @@ class Authenticator(abstractAuthenticator):
             except Exception:
                 roles = []
 
-        access_token = self.token_service.create_access_token(user["id"], claims={"roles": roles})
-        refresh_token = self.token_service.create_refresh_token(user["id"], claims={"roles": roles})
-        session_id = self.session_store.create_session(user["id"], session_data={"roles": roles})
+        access_token = self.token_service.create_access_token(
+            str(user["id"]), claims={"roles": roles}
+        )
+        refresh_token = self.token_service.create_refresh_token(
+            str(user["id"]), claims={"roles": roles}
+        )
+        session_id = self.session_store.create_session(
+            str(user["id"]), session_data={"roles": roles}
+        )
 
-        # Sanitize metadata for response
         safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
         safe_metadata.pop("mfa_secret", None)
         safe_metadata.pop("backup_codes", None)
 
         resp = {
             "status": "SUCCESS",
-            "user_id": user["id"],
+            "user_id": str(user["id"]),
             "access_token": access_token,
             "refresh_token": refresh_token,
             "session_id": session_id,
             "user": {
-                "id": user["id"],
+                "id": str(user["id"]),
                 "username": user["username"],
                 "email": user["email"],
                 "roles": roles,
@@ -441,8 +368,7 @@ class Authenticator(abstractAuthenticator):
 
         return resp
 
-
-    def authenticate_token(self, token: str) -> Dict[str, Any]:
+    async def authenticate_token(self, token: str) -> Dict[str, Any]:
         """Validate a bearer token and produce the authenticated subject's execution context."""
         if not token or not isinstance(token, str):
             return {
@@ -450,12 +376,10 @@ class Authenticator(abstractAuthenticator):
                 "reason": "MISSING_TOKEN",
             }
 
-        # Sanitize bearer prefix
         clean_token = token.strip()
         if clean_token.lower().startswith("bearer "):
             clean_token = clean_token[7:].strip()
 
-        # Decode and verify claims
         try:
             payload = self.token_service.decode_and_verify(clean_token)
         except ValueError as e:
@@ -478,16 +402,14 @@ class Authenticator(abstractAuthenticator):
                 "detail": str(e),
             }
 
-        # Ensure token is access token not refresh token
         if payload.get("type") != "access":
             return {
                 "status": "FAILED",
                 "reason": "INVALID_TOKEN_TYPE",
             }
 
-        # Check if user account is still active in the database
         user_id = payload.get("sub")
-        user = self.user_repo.get_by_id(user_id)
+        user = await _maybe_await(self.user_repo.get_by_id(user_id))
         if not user:
             return {
                 "status": "FAILED",
@@ -501,13 +423,13 @@ class Authenticator(abstractAuthenticator):
 
         return {
             "status": "SUCCESS",
-            "user_id": user_id,
+            "user_id": str(user_id),
             "username": user.get("username"),
             "roles": payload.get("roles", user.get("roles", [])),
             "claims": payload,
         }
 
-    def authenticate_session(self, session_id: str) -> Dict[str, Any]:
+    async def authenticate_session(self, session_id: str) -> Dict[str, Any]:
         """Validate an active session ID and resolve the current authenticated user context."""
         if not session_id or not isinstance(session_id, str):
             return {
@@ -523,7 +445,7 @@ class Authenticator(abstractAuthenticator):
             }
 
         user_id = session.get("user_id")
-        user = self.user_repo.get_by_id(user_id)
+        user = await _maybe_await(self.user_repo.get_by_id(user_id))
         if not user:
             return {
                 "status": "FAILED",
@@ -538,19 +460,19 @@ class Authenticator(abstractAuthenticator):
         self.session_store.refresh_session_ttl(session_id)
         return {
             "status": "SUCCESS",
-            "user_id": user_id,
+            "user_id": str(user_id),
             "username": user.get("username"),
             "created_at": session.get("created_at"),
             "data": session.get("data", {}),
         }
 
-    def initiate_mfa_challenge(
+    async def initiate_mfa_challenge(
         self,
         user_id: str,
         challenge_type: str = "totp",
     ) -> Dict[str, Any]:
         """Create and record an active pending MFA challenge in Redis with 5-minute TTL."""
-        user = self.user_repo.get_by_id(user_id)
+        user = await _maybe_await(self.user_repo.get_by_id(user_id))
         if not user:
             raise ValueError("User not found")
 
@@ -576,7 +498,6 @@ class Authenticator(abstractAuthenticator):
             "attempts": 0,
         }
 
-        # Store challenge in Redis with 300s TTL
         self._save_mfa_challenge(challenge_id, challenge_data, ttl_seconds=300)
 
         return {
@@ -585,7 +506,7 @@ class Authenticator(abstractAuthenticator):
             "challenge_type": challenge_type,
         }
 
-    def complete_mfa_challenge(
+    async def complete_mfa_challenge(
         self,
         user_id: str,
         challenge_id: str,
@@ -595,7 +516,7 @@ class Authenticator(abstractAuthenticator):
         ip_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Validate a submitted second-factor code against the Redis-backed challenge."""
-        user = self.user_repo.get_by_id(user_id)
+        user = await _maybe_await(self.user_repo.get_by_id(user_id))
         if not user:
             return {
                 "status": "FAILED",
@@ -638,15 +559,21 @@ class Authenticator(abstractAuthenticator):
             }
 
         backup_codes = metadata.get("backup_codes", [])
-        is_valid = self.mfa_provider.verify_totp_code(metadata["mfa_secret"], response_code)
+        is_valid = self.mfa_provider.verify_totp_code(
+            metadata["mfa_secret"], response_code
+        )
 
         if not is_valid and backup_codes:
-            is_valid, remaining_codes = self.mfa_provider.verify_and_consume_backup_code(
-                response_code, backup_codes
+            is_valid, remaining_codes = (
+                self.mfa_provider.verify_and_consume_backup_code(
+                    response_code, backup_codes
+                )
             )
             if is_valid:
                 metadata["backup_codes"] = remaining_codes
-                self.user_repo.update_user(user["id"], {"metadata": metadata})
+                await _maybe_await(
+                    self.user_repo.update_user(user["id"], {"metadata": metadata})
+                )
 
         if not is_valid:
             challenge["attempts"] += 1
@@ -662,7 +589,6 @@ class Authenticator(abstractAuthenticator):
                 "reason": "INVALID_MFA_CODE",
             }
 
-        # Challenge passed: delete challenge record
         self._delete_mfa_challenge(challenge_id)
 
         roles = user.get("roles", [])
@@ -672,33 +598,39 @@ class Authenticator(abstractAuthenticator):
             except Exception:
                 roles = []
 
-        access_token = self.token_service.create_access_token(user["id"], claims={"roles": roles})
-        refresh_token = self.token_service.create_refresh_token(user["id"], claims={"roles": roles})
-        session_id = self.session_store.create_session(user["id"], session_data={"roles": roles})
+        access_token = self.token_service.create_access_token(
+            str(user["id"]), claims={"roles": roles}
+        )
+        refresh_token = self.token_service.create_refresh_token(
+            str(user["id"]), claims={"roles": roles}
+        )
+        session_id = self.session_store.create_session(
+            str(user["id"]), session_data={"roles": roles}
+        )
 
-        # Provision trusted device if requested
         raw_dev_token = None
         dev_rec = None
         if remember_device and self.device_trust_service:
-            dev_rec, raw_dev_token = self.device_trust_service.create_trusted_device(
-                user_id=user["id"],
-                user_agent=user_agent,
-                ip_address=ip_address,
+            dev_rec, raw_dev_token = await _maybe_await(
+                self.device_trust_service.create_trusted_device(
+                    user_id=str(user["id"]),
+                    user_agent=user_agent,
+                    ip_address=ip_address,
+                )
             )
 
-        # Sanitize metadata for response
         safe_metadata = dict(metadata) if isinstance(metadata, dict) else {}
         safe_metadata.pop("mfa_secret", None)
         safe_metadata.pop("backup_codes", None)
 
         resp = {
             "status": "SUCCESS",
-            "user_id": user["id"],
+            "user_id": str(user["id"]),
             "access_token": access_token,
             "refresh_token": refresh_token,
             "session_id": session_id,
             "user": {
-                "id": user["id"],
+                "id": str(user["id"]),
                 "username": user["username"],
                 "email": user["email"],
                 "roles": roles,
@@ -717,4 +649,5 @@ class Authenticator(abstractAuthenticator):
 
         return resp
 
-        
+
+concreteAuthenticator = Authenticator

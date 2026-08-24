@@ -1,11 +1,13 @@
 """
-Auth N&Z - Permission Evaluator & Scoped Authorization Engine (permission_evaluator.py)
--------------------------------------------------------------------------------------
+Auth N&Z - Permission Evaluator & Scoped Authorization Engine (PostgreSQL Async)
+--------------------------------------------------------------------------------
 Evaluates whether an authenticated subject possesses authority to execute actions on
-resources within global and workspace-scoped contexts (supporting RBAC, ABAC, and Multi-Tenancy).
+resources within global and workspace-scoped contexts (supporting RBAC, ABAC, and Multi-Tenancy)
+using async repositories.
 """
 
 from abc import ABC, abstractmethod
+import inspect
 import json
 import logging
 from typing import Any, Dict, List, Optional, Set
@@ -16,11 +18,18 @@ from workspace_repository import WorkspaceRepository
 logger = logging.getLogger("auth_nz.permission_evaluator")
 
 
+async def _maybe_await(val: Any) -> Any:
+    """Helper to await a coroutine if async, or return value directly if sync."""
+    if inspect.isawaitable(val):
+        return await val
+    return val
+
+
 class abstractPermissionEvaluator(ABC):
     """Abstract interface defining access control and authorization policy evaluation mechanisms."""
 
     @abstractmethod
-    def has_permission(
+    async def has_permission(
         self,
         subject_id: str,
         required_permission: str,
@@ -30,7 +39,7 @@ class abstractPermissionEvaluator(ABC):
         pass
 
     @abstractmethod
-    def has_role(
+    async def has_role(
         self,
         subject_id: str,
         required_role: str,
@@ -40,7 +49,7 @@ class abstractPermissionEvaluator(ABC):
         pass
 
     @abstractmethod
-    def is_resource_accessible(
+    async def is_resource_accessible(
         self,
         subject_id: str,
         action: str,
@@ -53,7 +62,7 @@ class abstractPermissionEvaluator(ABC):
         pass
 
     @abstractmethod
-    def get_effective_permissions(
+    async def get_effective_permissions(
         self,
         subject_id: str,
         context: Optional[Dict[str, Any]] = None,
@@ -62,7 +71,7 @@ class abstractPermissionEvaluator(ABC):
         pass
 
     @abstractmethod
-    def evaluate_policy(
+    async def evaluate_policy(
         self,
         subject_attributes: Dict[str, Any],
         action: str,
@@ -157,9 +166,9 @@ class PermissionEvaluator(abstractPermissionEvaluator):
                     queue.append(norm_r)
         return all_roles
 
-    def _get_global_roles(self, subject_id: str) -> List[str]:
+    async def _get_global_roles(self, subject_id: str) -> List[str]:
         """Retrieve global roles directly assigned on the user account."""
-        user = self.user_repo.get_by_id(subject_id)
+        user = await _maybe_await(self.user_repo.get_by_id(subject_id))
         if not user or not user.get("is_active", 1):
             return []
         raw_roles = user.get("roles", [])
@@ -170,7 +179,7 @@ class PermissionEvaluator(abstractPermissionEvaluator):
                 return []
         return raw_roles if isinstance(raw_roles, list) else []
 
-    def has_role(
+    async def has_role(
         self,
         subject_id: str,
         required_role: str,
@@ -183,7 +192,7 @@ class PermissionEvaluator(abstractPermissionEvaluator):
         - Evaluates role hierarchy (superadmin > admin > developer > editor > viewer).
         """
         norm_required = self._normalize_role(required_role)
-        global_roles = self._get_global_roles(subject_id)
+        global_roles = await self._get_global_roles(subject_id)
         effective_global = self._expand_roles(global_roles)
 
         # 1. Global superadmin has all roles everywhere
@@ -193,7 +202,9 @@ class PermissionEvaluator(abstractPermissionEvaluator):
         # 2. If scope is provided (workspace_id), check workspace membership
         if scope:
             ws_id = scope.strip()
-            member = self.workspace_repo.get_member(ws_id, user_id=subject_id)
+            member = await _maybe_await(
+                self.workspace_repo.get_member(ws_id, user_id=subject_id)
+            )
             if member and member.get("status") == "active":
                 member_role = member.get("role", "viewer")
                 effective_scoped = self._expand_roles([member_role])
@@ -209,19 +220,21 @@ class PermissionEvaluator(abstractPermissionEvaluator):
         # 3. If no scope, evaluate against global roles
         return norm_required in effective_global
 
-    def get_effective_permissions(
+    async def get_effective_permissions(
         self,
         subject_id: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """Compile all distinct permissions granted via direct, inherited, and scoped roles."""
-        global_roles = self._get_global_roles(subject_id)
+        global_roles = await self._get_global_roles(subject_id)
         effective_roles = set(self._expand_roles(global_roles))
 
         # Check for workspace context
         if context and context.get("workspace_id"):
             ws_id = str(context["workspace_id"]).strip()
-            member = self.workspace_repo.get_member(ws_id, user_id=subject_id)
+            member = await _maybe_await(
+                self.workspace_repo.get_member(ws_id, user_id=subject_id)
+            )
             if member and member.get("status") == "active":
                 scoped_role = member.get("role", "viewer")
                 effective_roles.update(self._expand_roles([scoped_role]))
@@ -233,14 +246,14 @@ class PermissionEvaluator(abstractPermissionEvaluator):
 
         return list(permissions)
 
-    def has_permission(
+    async def has_permission(
         self,
         subject_id: str,
         required_permission: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Check if a subject possesses a specific permission (supporting wildcards)."""
-        granted = self.get_effective_permissions(subject_id, context)
+        granted = await self.get_effective_permissions(subject_id, context)
 
         if "*" in granted or required_permission in granted:
             return True
@@ -253,7 +266,7 @@ class PermissionEvaluator(abstractPermissionEvaluator):
 
         return False
 
-    def is_resource_accessible(
+    async def is_resource_accessible(
         self,
         subject_id: str,
         action: str,
@@ -263,7 +276,7 @@ class PermissionEvaluator(abstractPermissionEvaluator):
         context: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Evaluate fine-grained, resource-level access control."""
-        user = self.user_repo.get_by_id(subject_id)
+        user = await _maybe_await(self.user_repo.get_by_id(subject_id))
         if not user or not user.get("is_active", 1):
             return False
 
@@ -273,12 +286,14 @@ class PermissionEvaluator(abstractPermissionEvaluator):
         scope = context.get("workspace_id") if context else attrs.get("workspace_id")
 
         # Admin or Superadmin role bypass
-        if self.has_role(subject_id, "admin", scope=scope) or self.has_role(subject_id, "superadmin"):
+        is_admin = await self.has_role(subject_id, "admin", scope=scope)
+        is_super = await self.has_role(subject_id, "superadmin")
+        if is_admin or is_super:
             return True
 
         # Specific permission check
         perm_key = f"{clean_type}:{clean_action}"
-        if self.has_permission(subject_id, perm_key, context):
+        if await self.has_permission(subject_id, perm_key, context):
             return True
 
         # Resource creator / owner check
@@ -292,7 +307,7 @@ class PermissionEvaluator(abstractPermissionEvaluator):
         # Default deny
         return False
 
-    def evaluate_policy(
+    async def evaluate_policy(
         self,
         subject_attributes: Dict[str, Any],
         action: str,

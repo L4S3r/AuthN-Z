@@ -114,18 +114,18 @@ from task_repository import TaskRepository
 from workspace_repository import WorkspaceRepository
 from email_service import EmailService
 
-#singletons
+# Singletons (PostgreSQL Async Backend)
 hasher = concretePasswordHasher()
-repo = concreteUserRepository(db_file="DATABASE.db")
-ws_repo = WorkspaceRepository(db_file="DATABASE.db")
+repo = concreteUserRepository()
+ws_repo = WorkspaceRepository()
 sess_store = concreteSessionStore()
 token_svc = concreteTokenService(redis_client=sess_store.r)
 mfa_prov = concreteMFAProvider()
-audit_log = AuditLogger(db_file="DATABASE.db")
+audit_log = AuditLogger()
 oauth_mgr = OAuthManager(redis_client=sess_store.r)
-task_repo = TaskRepository(db_file="DATABASE.db")
+task_repo = TaskRepository()
 email_svc = EmailService(audit_logger=audit_log)
-device_trust_svc = DeviceTrustService(db_file="DATABASE.db")
+device_trust_svc = DeviceTrustService()
 auth = Authenticator(
     user_repo=repo,
     hasher=hasher,
@@ -217,40 +217,9 @@ security = HTTPBearer(auto_error=False)
 # =============================================================================
 # In-App Notifications Storage & Push Service (Phase 4.2)
 # =============================================================================
-def init_notifications_table(db_file: str = "DATABASE.db"):
-    try:
-        import sqlite3
-        with sqlite3.connect(db_file, timeout=10.0) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS notifications (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    workspace_id TEXT DEFAULT 'ws_default',
-                    task_id TEXT,
-                    type TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    link TEXT,
-                    is_read INTEGER DEFAULT 0,
-                    created_at TEXT NOT NULL
-                );
-            """)
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(notifications);")
-            cols = [r[1] for r in cursor.fetchall()]
-            if "task_id" not in cols:
-                conn.execute("ALTER TABLE notifications ADD COLUMN task_id TEXT;")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_read ON notifications(user_id, is_read);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_created ON notifications(created_at);")
-            conn.commit()
-    except Exception as exc:
-        logger.warning("Failed to initialize notifications table: %s", exc)
-
-init_notifications_table("DATABASE.db")
-
+from models import Notification
+from database import get_session_factory
+from sqlalchemy import select, func, update as sql_update
 
 async def create_and_push_notification(
     user_id: str,
@@ -260,29 +229,46 @@ async def create_and_push_notification(
     link: Optional[str] = None,
     workspace_id: Optional[str] = None,
     task_id: Optional[str] = None,
-    db_file: str = "DATABASE.db",
 ) -> Dict[str, Any]:
-    """Persist notification and broadcast in real-time over WebSocket with deep-link metadata."""
-    import sqlite3
+    """Persist notification in PostgreSQL and broadcast in real-time over WebSocket with deep-link metadata."""
     import urllib.parse
-    notif_id = f"notif_{uuid.uuid4().hex[:16]}"
-    now_str = datetime.now(timezone.utc).isoformat()
+    notif_uuid = uuid.uuid4()
+    now_dt = datetime.now(timezone.utc)
+    now_str = now_dt.isoformat()
 
-    resolved_task_id = task_id
-    if not resolved_task_id and link and "task=" in link:
+    resolved_task_uuid = None
+    if task_id:
+        try:
+            resolved_task_uuid = uuid.UUID(str(task_id).strip())
+        except Exception:
+            pass
+    elif link and "task=" in link:
         try:
             parsed = urllib.parse.urlparse(link)
             qs = urllib.parse.parse_qs(parsed.query)
             if "task" in qs and qs["task"]:
-                resolved_task_id = qs["task"][0]
+                resolved_task_uuid = uuid.UUID(qs["task"][0].strip())
+        except Exception:
+            pass
+
+    user_uuid = None
+    try:
+        user_uuid = uuid.UUID(str(user_id).strip())
+    except Exception:
+        pass
+
+    ws_uuid = None
+    if workspace_id:
+        try:
+            ws_uuid = uuid.UUID(str(workspace_id).strip())
         except Exception:
             pass
 
     record = {
-        "id": notif_id,
-        "user_id": user_id,
-        "workspace_id": workspace_id or "ws_default",
-        "task_id": resolved_task_id,
+        "id": str(notif_uuid),
+        "user_id": str(user_id),
+        "workspace_id": str(workspace_id) if workspace_id else None,
+        "task_id": str(resolved_task_uuid) if resolved_task_uuid else None,
         "type": notif_type,
         "title": title,
         "message": message,
@@ -290,26 +276,27 @@ async def create_and_push_notification(
         "is_read": 0,
         "created_at": now_str,
     }
-    try:
-        with sqlite3.connect(db_file, timeout=10.0) as conn:
-            conn.execute("""
-                INSERT INTO notifications (id, user_id, workspace_id, task_id, type, title, message, link, is_read, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                record["id"],
-                record["user_id"],
-                record["workspace_id"],
-                record["task_id"],
-                record["type"],
-                record["title"],
-                record["message"],
-                record["link"],
-                record["is_read"],
-                record["created_at"],
-            ))
-            conn.commit()
-    except Exception as exc:
-        logger.error("Failed to insert in-app notification: %s", exc)
+
+    if user_uuid:
+        try:
+            session_factory = get_session_factory()
+            async with session_factory() as session:
+                notif_obj = Notification(
+                    id=notif_uuid,
+                    user_id=user_uuid,
+                    workspace_id=ws_uuid,
+                    task_id=resolved_task_uuid,
+                    type=notif_type,
+                    title=title,
+                    message=message,
+                    link=link,
+                    is_read=False,
+                    created_at=now_dt,
+                )
+                session.add(notif_obj)
+                await session.commit()
+        except Exception as exc:
+            logger.error("Failed to insert in-app notification to PostgreSQL: %s", exc)
 
     # Push to active WebSocket clients for this user
     await ws_manager.send_to_user(
@@ -661,7 +648,7 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    res = auth.authenticate_token(token)
+    res = await auth.authenticate_token(token)
     if res["status"] != "SUCCESS":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -689,7 +676,7 @@ async def register(req: RegisterRequest, request: Request):
     """Public registration: always assigns default unprivileged 'viewer' role and clearance 1."""
     try:
         hashed_password = hasher.hash(req.password)
-        new_user = repo.create_user({
+        new_user = await repo.create_user({
             "username": req.username,
             "email": req.email,
             "hashed_password": hashed_password,
@@ -700,7 +687,7 @@ async def register(req: RegisterRequest, request: Request):
             },
         })
         client_ip = request.client.host if request.client else "unknown"
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="USER_REGISTERED",
             severity="INFO",
             details={
@@ -721,8 +708,8 @@ async def admin_create_user(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Admin-only endpoint: Provision new accounts with custom roles and security clearance."""
-    if not perm_eval.has_role(current_user["user_id"], "admin"):
-        audit_log.record_access_denial(
+    if not await perm_eval.has_role(current_user["user_id"], "admin"):
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="create_user",
             resource="admin/users",
@@ -735,7 +722,7 @@ async def admin_create_user(
 
     try:
         hashed_password = hasher.hash(req.password)
-        new_user = repo.create_user({
+        new_user = await repo.create_user({
             "username": req.username,
             "email": req.email,
             "hashed_password": hashed_password,
@@ -746,7 +733,7 @@ async def admin_create_user(
             },
         })
         client_ip = request.client.host if request.client else "unknown"
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="ADMIN_USER_PROVISIONED",
             severity="INFO",
             details={
@@ -771,7 +758,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
     # Rate limiting: max 30 requests per minute per IP, max 10 per minute per identifier
     if not check_rate_limit(f"login_ip:{client_ip}", max_requests=30, window_seconds=60) or \
        not check_rate_limit(f"login_user:{clean_ident}", max_requests=10, window_seconds=60):
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="LOGIN_RATE_LIMITED",
             severity="WARNING",
             details={"identifier": req.identifier, "ip_address": client_ip},
@@ -784,7 +771,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
     cand_token = request.cookies.get("trusted_device")
     clean_token = str(cand_token).strip().strip('"').strip("'") if cand_token else None
 
-    res = auth.authenticate_credentials(
+    res = await auth.authenticate_credentials(
         req.identifier,
         req.password,
         trusted_device_token=clean_token,
@@ -795,7 +782,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
     if res["status"] == "SUCCESS":
         if res.get("mfa_skipped"):
             trusted_dev = res.get("trusted_device", {})
-            audit_log.record_security_event(
+            await audit_log.record_security_event(
                 event_name="MFA_SKIPPED_TRUSTED_DEVICE",
                 severity="INFO",
                 details={
@@ -808,13 +795,13 @@ async def login(req: LoginRequest, request: Request, response: Response):
             if clean_token:
                 set_trusted_device_cookie(response, request, clean_token)
         else:
-            audit_log.record_auth_success(res["user_id"], "password", ip_address=client_ip)
+            await audit_log.record_auth_success(res["user_id"], "password", ip_address=client_ip)
 
         res.pop("trusted_device_token", None)
         res.pop("_raw_device_token", None)
 
         # Enrich user profile fields for frontend client compatibility
-        user = repo.get_by_id(res["user_id"])
+        user = await repo.get_by_id(res["user_id"])
         if user:
             meta = user.get("metadata", {})
             if isinstance(meta, str):
@@ -843,7 +830,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
         return res
     elif res["status"] == "LOCKED":
         user_id = res.get("user_id")
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="ACCOUNT_LOCKOUT",
             severity="CRITICAL",
             details={
@@ -854,7 +841,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
             },
         )
         if user_id and res.get("newly_locked"):
-            user = repo.get_by_id(user_id)
+            user = await repo.get_by_id(user_id)
             if user:
                 try:
                     email_svc.send_security_alert_email(
@@ -879,7 +866,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
             headers={"Retry-After": str(res.get("lockout_seconds", 900))},
         )
     else:
-        audit_log.record_auth_failure(
+        await audit_log.record_auth_failure(
             identifier=req.identifier,
             reason=res.get("reason", "INVALID_CREDENTIALS"),
             ip_address=client_ip,
@@ -947,7 +934,7 @@ async def refresh_tokens(
     # 1. Check if token family is already revoked
     if family_id and token_svc.is_family_revoked(family_id):
         clear_auth_cookies(response, request)
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="REVOKED_TOKEN_FAMILY_ATTEMPT",
             severity="CRITICAL",
             details={"user_id": user_id, "family_id": family_id, "ip_address": client_ip},
@@ -966,7 +953,7 @@ async def refresh_tokens(
             sess_store.delete_all_user_sessions(user_id)
 
         clear_auth_cookies(response, request)
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="REFRESH_TOKEN_REUSE_DETECTED",
             severity="CRITICAL",
             details={
@@ -977,7 +964,7 @@ async def refresh_tokens(
             },
         )
 
-        user = repo.get_by_id(user_id) if user_id else None
+        user = await repo.get_by_id(user_id) if user_id else None
         if user:
             try:
                 email_svc.send_security_alert_email(
@@ -999,7 +986,7 @@ async def refresh_tokens(
             detail="Security violation: Refresh token reuse detected. All tokens in this family have been revoked.",
         )
 
-    user = repo.get_by_id(user_id)
+    user = await repo.get_by_id(user_id)
     if not user or not user.get("is_active", 1):
         clear_auth_cookies(response, request)
         raise HTTPException(
@@ -1025,7 +1012,7 @@ async def refresh_tokens(
     # Set updated httpOnly cookies
     set_auth_cookies(response, request, new_access_token, new_refresh_token)
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="TOKEN_REFRESHED",
         severity="INFO",
         details={"user_id": user_id, "family_id": family_id, "ip_address": client_ip},
@@ -1063,13 +1050,13 @@ async def logout(
     sessions_deleted = 0
     if req.logout_all_devices:
         sessions_deleted = sess_store.delete_all_user_sessions(user_id)
-        device_trust_svc.revoke_all_trusted_devices(user_id)
+        await device_trust_svc.revoke_all_trusted_devices(user_id)
         clear_trusted_device_cookie(response, request)
     elif req.session_id:
         sess_store.delete_session(req.session_id)
         sessions_deleted = 1
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="USER_LOGGED_OUT",
         severity="INFO",
         details={
@@ -1100,7 +1087,7 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
     # Rate limiting: max 5 forgot-password requests/min per IP, max 3/min per target email
     if not check_rate_limit(f"forgot_pw_ip:{client_ip}", max_requests=5, window_seconds=60) or \
        not check_rate_limit(f"forgot_pw_email:{clean_email}", max_requests=3, window_seconds=60):
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="FORGOT_PASSWORD_RATE_LIMITED",
             severity="WARNING",
             details={"email": clean_email, "ip_address": client_ip},
@@ -1110,9 +1097,9 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
             detail="Too many password reset requests. Please wait a few moments before trying again.",
         )
 
-    user = repo.get_by_identifier(clean_email)
+    user = await repo.get_by_identifier(clean_email)
     if user and user.get("is_active", 1):
-        raw_token = repo.create_password_reset_token(
+        raw_token = await repo.create_password_reset_token(
             user_id=user["id"],
             ip_address=client_ip,
             expires_in_minutes=15,
@@ -1129,7 +1116,7 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
         except Exception as exc:
             logger.warning("Failed to dispatch password reset email: %s", exc)
 
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="PASSWORD_RESET_REQUESTED",
             severity="INFO",
             details={"user_id": user["id"], "email": clean_email, "ip_address": client_ip},
@@ -1147,7 +1134,7 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
 @app.get("/auth/verify-reset-token", tags=["Authentication"])
 async def verify_reset_token(token: str):
     """Verify if a password reset token is valid, active, and unexpired."""
-    record = repo.verify_password_reset_token(token)
+    record = await repo.verify_password_reset_token(token)
     if not record:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1189,9 +1176,9 @@ async def reset_password(req: ResetPasswordRequest, request: Request, response: 
         )
 
     # Verify token before hashing
-    token_record = repo.verify_password_reset_token(req.token)
+    token_record = await repo.verify_password_reset_token(req.token)
     if not token_record:
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="PASSWORD_RESET_FAILED",
             severity="WARNING",
             details={"reason": "INVALID_OR_EXPIRED_TOKEN", "ip_address": client_ip},
@@ -1204,7 +1191,7 @@ async def reset_password(req: ResetPasswordRequest, request: Request, response: 
     user_id = token_record["user_id"]
     new_hashed_password = hasher.hash(req.new_password)
 
-    consumed_user_id = repo.consume_password_reset_token(req.token, new_hashed_password)
+    consumed_user_id = await repo.consume_password_reset_token(req.token, new_hashed_password)
     if not consumed_user_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1213,7 +1200,7 @@ async def reset_password(req: ResetPasswordRequest, request: Request, response: 
 
     # Security posture: Invalidate all existing active sessions, trusted devices, and clear lockout for this user
     sess_store.delete_all_user_sessions(user_id)
-    device_trust_svc.revoke_all_trusted_devices(user_id)
+    await device_trust_svc.revoke_all_trusted_devices(user_id)
     auth.unlock_account(user_id)
     clear_trusted_device_cookie(response, request)
     clear_auth_cookies(response, request)
@@ -1231,7 +1218,7 @@ async def reset_password(req: ResetPasswordRequest, request: Request, response: 
     except Exception as exc:
         logger.warning("Failed to send password reset confirmation alert email: %s", exc)
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="PASSWORD_RESET_SUCCESS",
         severity="INFO",
         details={"user_id": user_id, "ip_address": client_ip},
@@ -1251,7 +1238,7 @@ async def setup_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
     backup_codes = mfa_prov.generate_backup_codes(count=8, code_length=10)
     hashed_backups = [hashlib.sha256(c.encode("utf-8")).hexdigest() for c in backup_codes]
 
-    user = repo.get_by_id(user_id)
+    user = await repo.get_by_id(user_id)
     metadata = user.get("metadata", {})
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
@@ -1259,7 +1246,7 @@ async def setup_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
     # Store as pending secret until verified by 6-digit TOTP input
     metadata["pending_mfa_secret"] = secret
     metadata["pending_backup_codes"] = hashed_backups
-    repo.update_user(user_id, {"metadata": metadata})
+    await repo.update_user(user_id, {"metadata": metadata})
 
     uri = mfa_prov.get_provisioning_uri(user_id, secret, user["email"])
     return {
@@ -1277,7 +1264,7 @@ async def verify_mfa_setup(
 ):
     """Verify the 6-digit TOTP code from authenticator app to finalize and activate 2FA."""
     user_id = current_user["user_id"]
-    user = repo.get_by_id(user_id)
+    user = await repo.get_by_id(user_id)
     metadata = user.get("metadata", {})
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
@@ -1302,9 +1289,9 @@ async def verify_mfa_setup(
     if "pending_backup_codes" in metadata:
         metadata["backup_codes"] = metadata.pop("pending_backup_codes")
     metadata.pop("pending_mfa_secret", None)
-    repo.update_user(user_id, {"metadata": metadata})
+    await repo.update_user(user_id, {"metadata": metadata})
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="MFA_ACTIVATED",
         severity="INFO",
         details={"user_id": user_id},
@@ -1324,7 +1311,7 @@ async def disable_mfa(
 ):
     """Disable two-factor authentication for the authenticated user."""
     user_id = current_user["user_id"]
-    user = repo.get_by_id(user_id)
+    user = await repo.get_by_id(user_id)
     metadata = user.get("metadata", {})
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
@@ -1334,13 +1321,13 @@ async def disable_mfa(
     metadata.pop("backup_codes", None)
     metadata.pop("pending_mfa_secret", None)
     metadata.pop("pending_backup_codes", None)
-    repo.update_user(user_id, {"metadata": metadata})
+    await repo.update_user(user_id, {"metadata": metadata})
 
     # Revoke all trusted devices when MFA is disabled
-    device_trust_svc.revoke_all_trusted_devices(user_id)
+    await device_trust_svc.revoke_all_trusted_devices(user_id)
     clear_trusted_device_cookie(response, request)
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="MFA_DISABLED",
         severity="WARNING",
         details={"user_id": user_id},
@@ -1356,7 +1343,7 @@ async def complete_mfa(req: MFACompleteRequest, request: Request, response: Resp
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "")
 
-    res = auth.complete_mfa_challenge(
+    res = await auth.complete_mfa_challenge(
         user_id=req.user_id,
         challenge_id=req.challenge_id,
         response_code=req.code,
@@ -1366,14 +1353,14 @@ async def complete_mfa(req: MFACompleteRequest, request: Request, response: Resp
     )
 
     if res["status"] == "SUCCESS":
-        audit_log.record_auth_success(req.user_id, "mfa_challenge", ip_address=client_ip)
+        await audit_log.record_auth_success(req.user_id, "mfa_challenge", ip_address=client_ip)
 
         raw_dev_token = res.pop("trusted_device_token", None) or res.pop("_raw_device_token", None)
         if raw_dev_token:
             dev_rec = res.get("trusted_device", {})
             set_trusted_device_cookie(response, request, raw_dev_token)
 
-            audit_log.record_security_event(
+            await audit_log.record_security_event(
                 event_name="DEVICE_TRUSTED",
                 severity="INFO",
                 details={
@@ -1385,7 +1372,7 @@ async def complete_mfa(req: MFACompleteRequest, request: Request, response: Resp
             )
 
         # Enrich user metadata in response
-        user = repo.get_by_id(req.user_id)
+        user = await repo.get_by_id(req.user_id)
         if user:
             meta = user.get("metadata", {})
             if isinstance(meta, str):
@@ -1409,7 +1396,7 @@ async def complete_mfa(req: MFACompleteRequest, request: Request, response: Resp
 
         return res
     else:
-        audit_log.record_auth_failure(
+        await audit_log.record_auth_failure(
             identifier=req.user_id,
             reason=res.get("reason", "INVALID_MFA_CODE"),
             ip_address=client_ip,
@@ -1430,7 +1417,7 @@ async def list_my_trusted_devices(
     current_token = request.cookies.get("trusted_device")
     if current_token:
         current_token = str(current_token).strip().strip('"').strip("'")
-    devices = device_trust_svc.list_trusted_devices(user_id, current_token=current_token)
+    devices = await device_trust_svc.list_trusted_devices(user_id, current_token=current_token)
     return {
         "status": "SUCCESS",
         "devices": devices,
@@ -1454,11 +1441,11 @@ async def revoke_my_trusted_device(
     is_current = False
     if current_token:
         clean_curr = str(current_token).strip().strip('"').strip("'")
-        verified_curr = device_trust_svc.verify_trusted_device(user_id, clean_curr)
+        verified_curr = await device_trust_svc.verify_trusted_device(user_id, clean_curr)
         if verified_curr and verified_curr.get("id") == device_id.strip():
             is_current = True
 
-    revoked = device_trust_svc.revoke_trusted_device(user_id, device_id)
+    revoked = await device_trust_svc.revoke_trusted_device(user_id, device_id)
     if not revoked:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trusted device not found.")
 
@@ -1466,7 +1453,7 @@ async def revoke_my_trusted_device(
     if is_current or current_token:
         clear_trusted_device_cookie(response, request)
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="DEVICE_TRUST_REVOKED",
         severity="INFO",
         details={"user_id": user_id, "device_id": device_id, "is_current": is_current, "ip_address": client_ip},
@@ -1483,10 +1470,10 @@ async def revoke_all_my_trusted_devices(
     """Revoke all trusted devices for the authenticated user."""
     user_id = current_user["user_id"]
     client_ip = request.client.host if request.client else "unknown"
-    count = device_trust_svc.revoke_all_trusted_devices(user_id)
+    count = await device_trust_svc.revoke_all_trusted_devices(user_id)
     clear_trusted_device_cookie(response, request)
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="ALL_DEVICES_TRUST_REVOKED",
         severity="INFO",
         details={"user_id": user_id, "devices_revoked": count, "ip_address": client_ip},
@@ -1497,7 +1484,7 @@ async def revoke_all_my_trusted_devices(
 @app.get("/auth/me", tags=["User Context"])
 async def get_my_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Retrieve identity context of the authenticated user."""
-    user = repo.get_by_id(current_user["user_id"])
+    user = await repo.get_by_id(current_user["user_id"])
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
@@ -1560,7 +1547,7 @@ async def get_protected_document(
         "required_clearance": 2,
     }
 
-    has_access = perm_eval.is_resource_accessible(
+    has_access = await perm_eval.is_resource_accessible(
         subject_id=user_id,
         action="read",
         resource_type="documents",
@@ -1569,7 +1556,7 @@ async def get_protected_document(
     )
 
     if not has_access:
-        audit_log.record_access_denial(
+        await audit_log.record_access_denial(
             subject_id=user_id,
             action="read",
             resource=f"documents/{doc_id}",
@@ -1598,8 +1585,8 @@ async def get_audit_trail(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Query security audit telemetry records. Requires 'admin' or 'superadmin' role."""
-    if not perm_eval.has_role(current_user["user_id"], "admin"):
-        audit_log.record_access_denial(
+    if not await perm_eval.has_role(current_user["user_id"], "admin"):
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="read",
             resource="audit_logs",
@@ -1616,11 +1603,11 @@ async def get_audit_trail(
     if severity:
         filters["severity"] = severity.upper()
     if workspace_id:
-        filters["workspace_id"] = ws_repo._resolve_ws_id(workspace_id)
+        filters["workspace_id"] = await ws_repo._resolve_ws_id(workspace_id)
     if subject_id:
         filters["subject_id"] = subject_id
 
-    logs = audit_log.query_events(filters, limit=min(limit, 200), offset=offset)
+    logs = await audit_log.query_events(filters, limit=min(limit, 200), offset=offset)
     return {
         "status": "SUCCESS",
         "count": len(logs),
@@ -1652,7 +1639,7 @@ def resolve_or_create_oauth_user(
     display_name = profile.get("name")
     avatar_url = profile.get("picture")
 
-    user = repo.get_by_identifier(email)
+    user = await repo.get_by_identifier(email)
     if user:
         if not user.get("is_active", 1):
             raise HTTPException(
@@ -1685,16 +1672,16 @@ def resolve_or_create_oauth_user(
 
         curr_username = user.get("username", "")
         if clean_preferred and len(clean_preferred) >= 3 and (curr_username == email.split("@")[0].lower() or curr_username.startswith("user_")):
-            existing_target = repo.get_by_identifier(clean_preferred)
+            existing_target = await repo.get_by_identifier(clean_preferred)
             if not existing_target or existing_target["id"] == user["id"]:
                 update_fields["username"] = clean_preferred
 
-        repo.update_user(user["id"], update_fields)
-        user = repo.get_by_id(user["id"])
+        await repo.update_user(user["id"], update_fields)
+        user = await repo.get_by_id(user["id"])
 
         # Synchronize display name & user_id into workspace_members
         if display_name:
-            with ws_repo._get_connection() as conn:
+            with await ws_repo._get_connection() as conn:
                 conn.execute(
                     "UPDATE workspace_members SET user_id = ?, name = COALESCE(?, name) WHERE (user_id = ? OR LOWER(email) = LOWER(?))",
                     (user["id"], display_name, user["id"], email.lower()),
@@ -1716,13 +1703,13 @@ def resolve_or_create_oauth_user(
         if len(clean_username) < 3:
             clean_username = f"user_{secrets.token_hex(4)}"
 
-        if repo.get_by_identifier(clean_username):
+        if await repo.get_by_identifier(clean_username):
             clean_username = f"{clean_username}_{secrets.token_hex(3)}"
 
         dummy_password = secrets.token_urlsafe(32)
         hashed_pw = hasher.hash(dummy_password)
 
-        user = repo.create_user({
+        user = await repo.create_user({
             "username": clean_username,
             "email": email,
             "hashed_password": hashed_pw,
@@ -1736,7 +1723,7 @@ def resolve_or_create_oauth_user(
             },
         })
 
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="USER_OAUTH_PROVISIONED",
             severity="INFO",
             details={
@@ -1764,7 +1751,7 @@ def resolve_or_create_oauth_user(
             clean_token = str(cand_token).strip().strip('"').strip("'")
 
         if clean_token and device_trust_svc:
-            trusted_dev = device_trust_svc.verify_trusted_device(
+            trusted_dev = await device_trust_svc.verify_trusted_device(
                 user_id=user["id"],
                 raw_token=clean_token,
                 user_agent=user_agent,
@@ -1774,7 +1761,7 @@ def resolve_or_create_oauth_user(
                 mfa_skipped = True
 
         if not mfa_skipped:
-            challenge = auth.initiate_mfa_challenge(user["id"], challenge_type="totp")
+            challenge = await auth.initiate_mfa_challenge(user["id"], challenge_type="totp")
             return {
                 "status": "MFA_REQUIRED",
                 "user_id": user["id"],
@@ -1797,7 +1784,7 @@ def resolve_or_create_oauth_user(
     safe_metadata.pop("backup_codes", None)
 
     if mfa_skipped:
-        audit_log.record_security_event(
+        await audit_log.record_security_event(
             event_name="MFA_SKIPPED_TRUSTED_DEVICE",
             severity="INFO",
             details={
@@ -1807,11 +1794,11 @@ def resolve_or_create_oauth_user(
                 "ip_address": client_ip,
             },
         )
-        audit_log.record_auth_success(user["id"], f"oauth_{provider}+trusted_device", ip_address=client_ip)
+        await audit_log.record_auth_success(user["id"], f"oauth_{provider}+trusted_device", ip_address=client_ip)
         if response and request and clean_token:
             set_trusted_device_cookie(response, request, clean_token)
     else:
-        audit_log.record_auth_success(user["id"], f"oauth_{provider}", ip_address=client_ip)
+        await audit_log.record_auth_success(user["id"], f"oauth_{provider}", ip_address=client_ip)
 
     user_name = safe_metadata.get("name") or display_name or user["username"]
     user_avatar = safe_metadata.get("avatar_url") or avatar_url
@@ -1940,7 +1927,7 @@ async def oauth_callback(
             code_verifier=state_data.get("code_verifier"),
         )
     except Exception as exc:
-        audit_log.record_auth_failure(
+        await audit_log.record_auth_failure(
             identifier=f"oauth_{provider}",
             reason=str(exc),
             ip_address=client_ip,
@@ -1986,7 +1973,7 @@ async def oauth_exchange_code(
             code_verifier=req.code_verifier,
         )
     except Exception as exc:
-        audit_log.record_auth_failure(
+        await audit_log.record_auth_failure(
             identifier=f"oauth_{provider}",
             reason=str(exc),
             ip_address=client_ip,
@@ -2017,7 +2004,7 @@ async def get_tasks(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Retrieve workspace sprint tasks with optional filtering."""
-    tasks = task_repo.list_tasks(
+    tasks = await task_repo.list_tasks(
         workspace_id=workspace_id,
         status=status,
         priority=priority,
@@ -2032,7 +2019,7 @@ async def get_single_task(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Retrieve a single task by ID. Verifies active membership in the task's workspace."""
-    task = task_repo.get_task(task_id)
+    task = await task_repo.get_task(task_id)
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2043,10 +2030,10 @@ async def get_single_task(
     user_id = current_user["user_id"]
 
     # Verify workspace membership clearance if not superadmin
-    is_superadmin = perm_eval.has_role(user_id, "superadmin")
+    is_superadmin = await perm_eval.has_role(user_id, "superadmin")
     if not is_superadmin and ws_id != "ws_default":
-        user = repo.get_by_id(user_id)
-        member = ws_repo.get_member(ws_id, user_id=user_id, email=user.get("email") if user else None)
+        user = await repo.get_by_id(user_id)
+        member = await ws_repo.get_member(ws_id, user_id=user_id, email=user.get("email") if user else None)
         if not member or member.get("status") != "active":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2065,8 +2052,8 @@ async def create_task(
     ws_id = req.workspace_id or "ws_default"
 
     # Enforce RBAC: only editors, admins, and superadmins can create tasks
-    if not perm_eval.has_role(current_user["user_id"], "editor", scope=ws_id):
-        audit_log.record_access_denial(
+    if not await perm_eval.has_role(current_user["user_id"], "editor", scope=ws_id):
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="create",
             resource=f"workspaces/{ws_id}/tasks",
@@ -2077,7 +2064,7 @@ async def create_task(
             detail="Access denied: Editor, Admin, or Superadmin role required to create tasks.",
         )
 
-    user = repo.get_by_id(current_user["user_id"])
+    user = await repo.get_by_id(current_user["user_id"])
     creator_email = user["email"] if user else current_user["user_id"]
     assigned_by_name = user["username"] if user else "Workspace Admin"
 
@@ -2091,7 +2078,7 @@ async def create_task(
     primary_email = req.assignee_email or (assignees_list[0]["email"] if assignees_list else creator_email)
     primary_name = req.assignee_name or (assignees_list[0]["name"] if assignees_list else (user["username"] if user else "Member"))
 
-    new_task = task_repo.create_task({
+    new_task = await task_repo.create_task({
         "workspace_id": ws_id,
         "title": req.title.strip(),
         "description": (req.description or "").strip(),
@@ -2122,7 +2109,7 @@ async def create_task(
                 task_id=new_task["id"],
             )
             # In-App Notification Push (Phase 4.2 & Deep-Linking)
-            assigned_user = repo.get_by_identifier(target_email)
+            assigned_user = await repo.get_by_identifier(target_email)
             if assigned_user:
                 await create_and_push_notification(
                     user_id=assigned_user["id"],
@@ -2160,7 +2147,7 @@ async def update_task(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Update task card status (Kanban movement), priority, deadline, or assignees. Requires Editor, Admin, or Superadmin role."""
-    existing = task_repo.get_task(task_id)
+    existing = await task_repo.get_task(task_id)
     if not existing:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2170,8 +2157,8 @@ async def update_task(
     ws_id = existing.get("workspace_id") or "ws_default"
 
     # Enforce RBAC: only editors, admins, and superadmins can modify tasks
-    if not perm_eval.has_role(current_user["user_id"], "editor", scope=ws_id):
-        audit_log.record_access_denial(
+    if not await perm_eval.has_role(current_user["user_id"], "editor", scope=ws_id):
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="update",
             resource=f"tasks/{task_id}",
@@ -2183,10 +2170,10 @@ async def update_task(
         )
 
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
-    updated = task_repo.update_task(task_id, updates)
+    updated = await task_repo.update_task(task_id, updates)
 
     # If assignees were updated, notify any newly added assignees
-    user = repo.get_by_id(current_user["user_id"])
+    user = await repo.get_by_id(current_user["user_id"])
     assigned_by_name = user["username"] if user else "Workspace Admin"
 
     existing_assignees = set()
@@ -2223,7 +2210,7 @@ async def update_task(
                 task_id=task_id,
             )
             # In-App Notification Push (Phase 4.2 & Deep-Linking)
-            assigned_user = repo.get_by_identifier(target_email)
+            assigned_user = await repo.get_by_identifier(target_email)
             if assigned_user:
                 await create_and_push_notification(
                     user_id=assigned_user["id"],
@@ -2262,25 +2249,25 @@ async def delete_task(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Delete a task card from the workspace. Requires task creator (with editor role), workspace admin, or superadmin role."""
-    existing_task = task_repo.get_task(task_id)
+    existing_task = await task_repo.get_task(task_id)
     if not existing_task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found.",
         )
 
-    user = repo.get_by_id(current_user["user_id"])
+    user = await repo.get_by_id(current_user["user_id"])
     caller_email = user["email"].strip().lower() if user and user.get("email") else ""
     task_creator = (existing_task.get("created_by") or "").strip().lower()
     ws_id = existing_task.get("workspace_id") or "ws_default"
 
     is_creator = bool(caller_email and caller_email == task_creator)
-    is_editor = perm_eval.has_role(current_user["user_id"], "editor", scope=ws_id)
-    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
-    is_superadmin = perm_eval.has_role(current_user["user_id"], "superadmin")
+    is_editor = await perm_eval.has_role(current_user["user_id"], "editor", scope=ws_id)
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
+    is_superadmin = await perm_eval.has_role(current_user["user_id"], "superadmin")
 
     if not (is_superadmin or is_admin or (is_creator and is_editor)):
-        audit_log.record_access_denial(
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="delete",
             resource=f"tasks/{task_id}",
@@ -2291,7 +2278,7 @@ async def delete_task(
             detail="Access denied: Workspace admin, superadmin, or task creator (with editor role) required to delete this task.",
         )
 
-    deleted = task_repo.delete_task(task_id)
+    deleted = await task_repo.delete_task(task_id)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2350,15 +2337,15 @@ async def workspace_websocket_endpoint(
         return
 
     user_id = payload.get("sub")
-    user = repo.get_by_id(user_id)
+    user = await repo.get_by_id(user_id)
     if not user or not user.get("is_active", 1):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="User inactive or not found")
         return
 
     # Verify workspace membership clearance if not superadmin
-    is_superadmin = perm_eval.has_role(user_id, "superadmin")
+    is_superadmin = await perm_eval.has_role(user_id, "superadmin")
     if not is_superadmin and workspace_id != "ws_default":
-        member = ws_repo.get_member(workspace_id, user_id=user_id, email=user.get("email"))
+        member = await ws_repo.get_member(workspace_id, user_id=user_id, email=user.get("email"))
         if not member:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Not a member of this workspace")
             return
@@ -2415,22 +2402,46 @@ async def get_user_notifications(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Retrieve in-app notifications and unread count for current authenticated user."""
-    import sqlite3
     user_id = current_user["user_id"]
-    with sqlite3.connect("DATABASE.db", timeout=10.0) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        unread_row = cursor.execute(
-            "SELECT COUNT(*) as count FROM notifications WHERE user_id = ? AND is_read = 0",
-            (user_id,),
-        ).fetchone()
-        unread_count = unread_row["count"] if unread_row else 0
+    try:
+        user_uuid = uuid.UUID(str(user_id).strip())
+    except Exception:
+        return {"status": "SUCCESS", "unread_count": 0, "notifications": []}
 
-        rows = cursor.execute(
-            "SELECT * FROM notifications WHERE user_id = ? ORDER BY datetime(created_at) DESC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
-        ).fetchall()
-        notifications = [dict(r) for r in rows]
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        unread_res = await session.execute(
+            select(func.count(Notification.id)).where(
+                Notification.user_id == user_uuid, Notification.is_read == False
+            )
+        )
+        unread_count = unread_res.scalar_one() or 0
+
+        stmt = (
+            select(Notification)
+            .where(Notification.user_id == user_uuid)
+            .order_by(Notification.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        rows_res = await session.execute(stmt)
+        rows = rows_res.scalars().all()
+
+        notifications = [
+            {
+                "id": str(n.id),
+                "user_id": str(n.user_id),
+                "workspace_id": str(n.workspace_id) if n.workspace_id else None,
+                "task_id": str(n.task_id) if n.task_id else None,
+                "type": n.type,
+                "title": n.title,
+                "message": n.message,
+                "link": n.link,
+                "is_read": 1 if n.is_read else 0,
+                "created_at": n.created_at.isoformat() if n.created_at else "",
+            }
+            for n in rows
+        ]
 
     return {
         "status": "SUCCESS",
@@ -2445,16 +2456,25 @@ async def mark_notification_as_read(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Mark a specific notification as read."""
-    import sqlite3
     user_id = current_user["user_id"]
-    with sqlite3.connect("DATABASE.db", timeout=10.0) as conn:
-        cursor = conn.execute(
-            "UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?",
-            (notification_id, user_id),
+    try:
+        user_uuid = uuid.UUID(str(user_id).strip())
+        notif_uuid = uuid.UUID(str(notification_id).strip())
+    except Exception:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        stmt = (
+            sql_update(Notification)
+            .where(Notification.id == notif_uuid, Notification.user_id == user_uuid)
+            .values(is_read=True)
         )
-        conn.commit()
-        if cursor.rowcount == 0:
+        res = await session.execute(stmt)
+        await session.commit()
+        if (res.rowcount or 0) == 0:
             raise HTTPException(status_code=404, detail="Notification not found.")
+
     return {"status": "SUCCESS", "id": notification_id, "is_read": 1}
 
 
@@ -2463,14 +2483,22 @@ async def mark_all_notifications_as_read(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Mark all notifications for the authenticated user as read."""
-    import sqlite3
     user_id = current_user["user_id"]
-    with sqlite3.connect("DATABASE.db", timeout=10.0) as conn:
-        conn.execute(
-            "UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
-            (user_id,),
+    try:
+        user_uuid = uuid.UUID(str(user_id).strip())
+    except Exception:
+        return {"status": "SUCCESS", "message": "All notifications marked as read."}
+
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        stmt = (
+            sql_update(Notification)
+            .where(Notification.user_id == user_uuid, Notification.is_read == False)
+            .values(is_read=True)
         )
-        conn.commit()
+        await session.execute(stmt)
+        await session.commit()
+
     return {"status": "SUCCESS", "message": "All notifications marked as read."}
 
 
@@ -2483,7 +2511,7 @@ async def list_team_members(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """List all workspace members and pending email invitations."""
-    members = task_repo.list_team_members()
+    members = await task_repo.list_team_members()
     return {"status": "SUCCESS", "count": len(members), "members": members}
 
 
@@ -2493,8 +2521,8 @@ async def invite_team_member(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Invite a new colleague to the team workspace with email notification. Requires 'admin' role."""
-    if not perm_eval.has_role(current_user["user_id"], "admin"):
-        audit_log.record_access_denial(
+    if not await perm_eval.has_role(current_user["user_id"], "admin"):
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="invite",
             resource="team_members",
@@ -2505,10 +2533,10 @@ async def invite_team_member(
             detail="Access denied: Admin role required to invite team members.",
         )
 
-    admin_user = repo.get_by_id(current_user["user_id"])
+    admin_user = await repo.get_by_id(current_user["user_id"])
     invited_by_name = admin_user["username"] if admin_user else "Admin"
 
-    invitation = task_repo.invite_member(
+    invitation = await task_repo.invite_member(
         email=req.email,
         name=req.name or req.email.split("@")[0],
         role=req.role or "viewer",
@@ -2527,7 +2555,7 @@ async def invite_team_member(
         invite_token=invitation["invite_token"],
     )
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="TEAM_MEMBER_INVITED",
         severity="INFO",
         details={
@@ -2551,7 +2579,7 @@ async def invite_team_member(
 @app.get("/team/invite/verify", tags=["Team Management"])
 async def verify_team_invitation(token: str):
     """Verify an invitation token for a new user landing on the accept-invite page."""
-    invite = task_repo.get_invitation_by_token(token)
+    invite = await task_repo.get_invitation_by_token(token)
     if not invite:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2582,7 +2610,7 @@ async def accept_team_invitation(
     response: Response,
 ):
     """Accept an invitation, register credentials, activate workspace clearance, and log in."""
-    invite = task_repo.get_invitation_by_token(req.token)
+    invite = await task_repo.get_invitation_by_token(req.token)
     if not invite:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2600,7 +2628,7 @@ async def accept_team_invitation(
     clearance_levels = {"admin": 3, "editor": 2, "viewer": 1}
     clearance = clearance_levels.get(invite["role"], 1)
 
-    existing_user = repo.get_by_identifier(email)
+    existing_user = await repo.get_by_identifier(email)
     hashed_pw = hasher.hash(req.password)
 
     if existing_user:
@@ -2626,21 +2654,21 @@ async def accept_team_invitation(
         if req.name:
             metadata["name"] = req.name.strip()
 
-        repo.update_user(user_id, {
+        await repo.update_user(user_id, {
             "hashed_password": hashed_pw,
             "roles": roles,
             "metadata": metadata,
             "is_active": 1,
         })
-        user = repo.get_by_id(user_id)
+        user = await repo.get_by_id(user_id)
     else:
         # Provision new user account
         base_username = email.split("@")[0].lower()
         clean_username = "".join(c for c in base_username if c.isalnum() or c in ("_", "-"))
-        if len(clean_username) < 3 or repo.get_by_identifier(clean_username):
+        if len(clean_username) < 3 or await repo.get_by_identifier(clean_username):
             clean_username = f"{clean_username}_{secrets.token_hex(3)}"
 
-        user = repo.create_user({
+        user = await repo.create_user({
             "username": clean_username,
             "email": email,
             "hashed_password": hashed_pw,
@@ -2655,7 +2683,7 @@ async def accept_team_invitation(
         roles = [invite["role"]]
 
     # Mark invitation as accepted in SQLite
-    task_repo.accept_invitation(req.token)
+    await task_repo.accept_invitation(req.token)
 
     # Generate JWT tokens and active session
     access_token = token_svc.create_access_token(user_id, claims={"roles": roles})
@@ -2674,7 +2702,7 @@ async def accept_team_invitation(
     safe_meta.pop("mfa_secret", None)
     safe_meta.pop("backup_codes", None)
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="TEAM_INVITE_ACCEPTED",
         severity="INFO",
         details={
@@ -2710,7 +2738,7 @@ async def remove_team_member(
 ):
     """Remove a member, delete their registered user account, and revoke sessions. Requires admin role."""
     caller_id = current_user["user_id"]
-    if not perm_eval.has_role(caller_id, "admin"):
+    if not await perm_eval.has_role(caller_id, "admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin role required to remove team members.",
@@ -2719,7 +2747,7 @@ async def remove_team_member(
     clean_email = member_email.strip().lower()
 
     # 1. Check if user is in users table
-    user = repo.get_by_identifier(clean_email)
+    user = await repo.get_by_identifier(clean_email)
     if user:
         if user["id"] == caller_id:
             raise HTTPException(
@@ -2728,12 +2756,12 @@ async def remove_team_member(
             )
         # Invalidate sessions & delete user
         sess_store.delete_all_user_sessions(user["id"])
-        repo.delete_user(user["id"])
+        await repo.delete_user(user["id"])
 
     # 2. Also remove from team_members table
-    task_repo.remove_member(clean_email)
+    await task_repo.remove_member(clean_email)
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="TEAM_MEMBER_REMOVED",
         severity="WARNING",
         details={
@@ -2759,12 +2787,12 @@ async def create_workspace(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Create a new team workspace. The creator is automatically assigned as the Workspace Admin."""
-    user = repo.get_by_id(current_user["user_id"])
+    user = await repo.get_by_id(current_user["user_id"])
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
     try:
-        new_ws = ws_repo.create_workspace(
+        new_ws = await ws_repo.create_workspace(
             name=req.name,
             created_by=current_user["user_id"],
             slug=req.slug,
@@ -2773,7 +2801,7 @@ async def create_workspace(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="WORKSPACE_CREATED",
         severity="INFO",
         details={
@@ -2791,14 +2819,14 @@ async def list_user_workspaces(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """List all workspaces the authenticated user belongs to (or all workspaces if Superadmin)."""
-    user = repo.get_by_id(current_user["user_id"])
+    user = await repo.get_by_id(current_user["user_id"])
     user_email = user["email"] if user else None
 
-    is_superadmin = perm_eval.has_role(current_user["user_id"], "superadmin")
+    is_superadmin = await perm_eval.has_role(current_user["user_id"], "superadmin")
     if is_superadmin:
-        workspaces = ws_repo.list_all_workspaces()
+        workspaces = await ws_repo.list_all_workspaces()
     else:
-        workspaces = ws_repo.list_workspaces_for_user(
+        workspaces = await ws_repo.list_workspaces_for_user(
             user_id=current_user["user_id"],
             email=user_email,
         )
@@ -2812,9 +2840,9 @@ async def get_workspace_details(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Retrieve workspace profile, metadata, and member metrics."""
-    is_authorized = perm_eval.has_role(current_user["user_id"], "viewer", scope=workspace_id) or perm_eval.has_role(current_user["user_id"], "superadmin")
+    is_authorized = await perm_eval.has_role(current_user["user_id"], "viewer", scope=workspace_id) or await perm_eval.has_role(current_user["user_id"], "superadmin")
     if not is_authorized:
-        audit_log.record_access_denial(
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="view",
             resource=f"workspaces/{workspace_id}",
@@ -2825,11 +2853,11 @@ async def get_workspace_details(
             detail="Access denied: You are not a member of this workspace.",
         )
 
-    ws = ws_repo.get_workspace(workspace_id)
+    ws = await ws_repo.get_workspace(workspace_id)
     if not ws:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found.")
 
-    metrics = ws_repo.count_members(workspace_id)
+    metrics = await ws_repo.count_members(workspace_id)
     return {"status": "SUCCESS", "workspace": ws, "metrics": metrics}
 
 
@@ -2840,9 +2868,9 @@ async def update_workspace(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Update workspace name, slug, or description. Requires Workspace Admin or Superadmin role."""
-    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
     if not is_admin:
-        audit_log.record_access_denial(
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="update",
             resource=f"workspaces/{workspace_id}",
@@ -2855,14 +2883,14 @@ async def update_workspace(
 
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     try:
-        updated = ws_repo.update_workspace(workspace_id, updates)
+        updated = await ws_repo.update_workspace(workspace_id, updates)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found.")
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="WORKSPACE_UPDATED",
         severity="INFO",
         details={"workspace_id": workspace_id, "updates": updates, "updated_by": current_user["user_id"]},
@@ -2876,9 +2904,9 @@ async def delete_workspace(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Delete a workspace and cascade delete all its tasks and member associations. Requires Workspace Admin or Superadmin."""
-    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
     if not is_admin:
-        audit_log.record_access_denial(
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="delete",
             resource=f"workspaces/{workspace_id}",
@@ -2890,14 +2918,14 @@ async def delete_workspace(
         )
 
     try:
-        deleted = ws_repo.delete_workspace(workspace_id)
+        deleted = await ws_repo.delete_workspace(workspace_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found.")
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="WORKSPACE_DELETED",
         severity="WARNING",
         details={"workspace_id": workspace_id, "deleted_by": current_user["user_id"]},
@@ -2916,14 +2944,14 @@ async def list_workspace_members(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """List all members and pending invitations for a specific workspace."""
-    is_authorized = perm_eval.has_role(current_user["user_id"], "viewer", scope=workspace_id) or perm_eval.has_role(current_user["user_id"], "superadmin")
+    is_authorized = await perm_eval.has_role(current_user["user_id"], "viewer", scope=workspace_id) or await perm_eval.has_role(current_user["user_id"], "superadmin")
     if not is_authorized:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: You are not a member of this workspace.",
         )
 
-    members = ws_repo.list_members(workspace_id=workspace_id, status=status_filter)
+    members = await ws_repo.list_members(workspace_id=workspace_id, status=status_filter)
     return {"status": "SUCCESS", "count": len(members), "members": members}
 
 
@@ -2934,9 +2962,9 @@ async def invite_workspace_member(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Invite a new colleague to a specific workspace with a defined role. Requires Workspace Admin or Superadmin."""
-    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
     if not is_admin:
-        audit_log.record_access_denial(
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="invite",
             resource=f"workspaces/{workspace_id}/members",
@@ -2947,11 +2975,11 @@ async def invite_workspace_member(
             detail="Access denied: Admin role required to invite workspace members.",
         )
 
-    admin_user = repo.get_by_id(current_user["user_id"])
+    admin_user = await repo.get_by_id(current_user["user_id"])
     invited_by_name = admin_user["username"] if admin_user else "Workspace Admin"
 
     try:
-        invitation = ws_repo.invite_member(
+        invitation = await ws_repo.invite_member(
             workspace_id=workspace_id,
             email=req.email,
             name=req.name,
@@ -2973,7 +3001,7 @@ async def invite_workspace_member(
         workspace_name=invitation.get("workspace_name", "TaskTracker Workspace"),
     )
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="WORKSPACE_MEMBER_INVITED",
         severity="INFO",
         details={
@@ -3004,18 +3032,18 @@ async def update_workspace_member_role(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Change a colleague's clearance role within a specific workspace. Requires Workspace Admin or Superadmin."""
-    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
     if not is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: Admin role required to update member roles.",
         )
 
-    updated = ws_repo.update_member_role(workspace_id, user_id_or_email, req.role)
+    updated = await ws_repo.update_member_role(workspace_id, user_id_or_email, req.role)
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found in this workspace.")
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="WORKSPACE_MEMBER_ROLE_UPDATED",
         severity="INFO",
         details={
@@ -3035,7 +3063,7 @@ async def remove_workspace_member(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Remove a colleague from a specific workspace or cancel their invitation. Requires Workspace Admin or Superadmin."""
-    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
     if not is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -3043,7 +3071,7 @@ async def remove_workspace_member(
         )
 
     # Check for self-removal
-    curr_user = repo.get_by_id(current_user["user_id"])
+    curr_user = await repo.get_by_id(current_user["user_id"])
     curr_email = curr_user["email"].lower() if curr_user else ""
     from urllib.parse import unquote
     clean_target = unquote(user_id_or_email).strip().lower()
@@ -3054,11 +3082,11 @@ async def remove_workspace_member(
             detail="Cannot remove your own administrator membership from the workspace.",
         )
 
-    removed = ws_repo.remove_member(workspace_id, user_id_or_email)
+    removed = await ws_repo.remove_member(workspace_id, user_id_or_email)
     if not removed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found in this workspace.")
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="WORKSPACE_MEMBER_REMOVED",
         severity="WARNING",
         details={
@@ -3073,7 +3101,7 @@ async def remove_workspace_member(
 @app.get("/workspaces/invite/verify", tags=["Workspaces"])
 async def verify_workspace_invitation(token: str):
     """Verify an invitation token when a user lands on the accept-invite onboarding page."""
-    invite = ws_repo.get_invitation_by_token(token)
+    invite = await ws_repo.get_invitation_by_token(token)
     if not invite:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -3105,7 +3133,7 @@ async def accept_workspace_invitation(
     request: Request,
 ):
     """Accept a workspace invitation, register credentials, activate workspace membership, and log in."""
-    invite = ws_repo.get_invitation_by_token(req.token)
+    invite = await ws_repo.get_invitation_by_token(req.token)
     if not invite:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -3124,7 +3152,7 @@ async def accept_workspace_invitation(
     clearance_levels = {"admin": 3, "editor": 2, "viewer": 1}
     clearance = clearance_levels.get(invite["role"], 1)
 
-    existing_user = repo.get_by_identifier(email)
+    existing_user = await repo.get_by_identifier(email)
     hashed_pw = hasher.hash(req.password)
 
     if existing_user:
@@ -3150,20 +3178,20 @@ async def accept_workspace_invitation(
         if not existing_name and req.name and req.name.strip():
             metadata["name"] = req.name.strip()
 
-        repo.update_user(user_id, {
+        await repo.update_user(user_id, {
             "hashed_password": hashed_pw,
             "roles": roles,
             "metadata": metadata,
             "is_active": 1,
         })
-        user = repo.get_by_id(user_id)
+        user = await repo.get_by_id(user_id)
     else:
         base_username = email.split("@")[0].lower()
         clean_username = "".join(c for c in base_username if c.isalnum() or c in ("_", "-"))
-        if len(clean_username) < 3 or repo.get_by_identifier(clean_username):
+        if len(clean_username) < 3 or await repo.get_by_identifier(clean_username):
             clean_username = f"{clean_username}_{secrets.token_hex(3)}"
 
-        user = repo.create_user({
+        user = await repo.create_user({
             "username": clean_username,
             "email": email,
             "hashed_password": hashed_pw,
@@ -3187,7 +3215,7 @@ async def accept_workspace_invitation(
     sync_name = req.name.strip() if req.name else (user_meta.get("name") or invite.get("name") or user.get("username"))
 
     # Mark invitation as accepted in SQLite workspace_members and sync name
-    accepted = ws_repo.accept_invitation(req.token, user_id=user_id, name=sync_name)
+    accepted = await ws_repo.accept_invitation(req.token, user_id=user_id, name=sync_name)
     if not accepted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -3211,7 +3239,7 @@ async def accept_workspace_invitation(
     safe_meta.pop("mfa_secret", None)
     safe_meta.pop("backup_codes", None)
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="WORKSPACE_INVITE_ACCEPTED",
         severity="INFO",
         details={
@@ -3252,16 +3280,16 @@ async def switch_active_workspace(
     """Switch the authenticated user's active tenant workspace context, returning refreshed scoped JWT tokens."""
     target_ws_id = req.workspace_id.strip()
     user_id = current_user["user_id"]
-    user = repo.get_by_id(user_id)
+    user = await repo.get_by_id(user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
-    is_superadmin = perm_eval.has_role(user_id, "superadmin")
-    ws = ws_repo.get_workspace(target_ws_id)
+    is_superadmin = await perm_eval.has_role(user_id, "superadmin")
+    ws = await ws_repo.get_workspace(target_ws_id)
     if not ws:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target workspace not found.")
 
-    member = ws_repo.get_member(target_ws_id, user_id=user_id, email=user.get("email"))
+    member = await ws_repo.get_member(target_ws_id, user_id=user_id, email=user.get("email"))
     if not member and not is_superadmin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -3282,7 +3310,7 @@ async def switch_active_workspace(
     # Set rotated httpOnly cookies for the new workspace scope
     set_auth_cookies(response, request, access_token, refresh_token)
 
-    audit_log.record_security_event(
+    await audit_log.record_security_event(
         event_name="WORKSPACE_SWITCHED",
         severity="INFO",
         details={
@@ -3320,10 +3348,10 @@ async def get_workspace_audit_logs(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Retrieve security audit telemetry for a specific workspace. Requires Workspace Admin or Superadmin."""
-    ws_id = ws_repo._resolve_ws_id(workspace_id)
-    is_admin = perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
+    ws_id = await ws_repo._resolve_ws_id(workspace_id)
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
     if not is_admin:
-        audit_log.record_access_denial(
+        await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="view_audit_logs",
             resource=f"workspaces/{ws_id}/audit-logs",
@@ -3341,7 +3369,7 @@ async def get_workspace_audit_logs(
     if severity:
         filters["severity"] = severity.upper()
 
-    logs = audit_log.query_events(
+    logs = await audit_log.query_events(
         filters,
         limit=min(limit, 200),
         offset=offset,
@@ -3354,7 +3382,6 @@ async def get_workspace_audit_logs(
         "audit_logs": logs,
         "logs": logs,
     }
-
 
 
 
