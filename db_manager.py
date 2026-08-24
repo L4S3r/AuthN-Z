@@ -408,9 +408,13 @@ def main():
             if conf != "y":
                 print("Aborted.")
                 return
-        asyncio.run(purge_all_data())
-        from seed_admin import interactive_prompt
-        interactive_prompt()
+
+        async def run_reset_flow():
+            await purge_all_data()
+            from seed_admin import async_interactive_prompt
+            await async_interactive_prompt()
+
+        asyncio.run(run_reset_flow())
 
 
 if __name__ == "__main__":

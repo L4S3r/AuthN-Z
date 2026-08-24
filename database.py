@@ -2,9 +2,10 @@
 Database Engine & Async Session Management (Auth N&Z)
 ====================================================
 Configures the async SQLAlchemy engine using asyncpg for non-blocking PostgreSQL access.
-Provides connection pooling, session lifecycle helpers, and environment resolution.
+Provides connection pooling, session lifecycle helpers, loop-aware engine caching, and environment resolution.
 """
 
+import asyncio
 import os
 from typing import AsyncGenerator, Optional
 from dotenv import load_dotenv
@@ -45,11 +46,18 @@ def get_database_url() -> str:
 
 _async_engine: Optional[AsyncEngine] = None
 _async_session_factory: Optional[async_sessionmaker[AsyncSession]] = None
+_engine_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 def get_engine(db_url: Optional[str] = None) -> AsyncEngine:
-    """Get or create singleton AsyncEngine instance."""
-    global _async_engine
+    """Get or create singleton AsyncEngine instance with event-loop awareness."""
+    global _async_engine, _async_session_factory, _engine_loop
+
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
     if db_url:
         target_url = db_url
         if target_url.startswith("postgresql://"):
@@ -64,7 +72,9 @@ def get_engine(db_url: Optional[str] = None) -> AsyncEngine:
             max_overflow=20,
         )
 
-    if _async_engine is None:
+    # Recreate engine if loop changed or was closed
+    if _async_engine is None or (_engine_loop is not None and current_loop is not None and _engine_loop != current_loop):
+        _engine_loop = current_loop
         _async_engine = create_async_engine(
             get_database_url(),
             echo=False,
@@ -72,6 +82,12 @@ def get_engine(db_url: Optional[str] = None) -> AsyncEngine:
             pool_size=10,
             max_overflow=20,
         )
+        _async_session_factory = async_sessionmaker(
+            bind=_async_engine,
+            expire_on_commit=False,
+            class_=AsyncSession,
+        )
+
     return _async_engine
 
 
@@ -86,13 +102,8 @@ def get_session_factory(db_url: Optional[str] = None) -> async_sessionmaker[Asyn
             class_=AsyncSession,
         )
 
-    if _async_session_factory is None:
-        _async_session_factory = async_sessionmaker(
-            bind=get_engine(),
-            expire_on_commit=False,
-            class_=AsyncSession,
-        )
-    return _async_session_factory
+    get_engine()
+    return _async_session_factory  # type: ignore
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:

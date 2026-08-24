@@ -87,7 +87,7 @@ async def create_admin_user(
     return new_user
 
 
-def interactive_prompt():
+async def async_interactive_prompt():
     print("=" * 60)
     print("  Auth N&Z - Admin Provisioning Utility (PostgreSQL)")
     print("=" * 60)
@@ -114,13 +114,13 @@ def interactive_prompt():
         clearance = 3
 
     print("\nCreating administrator account in PostgreSQL...")
-    user = asyncio.run(create_admin_user(
+    user = await create_admin_user(
         username=username,
         email=email,
         password=password,
         department=dept,
         clearance=clearance,
-    ))
+    )
 
     if user:
         print("\nSUCCESS! Admin account created successfully.")
@@ -132,6 +132,10 @@ def interactive_prompt():
         print(f"  Clearance:  {user['metadata'].get('clearance')}")
     else:
         print("\nFAILED: Admin account creation was unsuccessful.")
+
+
+def interactive_prompt():
+    asyncio.run(async_interactive_prompt())
 
 
 def main():
