@@ -1,17 +1,30 @@
-# Core Cryptography and Security
+# =============================================================================
+# Auth N&Z - Core Production & Development Dependencies
+# =============================================================================
+
+# Core Cryptography, Authentication & Security
 bcrypt>=4.0.0
-pyjwt>=2.8.0
+pyjwt[crypto]>=2.8.0
+cryptography>=41.0.0
 pyotp>=2.9.0
 python-dotenv>=1.0.0
 
-# Storage and Caching
+# Storage, Caching & Distributed Pub/Sub
 redis>=5.0.0
 
-# Web Gateway and API Framework
+# Web Gateway, ASGI Server & WebSocket Engine
 fastapi>=0.100.0
-uvicorn>=0.23.0
+uvicorn[standard]>=0.23.0
+websockets>=12.0.0
+python-multipart>=0.0.9
+
+# Data Modeling, Validation & Settings
 pydantic>=2.0.0
 pydantic[email]>=2.0.0
+pydantic-settings>=2.0.0
 email-validator>=2.0.0
-httpx>=0.25.0
 
+# HTTP Client, Automated CI Testing & Test Harness
+httpx>=0.25.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
