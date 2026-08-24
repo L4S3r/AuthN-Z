@@ -230,16 +230,12 @@ class TeamAcceptInviteRequest(BaseModel):
 class LoginRequest(BaseModel):
     identifier: str
     password: str
-    trusted_device_token: Optional[str] = None
-    device_token: Optional[str] = None
-    trusted_device: Optional[str] = None
 
 
 class OAuthExchangeRequest(BaseModel):
     code: str
     code_verifier: Optional[str] = None
     redirect_uri: Optional[str] = None
-    trusted_device_token: Optional[str] = None
 
 
 class MFAVerifySetupRequest(BaseModel):
@@ -262,7 +258,6 @@ class MFACompleteRequest(BaseModel):
     challenge_id: str
     code: str
     remember_device: Optional[bool] = False
-    trusted_device_token: Optional[str] = None
 
 
 
@@ -497,16 +492,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
             detail="Too many login attempts. Please wait 60 seconds before trying again.",
         )
 
-    cand_token = (
-        req.trusted_device_token
-        or req.device_token
-        or req.trusted_device
-        or request.cookies.get("trusted_device")
-        or request.headers.get("X-Trusted-Device-Token")
-        or request.headers.get("x-trusted-device-token")
-        or request.headers.get("X-Device-Token")
-        or request.headers.get("x-device-token")
-    )
+    cand_token = request.cookies.get("trusted_device")
     clean_token = str(cand_token).strip().strip('"').strip("'") if cand_token else None
 
     res = auth.authenticate_credentials(
@@ -1078,7 +1064,6 @@ def resolve_or_create_oauth_user(
     request: Optional[Request] = None,
     response: Optional[Response] = None,
     user_agent: Optional[str] = None,
-    trusted_device_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Link an external OAuth profile to an existing account or auto-provision a new user."""
     email = profile.get("email")
@@ -1200,14 +1185,7 @@ def resolve_or_create_oauth_user(
     trusted_dev = None
     clean_token = None
     if user_meta.get("mfa_enabled") and user_meta.get("mfa_secret"):
-        cand_token = (
-            (request.cookies.get("trusted_device") if request else None)
-            or trusted_device_token
-            or (request.headers.get("X-Trusted-Device-Token") if request else None)
-            or (request.headers.get("x-trusted-device-token") if request else None)
-            or (request.headers.get("X-Device-Token") if request else None)
-            or (request.headers.get("x-device-token") if request else None)
-        )
+        cand_token = request.cookies.get("trusted_device") if request else None
         if cand_token:
             clean_token = str(cand_token).strip().strip('"').strip("'")
 
@@ -1447,7 +1425,6 @@ async def oauth_exchange_code(
         request=request,
         response=response,
         user_agent=user_agent,
-        trusted_device_token=req.trusted_device_token,
     )
 
 
