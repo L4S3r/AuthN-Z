@@ -227,7 +227,8 @@ def init_notifications_table(db_file: str = "DATABASE.db"):
                 CREATE TABLE IF NOT EXISTS notifications (
                     id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
-                    workspace_id TEXT,
+                    workspace_id TEXT DEFAULT 'ws_default',
+                    task_id TEXT,
                     type TEXT NOT NULL,
                     title TEXT NOT NULL,
                     message TEXT NOT NULL,
@@ -236,7 +237,13 @@ def init_notifications_table(db_file: str = "DATABASE.db"):
                     created_at TEXT NOT NULL
                 );
             """)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(notifications);")
+            cols = [r[1] for r in cursor.fetchall()]
+            if "task_id" not in cols:
+                conn.execute("ALTER TABLE notifications ADD COLUMN task_id TEXT;")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_read ON notifications(user_id, is_read);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_notif_created ON notifications(created_at);")
             conn.commit()
     except Exception as exc:
@@ -252,16 +259,30 @@ async def create_and_push_notification(
     message: str,
     link: Optional[str] = None,
     workspace_id: Optional[str] = None,
+    task_id: Optional[str] = None,
     db_file: str = "DATABASE.db",
 ) -> Dict[str, Any]:
-    """Persist notification and broadcast in real-time over WebSocket."""
+    """Persist notification and broadcast in real-time over WebSocket with deep-link metadata."""
     import sqlite3
+    import urllib.parse
     notif_id = f"notif_{uuid.uuid4().hex[:16]}"
     now_str = datetime.now(timezone.utc).isoformat()
+
+    resolved_task_id = task_id
+    if not resolved_task_id and link and "task=" in link:
+        try:
+            parsed = urllib.parse.urlparse(link)
+            qs = urllib.parse.parse_qs(parsed.query)
+            if "task" in qs and qs["task"]:
+                resolved_task_id = qs["task"][0]
+        except Exception:
+            pass
+
     record = {
         "id": notif_id,
         "user_id": user_id,
-        "workspace_id": workspace_id,
+        "workspace_id": workspace_id or "ws_default",
+        "task_id": resolved_task_id,
         "type": notif_type,
         "title": title,
         "message": message,
@@ -272,12 +293,13 @@ async def create_and_push_notification(
     try:
         with sqlite3.connect(db_file, timeout=10.0) as conn:
             conn.execute("""
-                INSERT INTO notifications (id, user_id, workspace_id, type, title, message, link, is_read, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO notifications (id, user_id, workspace_id, task_id, type, title, message, link, is_read, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record["id"],
                 record["user_id"],
                 record["workspace_id"],
+                record["task_id"],
                 record["type"],
                 record["title"],
                 record["message"],
@@ -2004,6 +2026,36 @@ async def get_tasks(
     return {"status": "SUCCESS", "count": len(tasks), "tasks": tasks}
 
 
+@app.get("/tasks/{task_id}", tags=["Task Tracker"])
+async def get_single_task(
+    task_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Retrieve a single task by ID. Verifies active membership in the task's workspace."""
+    task = task_repo.get_task(task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found.",
+        )
+
+    ws_id = task.get("workspace_id") or "ws_default"
+    user_id = current_user["user_id"]
+
+    # Verify workspace membership clearance if not superadmin
+    is_superadmin = perm_eval.has_role(user_id, "superadmin")
+    if not is_superadmin and ws_id != "ws_default":
+        user = repo.get_by_id(user_id)
+        member = ws_repo.get_member(ws_id, user_id=user_id, email=user.get("email") if user else None)
+        if not member or member.get("status") != "active":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: You are not an active member of this workspace.",
+            )
+
+    return {"status": "SUCCESS", "task": task}
+
+
 @app.post("/tasks", tags=["Task Tracker"])
 async def create_task(
     req: TaskCreateRequest,
@@ -2069,7 +2121,7 @@ async def create_task(
                 assigned_by=assigned_by_name,
                 task_id=new_task["id"],
             )
-            # In-App Notification Push (Phase 4.2)
+            # In-App Notification Push (Phase 4.2 & Deep-Linking)
             assigned_user = repo.get_by_identifier(target_email)
             if assigned_user:
                 await create_and_push_notification(
@@ -2077,8 +2129,9 @@ async def create_task(
                     notif_type="TASK_ASSIGNED",
                     title="Task Assigned",
                     message=f"You were assigned to '{new_task['title']}' by {assigned_by_name}.",
-                    link="/dashboard",
+                    link=f"/?task={new_task['id']}&workspace={ws_id}",
                     workspace_id=ws_id,
+                    task_id=new_task["id"],
                 )
 
     # Real-time WebSocket Broadcast to workspace
@@ -2169,7 +2222,7 @@ async def update_task(
                 assigned_by=assigned_by_name,
                 task_id=task_id,
             )
-            # In-App Notification Push (Phase 4.2)
+            # In-App Notification Push (Phase 4.2 & Deep-Linking)
             assigned_user = repo.get_by_identifier(target_email)
             if assigned_user:
                 await create_and_push_notification(
@@ -2177,8 +2230,9 @@ async def update_task(
                     notif_type="TASK_ASSIGNED",
                     title="Task Assigned",
                     message=f"You were assigned to '{updated.get('title', existing['title'])}' by {assigned_by_name}.",
-                    link="/dashboard",
+                    link=f"/?task={task_id}&workspace={ws_id}",
                     workspace_id=ws_id,
+                    task_id=task_id,
                 )
 
     # Real-time WebSocket Broadcast to workspace

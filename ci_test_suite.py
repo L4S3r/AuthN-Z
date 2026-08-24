@@ -301,6 +301,14 @@ class CITestSuite(unittest.TestCase):
         created_task = res_create_ok.json()["task"]
         self.assertEqual(created_task["title"], "Editor Task Valid")
 
+        # Single task retrieval via GET /tasks/{task_id}
+        res_single = client.get(
+            f"/tasks/{created_task['id']}",
+            headers={"Authorization": f"Bearer {editor_token}"},
+        )
+        self.assertEqual(res_single.status_code, 200)
+        self.assertEqual(res_single.json()["task"]["id"], created_task["id"])
+
     # =========================================================================
     # 8. In-App Notifications & Real-Time Event Dispatch
     # =========================================================================
@@ -311,16 +319,18 @@ class CITestSuite(unittest.TestCase):
         client.cookies.clear()
         token = token_svc.create_access_token(self.user_id, claims={"roles": ["editor"]})
 
-        # 1. Create and push in-app notification
+        # 1. Create and push in-app notification with deep link
         notif = asyncio.run(create_and_push_notification(
             user_id=self.user_id,
             notif_type="TASK_ASSIGNED",
             title="CI Task Assignment",
             message="You have been assigned to test deliverable.",
-            link="/dashboard",
+            link="/?task=task_ci_123&workspace=ws_default",
             workspace_id="ws_default",
+            task_id="task_ci_123",
         ))
         self.assertIsNotNone(notif["id"])
+        self.assertEqual(notif["task_id"], "task_ci_123")
 
         # 2. Fetch notifications endpoint
         get_res = client.get("/notifications", headers={"Authorization": f"Bearer {token}"})
