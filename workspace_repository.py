@@ -211,6 +211,14 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         )
         return ws_slug_check.scalar_one_or_none()
 
+    async def _resolve_ws_id(self, workspace_id_or_slug: str) -> Optional[str]:
+        """Resolve workspace ID or slug to canonical workspace UUID string."""
+        if not workspace_id_or_slug:
+            return None
+        async with self.session_factory() as session:
+            ws_uuid = await self._resolve_ws_uuid(session, workspace_id_or_slug)
+            return str(ws_uuid) if ws_uuid else str(workspace_id_or_slug)
+
     @staticmethod
     def _format_workspace(raw: Dict[str, Any]) -> Dict[str, Any]:
         """Format workspace record for API response."""
