@@ -5,6 +5,5 @@
 *_unittest.py
 *_list.md
 *demo.py
-test_*.py
 __pycache__/
 *.json

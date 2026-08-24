@@ -1,140 +1,90 @@
 """
-Component Role: User Repository
-------------------------------
-This component acts as the data access layer for user accounts, identities, and credential records.
+Component Role: User Repository (PostgreSQL Async)
+-------------------------------------------------
+This component acts as the data access layer for user accounts, identities, credential records,
+and cryptographic password reset tokens using async SQLAlchemy (asyncpg) against PostgreSQL.
 
 System Relationship:
 The Authenticator queries this repository to find users by username, email, or ID to retrieve their
-stored credentials and account status during login. The PermissionEvaluator may also consult it to
-load assigned roles, groups, and privileges. It isolates the rest of the authentication/authorization
-system from specific database engines (e.g., PostgreSQL, MongoDB, DynamoDB).
+stored credentials and account status during login. The PermissionEvaluator consults it to
+load assigned roles, groups, and privileges.
 """
 
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import secrets
-import sqlite3
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import uuid
+
+from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from database import get_session_factory
+from models import PasswordResetToken, User
+
 
 class abstractUserRepository(ABC):
     """Abstract interface defining persistence and retrieval operations for user identities and profile state."""
 
     @abstractmethod
-    def get_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve a user record by its unique system identifier.
-
-        Args:
-            user_id: The unique primary key or UUID of the user.
-
-        Returns:
-            A dictionary containing the user's data (e.g., ID, username, email, hashed credentials,
-            status, roles, metadata), or None if no matching user exists.
-
-        Edge Cases to Consider:
-            - Malformed or invalid user ID formats (e.g., non-UUID strings if UUIDs are expected).
-            - Soft-deleted users vs. permanently deleted users.
-            - Database connection timeouts or query failures.
-        """
+    async def get_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a user record by its unique system identifier."""
         ...
 
     @abstractmethod
-    def get_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
-        """
-        Look up a user record by a unique login identifier such as username or email address.
-
-        Args:
-            identifier: The case-insensitive or normalized login string (username, email, phone number).
-
-        Returns:
-            A dictionary containing user data, or None if no user is found with that identifier.
-
-        Edge Cases to Consider:
-            - Case-sensitivity nuances (e.g., matching 'User@Example.com' with 'user@example.com').
-            - Whitespace trimming and Unicode normalization.
-            - Ambiguity if multiple identifiers overlap (e.g., email vs. username collision).
-        """
+    async def get_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
+        """Look up a user record by a unique login identifier such as username or email address."""
         ...
 
     @abstractmethod
-    def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Persist a new user record into the data store.
-
-        Args:
-            user_data: Dictionary containing fields for the new user (e.g., username, email,
-                       hashed password, creation timestamp, initial roles).
-
-        Returns:
-            The created user record dictionary, including the newly assigned unique user ID.
-
-        Edge Cases to Consider:
-            - Unique constraint violations (duplicate username or email already exists).
-            - Missing mandatory fields (e.g., missing email, password hash, or username).
-            - Schema validation failures.
-        """
+    async def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist a new user record into the data store."""
         ...
 
     @abstractmethod
-    def update_user(self, user_id: str, updates: Dict[str, Any]) -> bool:
-        """
-        Update specific fields of an existing user record.
-
-        Args:
-            user_id: The unique identifier of the user to update.
-            updates: Dictionary of key-value pairs representing modified fields.
-
-        Returns:
-            True if the update was applied successfully, False if the user was not found or no changes were made.
-
-        Edge Cases to Consider:
-            - Attempting to update immutable fields (such as user_id or creation date).
-            - Updating unique fields (e.g., changing email to one that already belongs to another user).
-            - Optimistic concurrency control (handling simultaneous conflicting writes).
-        """
+    async def update_user(self, user_id: str, updates: Dict[str, Any]) -> bool:
+        """Update specific fields of an existing user record."""
         ...
 
     @abstractmethod
-    def delete_user(self, user_id: str) -> bool:
-        """
-        Remove or soft-delete a user record from the data store.
-
-        Args:
-            user_id: The unique identifier of the user to delete.
-
-        Returns:
-            True if the user was found and deleted, False otherwise.
-
-        Edge Cases to Consider:
-            - Handling cascading deletes vs. soft-deletion flags (e.g., is_deleted=True).
-            - Ensuring associated tokens, sessions, or role assignments are cleaned up or invalidated.
-        """
+    async def delete_user(self, user_id: str) -> bool:
+        """Remove a user record from the data store."""
         ...
 
     @abstractmethod
-    def set_status(self, user_id: str, is_active: bool) -> bool:
-        """
-        Activate, suspend, or lock a user account.
-
-        Args:
-            user_id: The unique identifier of the user.
-            is_active: Boolean flag indicating whether the account is enabled for login/access.
-
-        Returns:
-            True if the status was successfully updated, False if the user does not exist.
-
-        Edge Cases to Consider:
-            - Revoking active sessions or tokens immediately upon locking/deactivating an account.
-            - Preventing self-lockout or locking the final remaining super-administrator.
-        """
+    async def set_status(self, user_id: str, is_active: bool) -> bool:
+        """Activate, suspend, or lock a user account."""
         ...
 
     @abstractmethod
-    def create_password_reset_token(
+    async def list_users(
+        self,
+        is_active: Optional[bool] = None,
+        role: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List all users with optional status and role filtering."""
+        ...
+
+    @abstractmethod
+    async def get_roles(self, user_id: str) -> List[str]:
+        """Retrieve all role strings assigned to a user."""
+        ...
+
+    @abstractmethod
+    async def add_role(self, user_id: str, role: str) -> bool:
+        """Add a role to a user if not already present."""
+        ...
+
+    @abstractmethod
+    async def remove_role(self, user_id: str, role: str) -> bool:
+        """Remove a role from a user."""
+        ...
+
+    @abstractmethod
+    async def create_password_reset_token(
         self,
         user_id: str,
         ip_address: Optional[str] = None,
@@ -144,203 +94,238 @@ class abstractUserRepository(ABC):
         ...
 
     @abstractmethod
-    def verify_password_reset_token(self, raw_token: str) -> Optional[Dict[str, Any]]:
+    async def verify_password_reset_token(self, raw_token: str) -> Optional[Dict[str, Any]]:
         """Verify token hash against stored active, unexpired, and unused reset records."""
         ...
 
     @abstractmethod
-    def consume_password_reset_token(self, raw_token: str, new_hashed_password: str) -> Optional[str]:
+    async def consume_password_reset_token(
+        self, raw_token: str, new_hashed_password: str
+    ) -> Optional[str]:
         """Atomically mark token as consumed and update the user's hashed password."""
         ...
 
+
 class UserRepository(abstractUserRepository):
-    def __init__(self, db_file: str = "DATABASE.db"):
-        self.db_file = db_file
-        self._init_db()
+    """PostgreSQL Async implementation of the User Repository."""
 
-    @contextmanager
-    def _get_connection(self):
-        """Yield a configured SQLite connection with WAL mode and foreign key support."""
-        conn = sqlite3.connect(self.db_file, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        try:
-            if self.db_file != ":memory:":
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("PRAGMA foreign_keys=ON;")
-            yield conn
-        finally:
-            conn.close()
+    def __init__(
+        self,
+        db_url: Optional[str] = None,
+        session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    ):
+        self.session_factory = session_factory or get_session_factory(db_url)
 
-    def _init_db(self) -> None:
-        """Create the user and password reset tables and configure concurrent WAL journal mode."""
-        users_query = """
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            hashed_password TEXT NOT NULL,
-            is_active INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            roles TEXT DEFAULT '[]',
-            metadata TEXT DEFAULT '{}'
-        );
-        """
-        reset_tokens_query = """
-        CREATE TABLE IF NOT EXISTS password_reset_tokens (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            token_hash TEXT NOT NULL UNIQUE,
-            expires_at TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            used_at TEXT,
-            ip_address TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-        """
-        with self._get_connection() as conn:
-            conn.execute(users_query)
-            conn.execute(reset_tokens_query)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_prt_user ON password_reset_tokens(user_id);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_prt_hash ON password_reset_tokens(token_hash);")
-            conn.commit()
+    @staticmethod
+    def _format_user(user: User) -> Dict[str, Any]:
+        """Format SQLAlchemy User model instance to dictionary matching previous repository shape."""
+        roles = user.roles if isinstance(user.roles, list) else []
+        meta = user.metadata_ if isinstance(user.metadata_, dict) else {}
+        created_str = (
+            user.created_at.isoformat()
+            if isinstance(user.created_at, datetime)
+            else str(user.created_at)
+        )
+        return {
+            "id": str(user.id),
+            "username": user.username,
+            "email": user.email,
+            "hashed_password": user.hashed_password,
+            "is_active": 1 if user.is_active else 0,
+            "created_at": created_str,
+            "roles": roles,
+            "metadata": meta,
+        }
 
-    def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Safely insert a new user using a parameterized query."""
-        user_id = user_data.get("id") or str(uuid.uuid4())
-        username = user_data["username"]
+    async def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Safely insert a new user with UUID primary key and JSONB attributes."""
+        user_id_raw = user_data.get("id")
+        if user_id_raw:
+            try:
+                user_id = uuid.UUID(str(user_id_raw).strip())
+            except (ValueError, AttributeError):
+                user_id = uuid.uuid4()
+        else:
+            user_id = uuid.uuid4()
+
+        username = user_data["username"].strip()
         email = user_data["email"].strip().lower()
         hashed_password = user_data["hashed_password"]
-        is_active = int(user_data.get("is_active", 1))
-        roles_json = json.dumps(user_data.get("roles", []))
-        metadata_json = json.dumps(user_data.get("metadata", {}))
-        query = """INSERT INTO users (
-                        id, 
-                        username,
-                        email,
-                        hashed_password,
-                        is_active,
-                        roles,
-                        metadata
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)"""
+        is_active = bool(user_data.get("is_active", True))
+
+        roles_raw = user_data.get("roles", [])
+        if isinstance(roles_raw, str):
+            try:
+                roles = json.loads(roles_raw)
+            except Exception:
+                roles = []
+        else:
+            roles = list(roles_raw or [])
+
+        metadata_raw = user_data.get("metadata", {})
+        if isinstance(metadata_raw, str):
+            try:
+                meta = json.loads(metadata_raw)
+            except Exception:
+                meta = {}
+        else:
+            meta = dict(metadata_raw or {})
+
+        new_user = User(
+            id=user_id,
+            username=username,
+            email=email,
+            hashed_password=hashed_password,
+            is_active=is_active,
+            roles=roles,
+            metadata_=meta,
+        )
 
         try:
-            with self._get_connection() as conn:
-                conn.execute(
-                    query,
-                    (user_id, username, email, hashed_password, is_active, roles_json, metadata_json)
-                )
-                conn.commit()
-            return self.get_by_id(user_id)
-        except sqlite3.IntegrityError as e:
+            async with self.session_factory() as session:
+                session.add(new_user)
+                await session.commit()
+            return await self.get_by_id(str(user_id))  # type: ignore
+        except IntegrityError as e:
             raise ValueError(f"User with this username or email address already exists: {e}")
 
-    def get_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch a user's name and email using their UUID."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            query = "SELECT * FROM users WHERE id = ?"
-            cursor.execute(query, (str(user_id),))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+    async def get_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a user record by UUID."""
+        if not user_id:
+            return None
+        try:
+            uid = uuid.UUID(str(user_id).strip())
+        except (ValueError, AttributeError):
+            return None
 
-    def get_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
+        async with self.session_factory() as session:
+            stmt = select(User).where(User.id == uid)
+            result = await session.execute(stmt)
+            user = result.scalars().first()
+            return self._format_user(user) if user else None
+
+    async def get_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
         """Lookup a user by case-insensitive username or email."""
-        clean_id = identifier.strip().lower()
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            query = "SELECT * FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?"
-            cursor.execute(query, (clean_id, clean_id))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        clean_id = (identifier or "").strip().lower()
+        if not clean_id:
+            return None
 
-    def update_user(self, user_id: str, updates: Dict[str, Any]) -> bool:
-        """Atomically update user fields using a single transaction."""
+        async with self.session_factory() as session:
+            stmt = select(User).where(
+                or_(
+                    func.lower(User.username) == clean_id,
+                    func.lower(User.email) == clean_id,
+                )
+            )
+            result = await session.execute(stmt)
+            user = result.scalars().first()
+            return self._format_user(user) if user else None
+
+    async def update_user(self, user_id: str, updates: Dict[str, Any]) -> bool:
+        """Atomically update user fields."""
+        if not user_id:
+            return False
+        try:
+            uid = uuid.UUID(str(user_id).strip())
+        except (ValueError, AttributeError):
+            return False
+
         allowed_fields = {"username", "email", "hashed_password", "is_active", "roles", "metadata"}
-        filtered_updates = {}
+        filtered_updates: Dict[str, Any] = {}
+
         for key, value in updates.items():
             if key in allowed_fields:
                 if key == "email" and isinstance(value, str):
-                    filtered_updates[key] = value.strip().lower()
-                elif key in ("roles", "metadata") and not isinstance(value, str):
-                    filtered_updates[key] = json.dumps(value)
+                    filtered_updates["email"] = value.strip().lower()
+                elif key == "roles":
+                    if isinstance(value, str):
+                        try:
+                            filtered_updates["roles"] = json.loads(value)
+                        except Exception:
+                            filtered_updates["roles"] = []
+                    else:
+                        filtered_updates["roles"] = list(value or [])
+                elif key == "metadata":
+                    if isinstance(value, str):
+                        try:
+                            filtered_updates["metadata_"] = json.loads(value)
+                        except Exception:
+                            filtered_updates["metadata_"] = {}
+                    else:
+                        filtered_updates["metadata_"] = dict(value or {})
+                elif key == "is_active":
+                    filtered_updates["is_active"] = bool(value)
                 else:
                     filtered_updates[key] = value
+
         if not filtered_updates:
             return False
 
-        set_clause = ", ".join(f"{field} = ?" for field in filtered_updates.keys())
-        query = f"UPDATE users SET {set_clause} WHERE id = ?"
-        params = list(filtered_updates.values()) + [str(user_id)]
         try:
-            with self._get_connection() as conn:
-                cursor = conn.execute(query, params)
-                conn.commit()
-                return cursor.rowcount > 0
-        except sqlite3.IntegrityError as e:
+            async with self.session_factory() as session:
+                stmt = update(User).where(User.id == uid).values(**filtered_updates)
+                result = await session.execute(stmt)
+                await session.commit()
+                return (result.rowcount or 0) > 0
+        except IntegrityError as e:
             raise ValueError(f"Update failed due to unique constraint: {e}")
 
-    def delete_user(self, user_id: str) -> bool:
+    async def delete_user(self, user_id: str) -> bool:
         """Permanently delete a user record."""
-        query = "DELETE FROM users WHERE id = ?"
-        with self._get_connection() as conn:
-            cursor = conn.execute(query, (str(user_id),))
-            conn.commit()
-            return cursor.rowcount > 0
+        if not user_id:
+            return False
+        try:
+            uid = uuid.UUID(str(user_id).strip())
+        except (ValueError, AttributeError):
+            return False
 
-    def set_status(self, user_id: str, is_active: bool) -> bool:
-        """Activate or deactivate/suspend a user account (soft-delete)."""
-        query = "UPDATE users SET is_active = ? WHERE id = ?"
-        status_int = 1 if is_active else 0
-        with self._get_connection() as conn:
-            cursor = conn.execute(query, (status_int, str(user_id)))
-            conn.commit()
-            return cursor.rowcount > 0
+        async with self.session_factory() as session:
+            stmt = delete(User).where(User.id == uid)
+            result = await session.execute(stmt)
+            await session.commit()
+            return (result.rowcount or 0) > 0
 
-    def list_users(
+    async def set_status(self, user_id: str, is_active: bool) -> bool:
+        """Activate or suspend a user account."""
+        if not user_id:
+            return False
+        try:
+            uid = uuid.UUID(str(user_id).strip())
+        except (ValueError, AttributeError):
+            return False
+
+        async with self.session_factory() as session:
+            stmt = update(User).where(User.id == uid).values(is_active=bool(is_active))
+            result = await session.execute(stmt)
+            await session.commit()
+            return (result.rowcount or 0) > 0
+
+    async def list_users(
         self,
         is_active: Optional[bool] = None,
         role: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """List all users with optional status and role filtering."""
-        query = "SELECT * FROM users WHERE 1=1"
-        params: List[Any] = []
+        async with self.session_factory() as session:
+            stmt = select(User).order_by(User.created_at.asc())
+            if is_active is not None:
+                stmt = stmt.where(User.is_active == bool(is_active))
+            result = await session.execute(stmt)
+            users = result.scalars().all()
 
-        if is_active is not None:
-            query += " AND is_active = ?"
-            params.append(1 if is_active else 0)
+        results: List[Dict[str, Any]] = []
+        for u in users:
+            data = self._format_user(u)
+            if role:
+                user_roles = [str(r).strip().lower() for r in (data.get("roles") or [])]
+                if role.strip().lower() not in user_roles:
+                    continue
+            results.append(data)
+        return results
 
-        query += " ORDER BY datetime(created_at) ASC"
-
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-            users = []
-            for r in rows:
-                u = dict(r)
-                if isinstance(u.get("roles"), str):
-                    try:
-                        u["roles"] = json.loads(u["roles"])
-                    except Exception:
-                        u["roles"] = []
-                if isinstance(u.get("metadata"), str):
-                    try:
-                        u["metadata"] = json.loads(u["metadata"])
-                    except Exception:
-                        u["metadata"] = {}
-
-                if role:
-                    user_roles = [str(rl).strip().lower() for rl in u.get("roles", [])]
-                    if role.strip().lower() not in user_roles:
-                        continue
-
-                users.append(u)
-            return users
-
-    def get_roles(self, user_id: str) -> List[str]:
+    async def get_roles(self, user_id: str) -> List[str]:
         """Retrieve all role strings assigned to a user."""
-        user = self.get_by_id(user_id)
+        user = await self.get_by_id(user_id)
         if not user:
             return []
         raw_roles = user.get("roles", [])
@@ -349,32 +334,32 @@ class UserRepository(abstractUserRepository):
                 return json.loads(raw_roles)
             except Exception:
                 return []
-        return raw_roles if isinstance(raw_roles, list) else []
+        return list(raw_roles) if isinstance(raw_roles, list) else []
 
-    def add_role(self, user_id: str, role: str) -> bool:
+    async def add_role(self, user_id: str, role: str) -> bool:
         """Add a role to a user if not already present."""
         clean_role = role.strip().lower()
-        user = self.get_by_id(user_id)
+        user = await self.get_by_id(user_id)
         if not user:
             return False
 
-        roles = self.get_roles(user_id)
+        roles = await self.get_roles(user_id)
         if clean_role not in roles:
             roles.append(clean_role)
-            return self.update_user(user_id, {"roles": roles})
+            return await self.update_user(user_id, {"roles": roles})
         return True
 
-    def remove_role(self, user_id: str, role: str) -> bool:
+    async def remove_role(self, user_id: str, role: str) -> bool:
         """Remove a role from a user."""
         clean_role = role.strip().lower()
-        user = self.get_by_id(user_id)
+        user = await self.get_by_id(user_id)
         if not user:
             return False
 
-        roles = self.get_roles(user_id)
+        roles = await self.get_roles(user_id)
         if clean_role in roles:
             roles = [r for r in roles if r != clean_role]
-            return self.update_user(user_id, {"roles": roles})
+            return await self.update_user(user_id, {"roles": roles})
         return True
 
     @staticmethod
@@ -382,39 +367,50 @@ class UserRepository(abstractUserRepository):
         """Compute SHA-256 digest of a raw reset token."""
         return hashlib.sha256((raw_token or "").strip().encode("utf-8")).hexdigest()
 
-    def create_password_reset_token(
+    async def create_password_reset_token(
         self,
         user_id: str,
         ip_address: Optional[str] = None,
         expires_in_minutes: int = 15,
     ) -> str:
         """Issue and record a high-entropy password reset token, invalidating prior tokens for the user."""
+        try:
+            uid = uuid.UUID(str(user_id).strip())
+        except (ValueError, AttributeError):
+            raise ValueError(f"Invalid user_id for password reset: {user_id}")
+
         raw_token = secrets.token_urlsafe(32)
         token_hash = self._hash_reset_token(raw_token)
         now = datetime.now(timezone.utc)
-        now_str = now.isoformat()
-        expires_at = (now + timedelta(minutes=expires_in_minutes)).isoformat()
-        token_id = f"prt_{uuid.uuid4().hex[:16]}"
+        expires_at = now + timedelta(minutes=expires_in_minutes)
+        token_id = uuid.uuid4()
 
-        with self._get_connection() as conn:
+        async with self.session_factory() as session:
             # Invalidate any previously unused reset tokens for this user
-            conn.execute(
-                "UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
-                (now_str, str(user_id)),
+            await session.execute(
+                update(PasswordResetToken)
+                .where(
+                    PasswordResetToken.user_id == uid,
+                    PasswordResetToken.used_at.is_(None),
+                )
+                .values(used_at=now)
             )
-            conn.execute(
-                """
-                INSERT INTO password_reset_tokens (
-                    id, user_id, token_hash, expires_at, created_at, used_at, ip_address
-                ) VALUES (?, ?, ?, ?, ?, NULL, ?)
-                """,
-                (token_id, str(user_id), token_hash, expires_at, now_str, ip_address or ""),
+
+            new_token = PasswordResetToken(
+                id=token_id,
+                user_id=uid,
+                token_hash=token_hash,
+                expires_at=expires_at,
+                created_at=now,
+                used_at=None,
+                ip_address=ip_address or "",
             )
-            conn.commit()
+            session.add(new_token)
+            await session.commit()
 
         return raw_token
 
-    def verify_password_reset_token(self, raw_token: str) -> Optional[Dict[str, Any]]:
+    async def verify_password_reset_token(self, raw_token: str) -> Optional[Dict[str, Any]]:
         """Verify token hash against stored active, unexpired, and unused reset records."""
         clean_token = (raw_token or "").strip()
         if not clean_token:
@@ -423,62 +419,86 @@ class UserRepository(abstractUserRepository):
         token_hash = self._hash_reset_token(clean_token)
         now_utc = datetime.now(timezone.utc)
 
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            query = """
-                SELECT prt.id, prt.user_id, prt.expires_at, prt.created_at, prt.used_at,
-                       u.username, u.email, u.is_active
-                FROM password_reset_tokens prt
-                JOIN users u ON prt.user_id = u.id
-                WHERE prt.token_hash = ? AND prt.used_at IS NULL
-            """
-            cursor.execute(query, (token_hash,))
-            row = cursor.fetchone()
+        async with self.session_factory() as session:
+            stmt = (
+                select(PasswordResetToken, User)
+                .join(User, PasswordResetToken.user_id == User.id)
+                .where(
+                    PasswordResetToken.token_hash == token_hash,
+                    PasswordResetToken.used_at.is_(None),
+                )
+            )
+            result = await session.execute(stmt)
+            row = result.first()
             if not row:
                 return None
 
-            record = dict(row)
-            if not record.get("is_active", 1):
+            prt, user = row
+            if not user.is_active:
                 return None
 
-            expires_at_str = record.get("expires_at")
-            if expires_at_str:
-                try:
-                    exp_dt = datetime.fromisoformat(expires_at_str)
-                    if now_utc > exp_dt:
-                        return None
-                except Exception:
+            if prt.expires_at:
+                exp_dt = (
+                    prt.expires_at
+                    if prt.expires_at.tzinfo
+                    else prt.expires_at.replace(tzinfo=timezone.utc)
+                )
+                if now_utc > exp_dt:
                     return None
 
-            return record
+            return {
+                "id": str(prt.id),
+                "user_id": str(prt.user_id),
+                "expires_at": prt.expires_at.isoformat() if prt.expires_at else "",
+                "created_at": prt.created_at.isoformat() if prt.created_at else "",
+                "used_at": prt.used_at.isoformat() if prt.used_at else None,
+                "ip_address": prt.ip_address,
+                "username": user.username,
+                "email": user.email,
+                "is_active": 1 if user.is_active else 0,
+            }
 
-    def consume_password_reset_token(self, raw_token: str, new_hashed_password: str) -> Optional[str]:
+    async def consume_password_reset_token(
+        self, raw_token: str, new_hashed_password: str
+    ) -> Optional[str]:
         """Atomically mark token as consumed and update the user's hashed password."""
-        verified = self.verify_password_reset_token(raw_token)
+        verified = await self.verify_password_reset_token(raw_token)
         if not verified:
             return None
 
         user_id = verified["user_id"]
         token_id = verified["id"]
-        now_str = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
 
         try:
-            with self._get_connection() as conn:
-                cursor = conn.execute(
-                    "UPDATE password_reset_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL",
-                    (now_str, token_id),
-                )
-                if cursor.rowcount == 0:
-                    return None
-
-                conn.execute(
-                    "UPDATE users SET hashed_password = ? WHERE id = ?",
-                    (new_hashed_password, str(user_id)),
-                )
-                conn.commit()
-            return str(user_id)
-        except sqlite3.Error:
+            uid = uuid.UUID(user_id)
+            tid = uuid.UUID(token_id)
+        except (ValueError, AttributeError):
             return None
+
+        async with self.session_factory() as session:
+            # Atomically consume token
+            stmt = (
+                update(PasswordResetToken)
+                .where(
+                    PasswordResetToken.id == tid,
+                    PasswordResetToken.used_at.is_(None),
+                )
+                .values(used_at=now)
+            )
+            res = await session.execute(stmt)
+            if (res.rowcount or 0) == 0:
+                await session.rollback()
+                return None
+
+            # Update password
+            await session.execute(
+                update(User)
+                .where(User.id == uid)
+                .values(hashed_password=new_hashed_password)
+            )
+            await session.commit()
+            return str(user_id)
 
 
 concreteUserRepository = UserRepository
