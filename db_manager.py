@@ -21,12 +21,14 @@ Usage:
 
 import argparse
 import asyncio
-import asyncpg
 import json
 import os
 import sys
 import uuid
 from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from sqlalchemy import select, func, delete, text
 from database import get_session_factory, get_engine

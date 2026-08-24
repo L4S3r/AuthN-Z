@@ -17,6 +17,9 @@ import asyncio
 import json
 import sys
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from user_repository import UserRepository
 from audit_logger import AuditLogger

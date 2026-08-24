@@ -16,6 +16,9 @@ import asyncio
 import getpass
 import sys
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from password_hasher import PasswordHasher
 from user_repository import UserRepository

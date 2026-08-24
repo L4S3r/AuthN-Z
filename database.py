@@ -7,6 +7,9 @@ Provides connection pooling, session lifecycle helpers, and environment resoluti
 
 import os
 from typing import AsyncGenerator, Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -18,13 +21,21 @@ from sqlalchemy.ext.asyncio import (
 
 def get_database_url() -> str:
     """
-    Retrieve database URL from environment variable DATABASE_URL.
+    Retrieve database URL from environment variables.
+    Supports DATABASE_URL or individual POSTGRES_* / PG* variables.
     Converts standard postgresql:// schemes to postgresql+asyncpg:// for async compatibility.
     """
-    url = os.getenv(
-        "DATABASE_URL",
-        "postgresql+asyncpg://authnz_app:CHANGEME@127.0.0.1:5432/authnz",
-    )
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        user = os.getenv("POSTGRES_USER") or os.getenv("PGUSER") or "authnz_app"
+        password = os.getenv("POSTGRES_PASSWORD") or os.getenv("PGPASSWORD") or ""
+        host = os.getenv("POSTGRES_HOST") or os.getenv("PGHOST") or "127.0.0.1"
+        port = os.getenv("POSTGRES_PORT") or os.getenv("PGPORT") or "5432"
+        db_name = os.getenv("POSTGRES_DB") or os.getenv("PGDATABASE") or "authnz"
+
+        auth_part = f"{user}:{password}" if password else user
+        url = f"postgresql+asyncpg://{auth_part}@{host}:{port}/{db_name}"
+
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     elif url.startswith("postgres://"):
