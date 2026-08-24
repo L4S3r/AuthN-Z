@@ -155,7 +155,9 @@ async def run_live_cutover_walkthrough():
             headers=auth_headers,
         )
         assert create_ws_res.status_code in (200, 201), f"Workspace creation failed: {create_ws_res.text}"
-        workspace_id = create_ws_res.json()["id"]
+        ws_data = create_ws_res.json()
+        workspace_obj = ws_data.get("workspace", ws_data)
+        workspace_id = workspace_obj["id"]
         print(f"  ✓ Workspace created with ID: {workspace_id}")
 
         # Switch workspace
@@ -188,7 +190,9 @@ async def run_live_cutover_walkthrough():
             headers=auth_headers,
         )
         assert task_create_res.status_code in (200, 201), f"Task create failed: {task_create_res.text}"
-        task_id = task_create_res.json()["id"]
+        task_resp_data = task_create_res.json()
+        task_obj = task_resp_data.get("task", task_resp_data)
+        task_id = task_obj["id"]
         print(f"  ✓ Task created with ID: {task_id}")
 
         # 5b: Update task
@@ -198,7 +202,9 @@ async def run_live_cutover_walkthrough():
             headers=auth_headers,
         )
         assert task_update_res.status_code == 200, f"Task update failed: {task_update_res.text}"
-        assert task_update_res.json()["status"] == "in_progress"
+        updated_task_data = task_update_res.json()
+        updated_obj = updated_task_data.get("task", updated_task_data)
+        assert updated_obj["status"] == "in_progress"
         print(f"  ✓ Task status updated to 'in_progress'")
 
         # 5c: Delete task
