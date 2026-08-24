@@ -18,7 +18,7 @@ import secrets
 from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
-from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Header, Query, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
@@ -422,7 +422,7 @@ class MFAVerifySetupRequest(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    refresh_token: Optional[str] = None
 
 
 class LogoutRequest(BaseModel):
@@ -876,7 +876,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
 async def refresh_tokens(
     request: Request,
     response: Response,
-    req: Optional[RefreshRequest] = None,
+    req: Optional[RefreshRequest] = Body(None),
 ):
     """Exchange a valid refresh token for a new access token and rotated refresh token."""
     client_ip = request.client.host if request.client else "unknown"
@@ -2276,7 +2276,7 @@ async def workspace_websocket_endpoint(
     Authenticates via 'access_token' cookie, Authorization header, or '?token=<jwt>' query parameter.
     """
     raw_token = token
-    if not raw_token and "access_token" in websocket.cookies:
+    if not raw_token or raw_token == "cookie_session":
         raw_token = websocket.cookies.get("access_token")
 
     if not raw_token:
