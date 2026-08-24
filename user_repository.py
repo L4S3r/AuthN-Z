@@ -11,6 +11,7 @@ system from specific database engines (e.g., PostgreSQL, MongoDB, DynamoDB).
 """
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -155,32 +156,24 @@ class abstractUserRepository(ABC):
 class UserRepository(abstractUserRepository):
     def __init__(self, db_file: str = "DATABASE.db"):
         self.db_file = db_file
+        self._init_db()
+
+    @contextmanager
+    def _get_connection(self):
+        """Yield a configured SQLite connection with WAL mode and foreign key support."""
+        conn = sqlite3.connect(self.db_file, timeout=10.0)
+        conn.row_factory = sqlite3.Row
         try:
-            self.conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=10.0)
-            self.conn.row_factory = sqlite3.Row
-            self._create_table()
-            print(f"Connected successfully to SQLite version: {sqlite3.sqlite_version}")
-        except sqlite3.Error as e:
-            print(f"Connection error: {e}")
-            raise
+            if self.db_file != ":memory:":
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            yield conn
+        finally:
+            conn.close()
 
-    def close(self) -> None:
-        """Close SQLite database connection."""
-        if hasattr(self, "conn") and self.conn:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-
-    def __del__(self) -> None:
-        self.close()
-
-    def _create_table(self) -> None:
+    def _init_db(self) -> None:
         """Create the user and password reset tables and configure concurrent WAL journal mode."""
-        if self.db_file != ":memory:":
-            self.conn.execute("PRAGMA journal_mode=WAL;")
-            self.conn.execute("PRAGMA synchronous=NORMAL;")
-
         users_query = """
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -205,22 +198,22 @@ class UserRepository(abstractUserRepository):
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
         """
-        with self.conn:
-            self.conn.execute(users_query)
-            self.conn.execute(reset_tokens_query)
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prt_user ON password_reset_tokens(user_id);")
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prt_hash ON password_reset_tokens(token_hash);")
+        with self._get_connection() as conn:
+            conn.execute(users_query)
+            conn.execute(reset_tokens_query)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_prt_user ON password_reset_tokens(user_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_prt_hash ON password_reset_tokens(token_hash);")
+            conn.commit()
 
-    
     def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
         """Safely insert a new user using a parameterized query."""
-        user_id=user_data.get("id") or str(uuid.uuid4())
-        username=user_data["username"]
-        email=user_data["email"].strip().lower()
-        hashed_password=user_data["hashed_password"]
-        is_active = int(user_data.get("is_active",1))
-        roles_json=json.dumps(user_data.get("roles",[]))
-        metadata_json = json.dumps(user_data.get("metadata",{}))
+        user_id = user_data.get("id") or str(uuid.uuid4())
+        username = user_data["username"]
+        email = user_data["email"].strip().lower()
+        hashed_password = user_data["hashed_password"]
+        is_active = int(user_data.get("is_active", 1))
+        roles_json = json.dumps(user_data.get("roles", []))
+        metadata_json = json.dumps(user_data.get("metadata", {}))
         query = """INSERT INTO users (
                         id, 
                         username,
@@ -231,73 +224,77 @@ class UserRepository(abstractUserRepository):
                         metadata
                         ) VALUES (?, ?, ?, ?, ?, ?, ?)"""
 
-        try: 
-            with self.conn:
-                self.conn.execute(
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
                     query,
-                    (user_id,username,email,hashed_password,is_active,roles_json,metadata_json)
+                    (user_id, username, email, hashed_password, is_active, roles_json, metadata_json)
                 )
-            return self.get_by_id(user_id) #Returns full record including created at
+                conn.commit()
+            return self.get_by_id(user_id)
         except sqlite3.IntegrityError as e:
-            raise ValueError(f"User with this username or emaill address already exists: {e}")
+            raise ValueError(f"User with this username or email address already exists: {e}")
 
     def get_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a user's name and email using their UUID."""
-        cursor=self.conn.cursor()
-        query="SELECT * FROM users WHERE id = ?"
-        cursor.execute(query,(str(user_id),))
-        row=cursor.fetchone()
-        return dict(row) if row else None
-    
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM users WHERE id = ?"
+            cursor.execute(query, (str(user_id),))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
     def get_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
         """Lookup a user by case-insensitive username or email."""
-        clean_id=identifier.strip().lower()
-        cursor=self.conn.cursor()
-        query= "SELECT * FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?"
-        cursor.execute(query,(clean_id,clean_id))
-        row = cursor.fetchone()
-        return dict(row) if row else None
-    
-    
+        clean_id = identifier.strip().lower()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?"
+            cursor.execute(query, (clean_id, clean_id))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
     def update_user(self, user_id: str, updates: Dict[str, Any]) -> bool:
         """Atomically update user fields using a single transaction."""
-        allowed_fields={"username","email","hashed_password","is_active","roles","metadata"}
+        allowed_fields = {"username", "email", "hashed_password", "is_active", "roles", "metadata"}
         filtered_updates = {}
-        for key,value in updates.items():
+        for key, value in updates.items():
             if key in allowed_fields:
-                if key == "email" and isinstance(value,str):
-                    filtered_updates[key]=value.strip().lower()
-                elif key in ("roles","metadata") and not isinstance(value,str):
+                if key == "email" and isinstance(value, str):
+                    filtered_updates[key] = value.strip().lower()
+                elif key in ("roles", "metadata") and not isinstance(value, str):
                     filtered_updates[key] = json.dumps(value)
                 else:
                     filtered_updates[key] = value
         if not filtered_updates:
             return False
 
-        set_clause= ", ".join(f"{field} = ?" for field in filtered_updates.keys())
-        query= f"UPDATE users SET {set_clause} WHERE id =?"        
-        params=list(filtered_updates.values()) + [str(user_id)]
+        set_clause = ", ".join(f"{field} = ?" for field in filtered_updates.keys())
+        query = f"UPDATE users SET {set_clause} WHERE id = ?"
+        params = list(filtered_updates.values()) + [str(user_id)]
         try:
-            with self.conn:
-                cursor=self.conn.execute(query,params)
+            with self._get_connection() as conn:
+                cursor = conn.execute(query, params)
+                conn.commit()
                 return cursor.rowcount > 0
         except sqlite3.IntegrityError as e:
             raise ValueError(f"Update failed due to unique constraint: {e}")
-            
 
     def delete_user(self, user_id: str) -> bool:
         """Permanently delete a user record."""
-        query="DELETE FROM users WHERE id= ?"
-        with self.conn:
-            cursor=self.conn.execute(query,(str(user_id),))
-            return cursor.rowcount>0
-    
+        query = "DELETE FROM users WHERE id = ?"
+        with self._get_connection() as conn:
+            cursor = conn.execute(query, (str(user_id),))
+            conn.commit()
+            return cursor.rowcount > 0
+
     def set_status(self, user_id: str, is_active: bool) -> bool:
         """Activate or deactivate/suspend a user account (soft-delete)."""
         query = "UPDATE users SET is_active = ? WHERE id = ?"
         status_int = 1 if is_active else 0
-        with self.conn:
-            cursor = self.conn.execute(query, (status_int, str(user_id)))
+        with self._get_connection() as conn:
+            cursor = conn.execute(query, (status_int, str(user_id)))
+            conn.commit()
             return cursor.rowcount > 0
 
     def list_users(
@@ -315,30 +312,31 @@ class UserRepository(abstractUserRepository):
 
         query += " ORDER BY datetime(created_at) ASC"
 
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-        users = []
-        for r in rows:
-            u = dict(r)
-            if isinstance(u.get("roles"), str):
-                try:
-                    u["roles"] = json.loads(u["roles"])
-                except Exception:
-                    u["roles"] = []
-            if isinstance(u.get("metadata"), str):
-                try:
-                    u["metadata"] = json.loads(u["metadata"])
-                except Exception:
-                    u["metadata"] = {}
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            users = []
+            for r in rows:
+                u = dict(r)
+                if isinstance(u.get("roles"), str):
+                    try:
+                        u["roles"] = json.loads(u["roles"])
+                    except Exception:
+                        u["roles"] = []
+                if isinstance(u.get("metadata"), str):
+                    try:
+                        u["metadata"] = json.loads(u["metadata"])
+                    except Exception:
+                        u["metadata"] = {}
 
-            if role:
-                user_roles = [str(rl).strip().lower() for rl in u.get("roles", [])]
-                if role.strip().lower() not in user_roles:
-                    continue
+                if role:
+                    user_roles = [str(rl).strip().lower() for rl in u.get("roles", [])]
+                    if role.strip().lower() not in user_roles:
+                        continue
 
-            users.append(u)
-        return users
+                users.append(u)
+            return users
 
     def get_roles(self, user_id: str) -> List[str]:
         """Retrieve all role strings assigned to a user."""
@@ -398,13 +396,13 @@ class UserRepository(abstractUserRepository):
         expires_at = (now + timedelta(minutes=expires_in_minutes)).isoformat()
         token_id = f"prt_{uuid.uuid4().hex[:16]}"
 
-        with self.conn:
+        with self._get_connection() as conn:
             # Invalidate any previously unused reset tokens for this user
-            self.conn.execute(
+            conn.execute(
                 "UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
                 (now_str, str(user_id)),
             )
-            self.conn.execute(
+            conn.execute(
                 """
                 INSERT INTO password_reset_tokens (
                     id, user_id, token_hash, expires_at, created_at, used_at, ip_address
@@ -412,6 +410,7 @@ class UserRepository(abstractUserRepository):
                 """,
                 (token_id, str(user_id), token_hash, expires_at, now_str, ip_address or ""),
             )
+            conn.commit()
 
         return raw_token
 
@@ -424,33 +423,34 @@ class UserRepository(abstractUserRepository):
         token_hash = self._hash_reset_token(clean_token)
         now_utc = datetime.now(timezone.utc)
 
-        cursor = self.conn.cursor()
-        query = """
-            SELECT prt.id, prt.user_id, prt.expires_at, prt.created_at, prt.used_at,
-                   u.username, u.email, u.is_active
-            FROM password_reset_tokens prt
-            JOIN users u ON prt.user_id = u.id
-            WHERE prt.token_hash = ? AND prt.used_at IS NULL
-        """
-        cursor.execute(query, (token_hash,))
-        row = cursor.fetchone()
-        if not row:
-            return None
-
-        record = dict(row)
-        if not record.get("is_active", 1):
-            return None
-
-        expires_at_str = record.get("expires_at")
-        if expires_at_str:
-            try:
-                exp_dt = datetime.fromisoformat(expires_at_str)
-                if now_utc > exp_dt:
-                    return None
-            except Exception:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            query = """
+                SELECT prt.id, prt.user_id, prt.expires_at, prt.created_at, prt.used_at,
+                       u.username, u.email, u.is_active
+                FROM password_reset_tokens prt
+                JOIN users u ON prt.user_id = u.id
+                WHERE prt.token_hash = ? AND prt.used_at IS NULL
+            """
+            cursor.execute(query, (token_hash,))
+            row = cursor.fetchone()
+            if not row:
                 return None
 
-        return record
+            record = dict(row)
+            if not record.get("is_active", 1):
+                return None
+
+            expires_at_str = record.get("expires_at")
+            if expires_at_str:
+                try:
+                    exp_dt = datetime.fromisoformat(expires_at_str)
+                    if now_utc > exp_dt:
+                        return None
+                except Exception:
+                    return None
+
+            return record
 
     def consume_password_reset_token(self, raw_token: str, new_hashed_password: str) -> Optional[str]:
         """Atomically mark token as consumed and update the user's hashed password."""
@@ -463,18 +463,19 @@ class UserRepository(abstractUserRepository):
         now_str = datetime.now(timezone.utc).isoformat()
 
         try:
-            with self.conn:
-                cursor = self.conn.execute(
+            with self._get_connection() as conn:
+                cursor = conn.execute(
                     "UPDATE password_reset_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL",
                     (now_str, token_id),
                 )
                 if cursor.rowcount == 0:
                     return None
 
-                self.conn.execute(
+                conn.execute(
                     "UPDATE users SET hashed_password = ? WHERE id = ?",
                     (new_hashed_password, str(user_id)),
                 )
+                conn.commit()
             return str(user_id)
         except sqlite3.Error:
             return None

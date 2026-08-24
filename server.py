@@ -123,7 +123,7 @@ mfa_prov = concreteMFAProvider()
 audit_log = AuditLogger(db_file="DATABASE.db")
 oauth_mgr = OAuthManager(redis_client=sess_store.r)
 task_repo = TaskRepository(db_file="DATABASE.db")
-email_svc = EmailService()
+email_svc = EmailService(audit_logger=audit_log)
 device_trust_svc = DeviceTrustService(db_file="DATABASE.db")
 auth = Authenticator(
     user_repo=repo,

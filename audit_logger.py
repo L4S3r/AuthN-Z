@@ -6,6 +6,7 @@ authentication, authorization, and multi-tenant workspace events.
 """
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import json
@@ -82,10 +83,14 @@ class AuditLogger(abstractAuditLogger):
         self.db_file = db_file
         self._create_table()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_connection(self):
         conn = sqlite3.connect(self.db_file, timeout=10.0)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _create_table(self) -> None:
         """Create audit_logs table, configure WAL mode, and ensure workspace_id column exists."""

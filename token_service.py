@@ -133,23 +133,49 @@ class TokenService(abstractTokenService):
     ):
         self.algorithm = algorithm
         self.secret_key = secret_key or self._get_or_generate_secret_key()
+        host_env = os.getenv("REDIS_HOST", "127.0.0.1")
+        port_env = int(os.getenv("REDIS_PORT", "6379"))
+        password_env = os.getenv("REDIS_PASSWORD", None)
+        is_prod = os.getenv("ENVIRONMENT", "development").lower() == "production"
+        require_redis = os.getenv("REQUIRE_REDIS", "false").lower() in ("true", "1") or is_prod
+
+        if host_env == "localhost":
+            host_env = "127.0.0.1"
+
         if redis_client is not None:
             self.r = redis_client
         elif redis is not None:
             try:
-                self.r = redis.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True, socket_connect_timeout=0.5, socket_timeout=0.5)
+                self.r = redis.Redis(
+                    host=host_env,
+                    port=port_env,
+                    password=password_env,
+                    db=0,
+                    decode_responses=True,
+                    socket_connect_timeout=0.5,
+                    socket_timeout=0.5,
+                )
                 self.r.ping()
             except Exception as exc:
+                if require_redis:
+                    raise RuntimeError(
+                        f"CRITICAL CONFIGURATION ERROR: Redis is required for shared multi-worker JWT blocklist in production "
+                        f"(ENVIRONMENT=production or REQUIRE_REDIS=true), but could not be reached at {host_env}:{port_env} ({exc})."
+                    )
                 logger.warning(
-                    "Redis connection failed (%s). Falling back to in-memory JWT blocklist. "
-                    "Warning: In-memory blocklists are not shared across multi-process workers.",
+                    "[ARCHITECTURE NOTICE] Redis connection failed (%s). Falling back to in-memory JWT blocklist. "
+                    "Warning: In-memory blocklists are not shared across multi-process workers (uvicorn --workers > 1).",
                     exc,
                 )
                 self.r = None
         else:
+            if require_redis:
+                raise RuntimeError(
+                    "CRITICAL CONFIGURATION ERROR: The 'redis' Python package is required in production (ENVIRONMENT=production or REQUIRE_REDIS=true), but is not installed."
+                )
             self.r = None
             logger.warning(
-                "The 'redis' package is not installed. Falling back to in-memory JWT blocklist. "
+                "[ARCHITECTURE NOTICE] The 'redis' package is not installed. Falling back to in-memory JWT blocklist. "
                 "Install with `python -m pip install redis` to enable shared Redis persistence."
             )
         self._in_memory_blocklist: Set[str] = set()

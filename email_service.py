@@ -21,13 +21,18 @@ logger = logging.getLogger("auth_nz.email_service")
 
 
 class EmailService:
-    def __init__(self):
+    def __init__(self, audit_logger=None):
+        self.audit_logger = audit_logger
         self.reload_config()
+
+    def set_audit_logger(self, audit_logger) -> None:
+        """Attach an AuditLogger instance dynamically."""
+        self.audit_logger = audit_logger
 
     def reload_config(self) -> None:
         """Reload configuration dynamically from environment variables with safe defaults."""
         try:
-            load_dotenv(override=True)
+            load_dotenv()
             self.smtp_host = os.getenv("SMTP_HOST")
             port_env = os.getenv("SMTP_PORT", "587")
             try:
@@ -113,10 +118,25 @@ class EmailService:
             error_detail = "SMTP credentials (SMTP_HOST, SMTP_USER, SMTP_PASSWORD) not configured in .env"
 
         if not sent_via_smtp:
-            logger.info("--- TRANSACTIONAL EMAIL LOG (FALLBACK) ---")
-            logger.info("TO: %s | SUBJECT: %s", clean_recipient, subject)
-            logger.info("SMTP STATUS: %s", error_detail)
-            logger.info("------------------------------------------")
+            logger.warning("--- TRANSACTIONAL EMAIL LOG (FALLBACK) ---")
+            logger.warning("TO: %s | SUBJECT: %s", clean_recipient, subject)
+            logger.warning("SMTP STATUS: %s", error_detail)
+            logger.warning("------------------------------------------")
+
+            if self.audit_logger is not None:
+                try:
+                    self.audit_logger.record_security_event(
+                        event_name="SMTP_DELIVERY_FAILURE",
+                        severity="WARNING",
+                        details={
+                            "recipient": clean_recipient,
+                            "subject": subject,
+                            "reason": error_detail,
+                            "fallback": "console_log",
+                        },
+                    )
+                except Exception as audit_exc:
+                    logger.warning("Failed to record SMTP failure audit event: %s", audit_exc)
 
         return {
             "delivered": sent_via_smtp,

@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional, Set
 from datetime import datetime, timezone
 import secrets
 import json
+import os
 try:
     import redis
 except ImportError:
@@ -73,25 +74,51 @@ class SessionStore(abstractSessionStore):
         self._in_memory_sessions: Dict[str, Dict[str, Any]] = {}
         self._in_memory_user_index: Dict[str, Set[str]] = {}
 
-        if host == "localhost":
-            host = "127.0.0.1"
+        host_env = os.getenv("REDIS_HOST", host or "127.0.0.1")
+        port_env = int(os.getenv("REDIS_PORT", port or 6379))
+        password_env = os.getenv("REDIS_PASSWORD", None)
+        is_prod = os.getenv("ENVIRONMENT", "development").lower() == "production"
+        require_redis = os.getenv("REQUIRE_REDIS", "false").lower() in ("true", "1") or is_prod
+
+        if host_env == "localhost":
+            host_env = "127.0.0.1"
+
         if redis is not None:
             try:
-                self.r = redis.Redis(host=host, port=port, db=db, decode_responses=True, socket_connect_timeout=0.5, socket_timeout=0.5)
+                self.r = redis.Redis(
+                    host=host_env,
+                    port=port_env,
+                    password=password_env,
+                    db=db,
+                    decode_responses=True,
+                    socket_connect_timeout=0.5,
+                    socket_timeout=0.5,
+                )
                 self.r.ping()
             except Exception as exc:
+                if require_redis:
+                    raise RuntimeError(
+                        f"CRITICAL CONFIGURATION ERROR: Redis is required for shared multi-worker state in production "
+                        f"(ENVIRONMENT=production or REQUIRE_REDIS=true), but could not be reached at {host_env}:{port_env} ({exc}). "
+                        f"Refusing to start with process-isolated in-memory state."
+                    )
                 logger.warning(
-                    "Redis session store is currently unreachable at %s:%s (%s). "
-                    "Falling back to in-memory sessions.",
-                    host,
-                    port,
+                    "[ARCHITECTURE NOTICE] Redis session store unreachable at %s:%s (%s). "
+                    "Running in SINGLE-WORKER in-memory mode. "
+                    "Sessions are not shared across multi-process workers (uvicorn --workers > 1).",
+                    host_env,
+                    port_env,
                     exc,
                 )
                 self.r = None
         else:
+            if require_redis:
+                raise RuntimeError(
+                    "CRITICAL CONFIGURATION ERROR: The 'redis' Python package is required in production (ENVIRONMENT=production or REQUIRE_REDIS=true), but is not installed."
+                )
             self.r = None
             logger.warning(
-                "The 'redis' package is not installed. Falling back to in-memory sessions. "
+                "[ARCHITECTURE NOTICE] The 'redis' package is not installed. Running in SINGLE-WORKER in-memory mode. "
                 "Install with `python -m pip install redis` to enable shared Redis persistence."
             )
 
