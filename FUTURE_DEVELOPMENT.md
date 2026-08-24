@@ -19,10 +19,39 @@ Implemented and active via `oauth_provider.py` and `server.py`:
   - `GET /auth/oauth/{provider}/callback` - Web OAuth redirect callback handler.
   - `POST /auth/oauth/{provider}/exchange` - Direct authorization code exchange for mobile apps (Flutter, React Native, Swift, Kotlin).
 
+---
+
+## 2. Multi-Tenancy and Scoped Permissions (COMPLETED)
+
+### Objective
+Support SaaS multi-tenant environments with isolated organization boundaries, custom team workspaces, and scoped role clearances.
+
+### Status
+Implemented and active via `workspace_repository.py`, `permission_evaluator.py`, `audit_logger.py`, and `server.py`:
+- `WorkspaceRepository` providing multi-workspace provisioning, cryptographic invite tokens, member role management, and idempotent invitations (`ON CONFLICT DO UPDATE`).
+- Scoped RBAC in `PermissionEvaluator` (`superadmin` > `admin` > `developer` > `editor` > `viewer`) evaluated per workspace scope.
+- REST endpoints for Workspace CRUD, member onboarding, and contextual workspace switching (`POST /auth/workspaces/switch`).
+- Workspace-scoped audit logging telemetry in `AuditLogger` (`GET /workspaces/{id}/audit-logs`).
+- Task gateway authorization enforcing that only Editors, Admins, and Superadmins can create, edit, or delete sprint tasks.
 
 ---
 
-## 2. WebAuthn and FIDO2 Passkey Support
+## 3. Production Database and Scalability Migration (COMPLETED)
+
+### Objective
+Transition storage engines from local SQLite to distributed, production-grade databases with non-blocking async execution.
+
+### Status
+Implemented and active across all repositories:
+- Asynchronous SQLAlchemy 2.0 and `asyncpg` connection pooling in `database.py`.
+- 9 declarative relational models in `models.py` with native `UUID`, `JSONB`, and `TIMESTAMPTZ` types.
+- Zero-downtime Alembic database schema migrations (`alembic/versions/0001_initial_schema.py`).
+- 5 async repository implementations: `user_repository.py`, `workspace_repository.py`, `task_repository.py`, `audit_logger.py`, and `device_trust_service.py`.
+- Full CLI administrative toolkit in `db_manager.py`, `seed_admin.py`, and `promote_admin.py`.
+
+---
+
+## 4. WebAuthn and FIDO2 Passkey Support
 
 ### Objective
 Enable biometric, hardware-key (YubiKey), and passwordless authentication standards.
@@ -35,7 +64,7 @@ Enable biometric, hardware-key (YubiKey), and passwordless authentication standa
 
 ---
 
-## 3. Distributed Policy Storage and Open Policy Agent (OPA) Integration
+## 5. Distributed Policy Storage and Open Policy Agent (OPA) Integration
 
 ### Objective
 Externalize fine-grained authorization rules into declarative policy definitions.
@@ -47,19 +76,7 @@ Externalize fine-grained authorization rules into declarative policy definitions
 
 ---
 
-## 4. Production Database and Scalability Migration
-
-### Objective
-Transition storage engines from local SQLite to distributed, production-grade databases.
-
-### Implementation Plan
-1. Implement `PostgresUserRepository` and `PostgresAuditLogger` using connection pooling (`asyncpg` / `SQLAlchemy`).
-2. Add automated database migration tooling (`alembic`).
-3. Migrate `AuditLogger` to a dedicated time-series or append-only log engine (Elasticsearch, OpenSearch, or ClickHouse) for high-throughput environments.
-
----
-
-## 5. Security Telemetry, Anomaly Detection, and Rate Limiting
+## 6. Security Telemetry, Anomaly Detection, and Rate Limiting
 
 ### Objective
 Detect credential stuffing, distributed brute-force attacks, and compromised credentials.
@@ -69,18 +86,3 @@ Detect credential stuffing, distributed brute-force attacks, and compromised cre
 2. Implement automated account lockout with exponential backoff after repeated failed attempts.
 3. Add IP geolocation and device fingerprinting to `AuditLogger` for impossible travel detection.
 4. Provide webhook integrations for real-time alerts on `CRITICAL` severity events (Slack, PagerDuty, Email).
-
----
-
-## 6. Multi-Tenancy and Scoped Permissions (COMPLETED)
-
-### Objective
-Support SaaS multi-tenant environments with isolated organization boundaries, custom team workspaces, and scoped role clearances.
-
-### Status
-Implemented and active via `workspace_repository.py`, `permission_evaluator.py`, `audit_logger.py`, and `server.py`:
-- `WorkspaceRepository` providing multi-workspace provisioning, cryptographic invite tokens, member role management, and migration.
-- Scoped RBAC in `PermissionEvaluator` (`superadmin` > `admin` > `editor` > `viewer`) evaluated per workspace scope.
-- REST endpoints for Workspace CRUD, member onboarding, and contextual workspace switching (`POST /auth/workspaces/switch`).
-- Workspace-scoped audit logging telemetry in `AuditLogger` (`GET /workspaces/{id}/audit-logs`).
-- Task gateway authorization enforcing that only Editors, Admins, and Superadmins can create, edit, or delete sprint tasks.
