@@ -180,22 +180,6 @@ class TokenService(abstractTokenService):
         self._in_memory_blocklist: Set[str] = set()
         self._in_memory_revoked_families: Set[str] = set()
 
-
-    def _get_or_generate_secret_key(self, key_name: str = "JWT_SECRET_KEY") -> str:
-        existing_key = os.environ.get(key_name)
-        if existing_key:
-            return existing_key
-        if os.path.exists(".env"):
-            with open(".env", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith(f"{key_name}="):
-                        return line.strip().split("=", 1)[1]
-        new_key = secrets.token_urlsafe(32)
-        with open(".env", "a", encoding="utf-8") as f:
-            f.write(f"{key_name}={new_key}\n")
-        print(f"Generated new secret key and saved to .env as '{key_name}'")
-        return new_key
-
     def create_access_token(
         self,
         subject_id: str,

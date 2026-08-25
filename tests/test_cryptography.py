@@ -33,7 +33,7 @@ def test_password_hasher_empty_and_unicode():
 
 
 def test_token_service_access_and_refresh_tokens():
-    svc = TokenService(secret_key="unit_test_secret_key_1234567890")
+    svc = TokenService(secret_key="unit_test_secret_key_1234567890_32bytes")
     user_id = "test-user-uuid-1234"
     roles = ["developer", "editor"]
 
@@ -52,7 +52,7 @@ def test_token_service_access_and_refresh_tokens():
 
 
 def test_token_service_revocation():
-    svc = TokenService(secret_key="unit_test_secret_key_1234567890")
+    svc = TokenService(secret_key="unit_test_secret_key_1234567890_32bytes")
     user_id = "test-user-revocation"
 
     token = svc.create_access_token(user_id)

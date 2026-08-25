@@ -44,19 +44,17 @@ class abstractMFAProvider(ABC):
     @abstractmethod
     def get_provisioning_uri(
         self,
-        user_id: str,
         secret: str,
         account_name: str,
-        issuer_name: str = "MySecureApp",
+        issuer: str = "Auth N&Z",
     ) -> str:
         """
         Generate an 'otpauth://totp/...' URI used to produce QR codes for authenticator applications.
 
         Args:
-            user_id: The unique identifier of the user.
             secret: The base32-encoded shared secret.
             account_name: The user's label or email to show in the authenticator app.
-            issuer_name: The name of the organization or application.
+            issuer: The name of the organization or application.
 
         Returns:
             A formatted URI string adhering to the Key URI Format (RFC 6238 / Google Authenticator standard).
@@ -142,33 +140,14 @@ class MFAProvider(abstractMFAProvider):
 
     def get_provisioning_uri(
         self,
-        *args,
-        issuer: Optional[str] = None,
-        issuer_name: Optional[str] = None,
-        **kwargs,
+        secret: str,
+        account_name: str,
+        issuer: str = "Auth N&Z",
     ) -> str:
         """
         Generate an 'otpauth://totp/...' URI used to produce QR codes for authenticator applications.
-        Supports both (secret, account_name, issuer=...) and (user_id, secret, account_name, issuer_name=...).
         """
-        secret = kwargs.get("secret")
-        account_name = kwargs.get("account_name")
-        effective_issuer = issuer or issuer_name or kwargs.get("issuer") or "Auth N&Z"
-
-        if len(args) >= 4:
-            _, secret, account_name, arg_issuer = args[:4]
-            effective_issuer = arg_issuer or effective_issuer
-        elif len(args) == 3:
-            if "@" in str(args[1]) or "." in str(args[1]):
-                secret, account_name, effective_issuer = args
-            else:
-                _, secret, account_name = args
-        elif len(args) == 2:
-            secret, account_name = args
-        elif len(args) == 1:
-            secret = args[0]
-
-        escaped_issuer = quote(str(effective_issuer or "Auth N&Z"))
+        escaped_issuer = quote(str(issuer or "Auth N&Z"))
         escaped_account = quote(str(account_name or "user"))
         return (
             f"otpauth://totp/{escaped_issuer}:{escaped_account}?"

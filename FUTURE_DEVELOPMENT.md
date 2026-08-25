@@ -80,13 +80,17 @@ Implemented and active via `policy_engine.py`, `opa_client.py`, `policies/rules.
 
 ---
 
-## 6. Security Telemetry, Anomaly Detection, and Rate Limiting
+## 6. Security Telemetry, Anomaly Detection, and Rate Limiting (PARTIALLY COMPLETED)
 
 ### Objective
 Detect credential stuffing, distributed brute-force attacks, and compromised credentials.
 
-### Implementation Plan
-1. Integrate sliding-window rate limiting using Redis token bucket algorithms (e.g. max 5 failed logins per minute per IP).
-2. Implement automated account lockout with exponential backoff after repeated failed attempts.
-3. Add IP geolocation and device fingerprinting to `AuditLogger` for impossible travel detection.
-4. Provide webhook integrations for real-time alerts on `CRITICAL` severity events (Slack, PagerDuty, Email).
+### Status & Implemented Controls
+Implemented and active via `api/dependencies.py`, `authenticator.py`, and `audit_logger.py`:
+- Distributed sliding-window rate limiting on login, password-reset, and email endpoints with automatic in-memory sliding-window fallback when Redis is unreachable.
+- Automated progressive account lockout with exponential backoff after repeated failed authentication attempts (Redis-backed with in-memory fallback).
+- Structured audit event recording with contextual metadata (IP address, user agent, event severity).
+
+### Next Roadmap Items
+1. Add IP geolocation and device fingerprinting to `AuditLogger` for impossible travel detection.
+2. Provide webhook integrations for real-time alerts on `CRITICAL` severity events (Slack, PagerDuty, Email).

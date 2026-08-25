@@ -46,7 +46,7 @@ async def setup_mfa(current_user: Dict[str, Any] = Depends(get_current_user)):
     metadata["pending_backup_codes"] = hashed_backups
     await user_repo.update_user(user_id, {"metadata": metadata})
 
-    uri = mfa_prov.get_provisioning_uri(user_id, secret, user["email"])
+    uri = mfa_prov.get_provisioning_uri(secret=secret, account_name=user["email"])
     return {
         "status": "SUCCESS",
         "secret": secret,
