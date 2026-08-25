@@ -84,6 +84,19 @@ class WebAuthnAuthVerifyRequest(BaseModel):
 
 
 # =============================================================================
+# Policy & Authorization Schemas
+# =============================================================================
+class PolicySimulateRequest(BaseModel):
+    subject_id: Optional[str] = None
+    subject: Optional[Dict[str, Any]] = None
+    action: str = Field(..., description="Action to simulate: read, write, delete, etc.")
+    resource_type: str = Field(..., description="Target resource type: documents, tasks, workspaces, etc.")
+    resource_id: str = Field(default="sample_res_id", description="Resource unique ID")
+    resource_attributes: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Attributes of the target resource")
+    context: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Contextual attributes e.g. workspace_id")
+
+
+# =============================================================================
 # OAuth2 / Social Login Schemas
 # =============================================================================
 class OAuthExchangeRequest(BaseModel):

@@ -158,6 +158,62 @@ def _cmd_metrics_dump(args):
     print(metrics_collector.generate_prometheus_metrics())
 
 
+def _cmd_policies_inspect(args):
+    from policy_engine import DeclarativePolicyEngine
+    from opa_client import OPAClient
+    engine = DeclarativePolicyEngine()
+    opa = OPAClient()
+    print("\n--- Declarative Policy Rules ---")
+    print(f"  Policy File:    {engine.policy_file_path}")
+    print(f"  Policy Hash:    {engine.policy_hash}")
+    print(f"  Defined Roles:  {', '.join(engine.role_permissions.keys())}")
+    print(f"  ABAC Rules:     {len(engine.abac_rules)}")
+    print(f"  OPA Enabled:    {opa.enabled} ({opa.endpoint_url})\n")
+
+
+def _cmd_policies_reload(args):
+    from policy_engine import DeclarativePolicyEngine, DistributedPolicyManager
+    manager = DistributedPolicyManager()
+    success = manager.engine.load_policies()
+    manager.invalidate_cache()
+    status_str = "SUCCESS" if success else "FALLBACK"
+    print(f"\n[{status_str}] Policy definitions reloaded (Hash: {manager.engine.policy_hash}). Distributed caches evicted.\n")
+
+
+async def _cmd_policies_simulate(args):
+    from policy_engine import DistributedPolicyManager
+    manager = DistributedPolicyManager()
+    subject = {
+        "id": args.subject_id or "cli_user",
+        "email": args.email or "user@example.com",
+        "roles": [r.strip() for r in args.roles.split(",") if r.strip()],
+        "clearance": args.clearance,
+        "department": args.department,
+        "is_superadmin": "superadmin" in args.roles,
+    }
+    res_attrs = {}
+    if args.resource_owner:
+        res_attrs["owner_id"] = args.resource_owner
+    if args.required_clearance:
+        res_attrs["required_clearance"] = args.required_clearance
+    if args.resource_department:
+        res_attrs["department"] = args.resource_department
+
+    decision = await manager.evaluate_access(
+        subject=subject,
+        action=args.action,
+        resource_type=args.resource_type,
+        resource_id=args.resource_id or "test_resource_1",
+        resource_attributes=res_attrs,
+    )
+    res_str = "ALLOWED" if decision else "DENIED"
+    print(f"\n--- Policy Evaluation Simulation Result ---")
+    print(f"  Decision:      {res_str}")
+    print(f"  Subject:       {subject['email']} (Roles: {subject['roles']}, Clearance: {subject['clearance']}, Dept: {subject['department']})")
+    print(f"  Action:        {args.action}")
+    print(f"  Resource:      {args.resource_type}/{args.resource_id or 'test_resource_1'} ({res_attrs})\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="authnz",
@@ -223,6 +279,24 @@ def main():
     metrics_sub = metrics_parser.add_subparsers(dest="action")
     metrics_sub.add_parser("dump", help="Dump Prometheus metrics text")
 
+    # Policies
+    policies_parser = subparsers.add_parser("policies", help="Declarative authorization policies & OPA")
+    policies_sub = policies_parser.add_subparsers(dest="action")
+    policies_sub.add_parser("inspect", help="Inspect loaded declarative rules and OPA status")
+    policies_sub.add_parser("reload", help="Hot-reload policy definitions and purge caches")
+    pol_sim = policies_sub.add_parser("simulate", help="Simulate a policy authorization decision")
+    pol_sim.add_argument("--subject-id", help="Subject user ID")
+    pol_sim.add_argument("--email", help="Subject email")
+    pol_sim.add_argument("--roles", default="viewer", help="Comma-separated roles")
+    pol_sim.add_argument("--clearance", type=int, default=1, help="Subject clearance level")
+    pol_sim.add_argument("--department", default="General", help="Subject department")
+    pol_sim.add_argument("--action", required=True, help="Action e.g. read, write, delete")
+    pol_sim.add_argument("--resource-type", required=True, help="Resource type e.g. documents, tasks")
+    pol_sim.add_argument("--resource-id", help="Resource ID")
+    pol_sim.add_argument("--resource-owner", help="Owner ID of the target resource")
+    pol_sim.add_argument("--required-clearance", type=int, help="Required clearance of resource")
+    pol_sim.add_argument("--resource-department", help="Department of the resource")
+
     args = parser.parse_args()
 
     if not args.subcommand:
@@ -266,6 +340,16 @@ def main():
             _cmd_metrics_dump(args)
         else:
             metrics_parser.print_help()
+
+    elif args.subcommand == "policies":
+        if args.action == "inspect":
+            _cmd_policies_inspect(args)
+        elif args.action == "reload":
+            _cmd_policies_reload(args)
+        elif args.action == "simulate":
+            asyncio.run(_cmd_policies_simulate(args))
+        else:
+            policies_parser.print_help()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,5 @@
 *_list.md
 *demo.py
 __pycache__/
-*.json
 digest.txt
 REFACTORING_REPORT.md

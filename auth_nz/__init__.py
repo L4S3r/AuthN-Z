@@ -42,6 +42,8 @@ from oauth_provider import OAuthManager
 from email_service import EmailService
 from webauthn_service import WebAuthnService
 from metrics import MetricsCollector, metrics_collector
+from opa_client import OPAClient
+from policy_engine import DeclarativePolicyEngine, DistributedPolicyManager
 from api.router import api_router
 
 __all__ = [
@@ -60,6 +62,9 @@ __all__ = [
     "WebAuthnService",
     "MetricsCollector",
     "metrics_collector",
+    "OPAClient",
+    "DeclarativePolicyEngine",
+    "DistributedPolicyManager",
     "settings",
     "AuthNZSettings",
     "api_router",

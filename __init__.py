@@ -33,6 +33,8 @@ from oauth_provider import OAuthManager
 from email_service import EmailService
 from webauthn_service import WebAuthnService
 from metrics import MetricsCollector, metrics_collector
+from opa_client import OPAClient
+from policy_engine import DeclarativePolicyEngine, DistributedPolicyManager
 
 # Database and Settings
 from database import get_engine, get_session_factory, get_db_session
@@ -87,6 +89,9 @@ __all__ = [
     "WebAuthnService",
     "MetricsCollector",
     "metrics_collector",
+    "OPAClient",
+    "DeclarativePolicyEngine",
+    "DistributedPolicyManager",
     # Database & Configuration
     "get_engine",
     "get_session_factory",

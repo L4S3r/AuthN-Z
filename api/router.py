@@ -18,6 +18,7 @@ from api.v1.websocket_router import router as websocket_router
 from api.v1.task_router import router as task_router
 from api.v1.webauthn_router import router as webauthn_router
 from api.v1.health_router import router as health_router
+from api.v1.policy_router import router as policy_router
 
 api_router = APIRouter()
 
@@ -34,3 +35,4 @@ api_router.include_router(websocket_router)
 api_router.include_router(task_router)
 api_router.include_router(webauthn_router)
 api_router.include_router(health_router)
+api_router.include_router(policy_router)

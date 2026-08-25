@@ -1,0 +1,114 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2026-08-25T18:00:00Z",
+  "role_hierarchy": {
+    "superadmin": 5,
+    "admin": 4,
+    "developer": 3,
+    "editor": 2,
+    "viewer": 1
+  },
+  "roles": {
+    "superadmin": {
+      "description": "Global Superadministrator with blanket system authority",
+      "permissions": [
+        "*"
+      ]
+    },
+    "admin": {
+      "description": "Workspace Administrator",
+      "permissions": [
+        "workspaces:read",
+        "workspaces:update",
+        "workspaces:delete",
+        "workspaces:invite",
+        "workspaces:manage_members",
+        "workspaces:audit_logs",
+        "tasks:create",
+        "tasks:read",
+        "tasks:update",
+        "tasks:delete",
+        "team:invite",
+        "team:manage",
+        "documents:read",
+        "documents:write",
+        "documents:delete"
+      ]
+    },
+    "developer": {
+      "description": "Engineering and API Integrator",
+      "permissions": [
+        "code:read",
+        "code:write",
+        "code:commit",
+        "workspaces:read",
+        "tasks:create",
+        "tasks:read",
+        "tasks:update",
+        "documents:read",
+        "documents:write",
+        "reports:read",
+        "team:read"
+      ]
+    },
+    "editor": {
+      "description": "Content & Sprint Contributor",
+      "permissions": [
+        "workspaces:read",
+        "tasks:create",
+        "tasks:read",
+        "tasks:update",
+        "documents:read",
+        "documents:write"
+      ]
+    },
+    "viewer": {
+      "description": "Read-only workspace consumer",
+      "permissions": [
+        "workspaces:read",
+        "tasks:read",
+        "documents:read"
+      ]
+    }
+  },
+  "abac_rules": [
+    {
+      "id": "rule_superadmin_bypass",
+      "description": "Superadmin role grants unconditional access to all resources",
+      "condition": "user.is_superadmin == true",
+      "effect": "ALLOW"
+    },
+    {
+      "id": "rule_document_ownership",
+      "resource_type": "documents",
+      "action": "read",
+      "description": "Users can always read documents they own",
+      "condition": "resource.owner_id == user.id",
+      "effect": "ALLOW"
+    },
+    {
+      "id": "rule_document_clearance_and_dept",
+      "resource_type": "documents",
+      "action": "read",
+      "description": "Users with sufficient clearance in matching department can read documents",
+      "condition": "user.clearance >= resource.required_clearance and (resource.department == null or user.department == resource.department)",
+      "effect": "ALLOW"
+    },
+    {
+      "id": "rule_public_documents",
+      "resource_type": "documents",
+      "action": "read",
+      "description": "Public documents are readable by any authenticated user",
+      "condition": "resource.is_public == true",
+      "effect": "ALLOW"
+    },
+    {
+      "id": "rule_task_creator_delete",
+      "resource_type": "tasks",
+      "action": "delete",
+      "description": "Task creators with editor clearance can delete their own tasks",
+      "condition": "user.email == resource.created_by and user.role_level >= 2",
+      "effect": "ALLOW"
+    }
+  ]
+}

@@ -78,7 +78,14 @@ class AuthNZSettings(BaseSettings):
     SMTP_PORT: int = Field(default=587, description="SMTP server port")
     SMTP_USER: Optional[str] = Field(default=None, description="SMTP server username")
     SMTP_PASSWORD: Optional[str] = Field(default=None, description="SMTP server password")
-    SMTP_FROM: str = Field(default="Auth N&Z <no-reply@l4s3r.site>", description="Sender email address")
+    SMTP_FROM: str = Field(default="noreply@l4s3r.site", description="Sender email address")
+
+    # Distributed Policy & Open Policy Agent (OPA)
+    OPA_ENABLED: bool = Field(default=False, description="Enable remote Open Policy Agent evaluation")
+    OPA_URL: str = Field(default="http://localhost:8181/v1/data/authnz/allow", description="OPA decision endpoint URL")
+    OPA_TIMEOUT_SECONDS: float = Field(default=1.0, description="Max timeout for OPA evaluation requests")
+    POLICY_CACHE_TTL_SECONDS: int = Field(default=300, description="TTL in seconds for cached policy decisions in Redis")
+    POLICY_FILE_PATH: str = Field(default="policies/rules.json", description="Local declarative policy file path")
 
     # Observability & Monitoring
     SENTRY_DSN: Optional[str] = Field(default=None, description="Sentry DSN for error and performance tracing")

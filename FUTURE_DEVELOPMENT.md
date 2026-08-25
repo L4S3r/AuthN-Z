@@ -51,28 +51,30 @@ Implemented and active across all repositories:
 
 ---
 
-## 4. WebAuthn and FIDO2 Passkey Support
+## 4. WebAuthn and FIDO2 Passkey Support (COMPLETED)
 
 ### Objective
 Enable biometric, hardware-key (YubiKey), and passwordless authentication standards.
 
-### Implementation Plan
-1. Add `py_webauthn` dependency.
-2. Implement Passkey registration challenge generation and credential attestation verification.
-3. Store public key credentials and counter values in `user_repository.py`.
-4. Integrate with `Authenticator` as a first-class primary or second factor.
+### Status
+Implemented and active via `webauthn_service.py` and `api/v1/webauthn_router.py`:
+- W3C WebAuthn Level 3 registration options and credential verification.
+- Passkey authentication challenges with sign counter clone detection.
+- Platform biometric support (Touch ID, Windows Hello, Android Biometrics) & hardware security keys.
 
 ---
 
-## 5. Distributed Policy Storage and Open Policy Agent (OPA) Integration
+## 5. Distributed Policy Storage and Open Policy Agent (OPA) Integration (COMPLETED)
 
 ### Objective
 Externalize fine-grained authorization rules into declarative policy definitions.
 
-### Implementation Plan
-1. Decouple hardcoded RBAC/ABAC matrices into external JSON/YAML configuration or OPA Rego policies.
-2. Support dynamic policy updates without application restarts.
-3. Introduce caching layer (Redis) for resolved effective permission sets with pub/sub cache invalidation.
+### Status
+Implemented and active via `policy_engine.py`, `opa_client.py`, `policies/rules.json`, `policies/authnz.rego`, and `api/v1/policy_router.py`:
+- Decoupled RBAC and ABAC rules into declarative JSON (`policies/rules.json`) and Open Policy Agent Rego (`policies/authnz.rego`).
+- Zero-downtime dynamic policy hot-reload API (`POST /admin/policies/reload`) and interactive policy simulation (`POST /admin/policies/simulate`).
+- Distributed Redis L2 decision caching with automatic cache eviction.
+- CLI policy administration (`python cli.py policies inspect`, `python cli.py policies reload`, `python cli.py policies simulate`).
 
 ---
 
