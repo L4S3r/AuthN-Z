@@ -79,9 +79,9 @@ class SessionStore(abstractSessionStore):
         port_env = port or settings.REDIS_PORT
         db_env = db if db is not None else settings.REDIS_DB
         password_env = settings.REDIS_PASSWORD
-        require_redis = settings.REQUIRE_REDIS or settings.is_production
+        require_redis = (settings.REQUIRE_REDIS or settings.is_production) and not settings.is_testing
         is_testing = settings.is_testing
-        if is_testing and not require_redis:
+        if is_testing and not settings.REQUIRE_REDIS:
             self.r = None
         elif redis is not None:
             try:
