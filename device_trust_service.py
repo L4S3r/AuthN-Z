@@ -212,26 +212,16 @@ class DeviceTrustService(abstractDeviceTrustService):
                 await session.commit()
                 return None
 
-            # Device binding: Verify presented User-Agent matches enrolled device profile
-            stored_ua = (device.user_agent or "").strip()
-            presented_ua = (user_agent or "").strip()
-            if stored_ua:
-                if stored_ua != presented_ua:
-                    stored_label = parse_device_label(stored_ua)
-                    presented_label = parse_device_label(presented_ua)
-                    if (
-                        stored_label != presented_label
-                        or presented_label == "Unknown Browser / Device"
-                    ):
-                        logger.warning(
-                            "Trusted device user-agent mismatch for user %s (stored: '%s' [%s], presented: '%s' [%s]). Rejecting trust.",
-                            user_id,
-                            stored_ua,
-                            stored_label,
-                            presented_ua,
-                            presented_label,
-                        )
-                        return None
+            # Device binding: Verify presented User-Agent exactly matches enrolled device User-Agent
+            # Exact string equality required; fail closed if either value is None/empty.
+            if not user_agent or not device.user_agent or user_agent != device.user_agent:
+                logger.warning(
+                    "Trusted device user-agent mismatch for user %s (stored: '%s', presented: '%s'). Rejecting trust.",
+                    user_id,
+                    device.user_agent,
+                    user_agent,
+                )
+                return None
 
             # Update last_used_at and IP
             update_values: Dict[str, Any] = {"last_used_at": now_utc}

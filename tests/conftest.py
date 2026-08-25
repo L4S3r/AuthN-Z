@@ -16,6 +16,7 @@ from httpx import AsyncClient, ASGITransport
 test_db_url = os.getenv("TEST_DATABASE_URL", "postgresql+asyncpg://authnz_app:testpassword123@127.0.0.1:5432/authnz_test")
 os.environ["DATABASE_URL"] = test_db_url
 os.environ["JWT_SECRET_KEY"] = "test_jwt_super_secret_key_1234567890"
+os.environ["ENVIRONMENT"] = "testing"
 
 from database import get_engine, get_session_factory
 from models import Base

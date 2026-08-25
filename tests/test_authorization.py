@@ -106,3 +106,118 @@ async def test_abac_policy_evaluation():
     # 4. Clearance failure
     res_high = {"owner_id": "other", "department": "Engineering", "required_clearance": 4}
     assert await evaluator.evaluate_policy(sub_eng, "read", res_high) is False
+
+
+@pytest.mark.asyncio
+async def test_verify_trusted_device_user_agent_exact_match_and_mismatch():
+    """
+    Test verify_trusted_device User-Agent enforcement:
+    (a) Matching user_agent succeeds and updates last_used_at / commit.
+    (b) Mismatched user_agent returns None and aborts update.
+    (c) Missing/empty user_agent fails closed.
+    """
+    import uuid
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import AsyncMock, MagicMock
+    from device_trust_service import DeviceTrustService
+    from models import TrustedDevice
+
+    test_user_id = uuid.uuid4()
+    raw_token = "valid_high_entropy_token_secret_12345"
+    token_hash = DeviceTrustService._hash_token(raw_token)
+    enrolled_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    mismatched_ua = "curl/8.4.0"
+
+    device_id = uuid.uuid4()
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Matching User-Agent -> Returns device record and commits update
+    mock_device = TrustedDevice(
+        id=device_id,
+        user_id=test_user_id,
+        token_hash=token_hash,
+        device_label="Google Chrome on Windows",
+        user_agent=enrolled_ua,
+        ip_address="192.168.1.100",
+        created_at=now_utc,
+        expires_at=now_utc + timedelta(days=30),
+        last_used_at=now_utc,
+    )
+
+    session = AsyncMock()
+    exec_result = MagicMock()
+    exec_result.scalars.return_value.first.return_value = mock_device
+    session.execute.return_value = exec_result
+
+    session_ctx = AsyncMock()
+    session_ctx.__aenter__.return_value = session
+    session_ctx.__aexit__.return_value = None
+    session_factory = MagicMock(return_value=session_ctx)
+
+    service = DeviceTrustService(session_factory=session_factory)
+
+    result = await service.verify_trusted_device(
+        user_id=str(test_user_id),
+        raw_token=raw_token,
+        user_agent=enrolled_ua,
+        ip_address="192.168.1.100",
+    )
+    assert result is not None
+    assert result["id"] == str(device_id)
+    assert result["user_id"] == str(test_user_id)
+    assert session.commit.called is True
+
+    # 2. Mismatched User-Agent (e.g. cookie replay with curl) -> Returns None, no update commit
+    session.reset_mock()
+    exec_result = MagicMock()
+    exec_result.scalars.return_value.first.return_value = mock_device
+    session.execute.return_value = exec_result
+
+    mismatch_result = await service.verify_trusted_device(
+        user_id=str(test_user_id),
+        raw_token=raw_token,
+        user_agent=mismatched_ua,
+        ip_address="192.168.1.100",
+    )
+    assert mismatch_result is None
+    assert session.commit.called is False
+
+    # 3. Missing/None incoming User-Agent -> Fail closed (returns None)
+    session.reset_mock()
+    exec_result = MagicMock()
+    exec_result.scalars.return_value.first.return_value = mock_device
+    session.execute.return_value = exec_result
+
+    none_ua_result = await service.verify_trusted_device(
+        user_id=str(test_user_id),
+        raw_token=raw_token,
+        user_agent=None,
+    )
+    assert none_ua_result is None
+    assert session.commit.called is False
+
+    # 4. Missing/Empty stored User-Agent (legacy device) -> Fail closed (returns None)
+    legacy_device = TrustedDevice(
+        id=device_id,
+        user_id=test_user_id,
+        token_hash=token_hash,
+        device_label="Legacy Device",
+        user_agent="",
+        ip_address="192.168.1.100",
+        created_at=now_utc,
+        expires_at=now_utc + timedelta(days=30),
+        last_used_at=now_utc,
+    )
+    session.reset_mock()
+    exec_result = MagicMock()
+    exec_result.scalars.return_value.first.return_value = legacy_device
+    session.execute.return_value = exec_result
+
+    legacy_result = await service.verify_trusted_device(
+        user_id=str(test_user_id),
+        raw_token=raw_token,
+        user_agent=enrolled_ua,
+    )
+    assert legacy_result is None
+    assert session.commit.called is False
+
