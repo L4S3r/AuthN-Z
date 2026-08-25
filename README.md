@@ -93,11 +93,32 @@ REDIS_PORT=6379
 PASSWORD_HASH_ALGORITHM=argon2id
 ```
 
-### 3. Start the API Gateway
+### 3. Start the API Gateway (Bare-Metal / Recommended for Mini-Servers)
 ```bash
 uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 ```
 Interactive Swagger docs: **http://localhost:8000/docs**
+
+---
+
+### 🐳 4. (OPTIONAL) Docker & Docker Compose Setup
+
+> [!NOTE]
+> **This Docker setup is 100% optional.**
+> For resource-constrained servers (such as mini-servers with 4GB RAM or low-spec VPS), **bare-metal Python execution via systemd** (Step 3 above) is strongly recommended, as it consumes only **~50 MB of RAM** without Docker daemon overhead.
+
+If you are deploying to a cloud container host or want an instant all-in-one local development stack (API + PostgreSQL + Redis + OPA):
+
+```bash
+# Spin up complete stack (Gateway + PostgreSQL + Redis + OPA)
+docker compose up -d
+
+# View container logs
+docker compose logs -f auth-api
+
+# Stop containers
+docker compose down
+```
 
 ---
 

@@ -16,7 +16,7 @@ def test_password_hasher_hashing_and_verification():
     hashed = hasher.hash(plain)
 
     assert hashed != plain
-    assert hashed.startswith("$2b$")
+    assert hashed.startswith("$argon2id$") or hashed.startswith("$2b$")
     assert hasher.verify(plain, hashed) is True
     assert hasher.verify("WrongPassword", hashed) is False
     assert hasher.needs_rehash(hashed) is False

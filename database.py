@@ -5,9 +5,9 @@ Configures the async SQLAlchemy engine using asyncpg for non-blocking PostgreSQL
 Provides connection pooling, session lifecycle helpers, loop-aware engine caching, and environment resolution.
 """
 
+from typing import AsyncGenerator, Dict, Optional
 import asyncio
 import os
-from typing import AsyncGenerator, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,8 +19,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-
 from config import settings
+
 
 def get_database_url() -> str:
     """
@@ -30,19 +30,13 @@ def get_database_url() -> str:
     return settings.get_database_url()
 
 
-_async_engine: Optional[AsyncEngine] = None
-_async_session_factory: Optional[async_sessionmaker[AsyncSession]] = None
-_engine_loop: Optional[asyncio.AbstractEventLoop] = None
+_async_engines: Dict[int, AsyncEngine] = {}
+_async_session_factories: Dict[int, async_sessionmaker[AsyncSession]] = {}
 
 
 def get_engine(db_url: Optional[str] = None) -> AsyncEngine:
     """Get or create singleton AsyncEngine instance with event-loop awareness."""
-    global _async_engine, _async_session_factory, _engine_loop
-
-    try:
-        current_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        current_loop = None
+    global _async_engines, _async_session_factories
 
     if db_url:
         target_url = db_url
@@ -58,28 +52,36 @@ def get_engine(db_url: Optional[str] = None) -> AsyncEngine:
             max_overflow=20,
         )
 
-    # Recreate engine if loop changed or was closed
-    if _async_engine is None or (_engine_loop is not None and current_loop is not None and _engine_loop != current_loop):
-        _engine_loop = current_loop
-        _async_engine = create_async_engine(
+    try:
+        current_loop = asyncio.get_running_loop()
+        loop_id = id(current_loop)
+    except RuntimeError:
+        current_loop = None
+        loop_id = 0
+
+    if loop_id not in _async_engines:
+        engine = create_async_engine(
             get_database_url(),
             echo=False,
             pool_pre_ping=True,
             pool_size=10,
             max_overflow=20,
         )
-        _async_session_factory = async_sessionmaker(
-            bind=_async_engine,
+        factory = async_sessionmaker(
+            bind=engine,
             expire_on_commit=False,
             class_=AsyncSession,
         )
+        _async_engines[loop_id] = engine
+        _async_session_factories[loop_id] = factory
 
-    return _async_engine
+    return _async_engines[loop_id]
 
 
 def get_session_factory(db_url: Optional[str] = None) -> async_sessionmaker[AsyncSession]:
-    """Get or create singleton async_sessionmaker instance."""
-    global _async_session_factory
+    """Get or create singleton async_sessionmaker instance with event-loop awareness."""
+    global _async_session_factories
+
     if db_url:
         engine = get_engine(db_url)
         return async_sessionmaker(
@@ -88,8 +90,15 @@ def get_session_factory(db_url: Optional[str] = None) -> async_sessionmaker[Asyn
             class_=AsyncSession,
         )
 
+    try:
+        current_loop = asyncio.get_running_loop()
+        loop_id = id(current_loop)
+    except RuntimeError:
+        current_loop = None
+        loop_id = 0
+
     get_engine()
-    return _async_session_factory  # type: ignore
+    return _async_session_factories[loop_id]
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
@@ -98,6 +107,9 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     async with session_factory() as session:
         try:
             yield session
+            await session.commit()
         except Exception:
             await session.rollback()
             raise
+        finally:
+            await session.close()

@@ -1,0 +1,107 @@
+# =============================================================================
+# Auth N&Z - Complete Self-Contained Docker Compose Stack (OPTIONAL)
+# =============================================================================
+# NOTE: This containerized stack is completely OPTIONAL.
+# For resource-constrained environments (e.g. low-RAM mini-servers / VPS),
+# running bare-metal Python via systemd (`uvicorn server:app`) uses only ~50MB RAM.
+# =============================================================================
+
+version: "3.8"
+
+services:
+  # 1. Auth N&Z Identity Gateway
+  auth-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: authnz_gateway
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Defaults for internal container networking if omitted in .env
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-authnz_app}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-authnz}}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - PASSWORD_HASH_ALGORITHM=${PASSWORD_HASH_ALGORITHM:-argon2id}
+      - OPA_ENABLED=${OPA_ENABLED:-false}
+      - OPA_URL=${OPA_URL:-http://opa:8181/v1/data/authnz/allow}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - authnz_net
+
+  # 2. PostgreSQL 16 Relational Persistence
+  postgres:
+    image: postgres:16-alpine
+    container_name: authnz_postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-authnz}
+      - POSTGRES_USER=${POSTGRES_USER:-authnz_app}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password123}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-authnz_app} -d ${POSTGRES_DB:-authnz}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - authnz_net
+
+  # 3. Redis 7 Distributed Session & Cache Store
+  redis:
+    image: redis:7-alpine
+    container_name: authnz_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - authnz_net
+
+  # 4. Open Policy Agent (OPA) Sidecar (Optional)
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: authnz_opa
+    restart: unless-stopped
+    ports:
+      - "8181:8181"
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "/policies"
+    volumes:
+      - ./policies:/policies:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8181/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - authnz_net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  authnz_net:
+    driver: bridge

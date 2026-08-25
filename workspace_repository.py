@@ -170,7 +170,18 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         db_url: Optional[str] = None,
         session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
     ):
-        self.session_factory = session_factory or get_session_factory(db_url)
+        self._custom_session_factory = session_factory
+        self._db_url = db_url
+
+    @property
+    def session_factory(self) -> async_sessionmaker[AsyncSession]:
+        if self._custom_session_factory is not None:
+            return self._custom_session_factory
+        return get_session_factory(self._db_url)
+
+    @session_factory.setter
+    def session_factory(self, val: async_sessionmaker[AsyncSession]):
+        self._custom_session_factory = val
 
     @staticmethod
     def _hash_token(token: str) -> str:
