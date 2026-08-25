@@ -75,7 +75,6 @@ py-modules = [
     "metrics",
     "server",
     "cli",
-    "auth_nz",
 ]
 
 [project.optional-dependencies]
