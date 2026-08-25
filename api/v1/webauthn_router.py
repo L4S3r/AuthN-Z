@@ -184,7 +184,7 @@ async def verify_authentication(
 
     if not user:
         # Fallback: scan active users to match credential_id
-        all_users = await user_repo.list_users(limit=500)
+        all_users = await user_repo.list_users()
         for u in all_users:
             meta = u.get("metadata", {})
             if isinstance(meta, str):
