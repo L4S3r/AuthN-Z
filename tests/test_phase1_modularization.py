@@ -116,3 +116,40 @@ def test_server_root_health_and_router_mounts():
 
     for expected in expected_paths:
         assert expected in paths, f"Route '{expected}' not found in OpenAPI schema paths: {paths}"
+
+
+def test_cors_origin_narrowing_and_rejection():
+    """Verify that only authorized l4s3r.site and project-specific Vercel origins are accepted by CORS."""
+    client = TestClient(app)
+
+    # 1. Authorized origin: l4s3r.site domain
+    res_valid1 = client.options("/", headers={"Origin": "https://auth-api.l4s3r.site", "Access-Control-Request-Method": "GET"})
+    assert res_valid1.headers.get("access-control-allow-origin") == "https://auth-api.l4s3r.site"
+
+    # 2. Authorized origin: project-specific Vercel preview
+    res_valid2 = client.options("/", headers={"Origin": "https://l4s3r-tasks-preview.vercel.app", "Access-Control-Request-Method": "GET"})
+    assert res_valid2.headers.get("access-control-allow-origin") == "https://l4s3r-tasks-preview.vercel.app"
+
+    # 3. Unauthorized origin: arbitrary third-party *.vercel.app deployment MUST BE REJECTED
+    res_evil = client.options("/", headers={"Origin": "https://evil-attacker.vercel.app", "Access-Control-Request-Method": "GET"})
+    assert "access-control-allow-origin" not in res_evil.headers
+
+    # 4. Unauthorized origin: random external domain MUST BE REJECTED
+    res_random = client.options("/", headers={"Origin": "https://malicious-site.com", "Access-Control-Request-Method": "GET"})
+    assert "access-control-allow-origin" not in res_random.headers
+
+
+def test_rate_limiter_in_memory_fallback():
+    """Verify rate limiter fallback operates in-memory when Redis is unavailable."""
+    from api.dependencies import check_rate_limit, _in_memory_rate_limits
+
+    test_key = "test_user_rate_limit_key_123"
+    _in_memory_rate_limits.pop(test_key, None)
+
+    # Allow 3 requests in a 10-second window
+    assert check_rate_limit(test_key, max_requests=3, window_seconds=10) is True
+    assert check_rate_limit(test_key, max_requests=3, window_seconds=10) is True
+    assert check_rate_limit(test_key, max_requests=3, window_seconds=10) is True
+
+    # 4th request must be rate limited (blocked)
+    assert check_rate_limit(test_key, max_requests=3, window_seconds=10) is False

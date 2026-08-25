@@ -99,7 +99,7 @@ from metrics import metrics_collector
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ALLOWED_ORIGINS,
-    allow_origin_regex=r"^https://([a-zA-Z0-9_-]+\.)*(l4s3r\.site|vercel\.app)$",
+    allow_origin_regex=r"^https://(([a-zA-Z0-9_-]+\.)*l4s3r\.site|l4s3r-[a-zA-Z0-9_-]+\.vercel\.app)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

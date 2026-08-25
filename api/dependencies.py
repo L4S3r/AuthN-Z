@@ -193,8 +193,15 @@ def clear_trusted_device_cookie(response: Response, request: Request) -> None:
     response.delete_cookie(key="trusted_device", path="/", samesite="lax", secure=is_https)
 
 
+_in_memory_rate_limits: Dict[str, Tuple[int, float]] = {}
+
+
 def check_rate_limit(key: str, max_requests: int, window_seconds: int) -> bool:
-    """Return True if under rate limit, False if threshold exceeded."""
+    """
+    Return True if under rate limit, False if threshold exceeded.
+    Uses Redis sliding-window TTL counters when available, with an in-memory
+    sliding-window fallback and architectural warning when Redis is unreachable.
+    """
     if sess_store and getattr(sess_store, "r", None):
         try:
             rate_key = f"rate_limit:{key}"
@@ -202,9 +209,32 @@ def check_rate_limit(key: str, max_requests: int, window_seconds: int) -> bool:
             if current == 1:
                 sess_store.r.expire(rate_key, window_seconds)
             return current <= max_requests
-        except Exception:
-            return True
-    return True
+        except Exception as exc:
+            logger.warning(
+                "Redis rate limit check failed (%s); falling back to in-memory rate limiter for key '%s'.",
+                exc,
+                key,
+            )
+
+    # In-memory sliding-window fallback
+    now = datetime.now(timezone.utc).timestamp()
+
+    # Periodic cleanup if cache grows large
+    if len(_in_memory_rate_limits) > 5000:
+        expired_keys = [k for k, (_, reset_ts) in _in_memory_rate_limits.items() if now >= reset_ts]
+        for k in expired_keys:
+            _in_memory_rate_limits.pop(k, None)
+
+    entry = _in_memory_rate_limits.get(key)
+    if entry is not None:
+        count, reset_ts = entry
+        if now < reset_ts:
+            count += 1
+            _in_memory_rate_limits[key] = (count, reset_ts)
+            return count <= max_requests
+
+    _in_memory_rate_limits[key] = (1, now + window_seconds)
+    return 1 <= max_requests
 
 
 # =============================================================================
