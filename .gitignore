@@ -1,4 +1,6 @@
 *.env
+.env*
+.env.docker
 *.db
 *.db-wal
 *.db-shm

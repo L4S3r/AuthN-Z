@@ -19,17 +19,18 @@ services:
     ports:
       - "${PORT:-8000}:8000"
     env_file:
-      - .env
+      - ${ENV_FILE:-.env.docker}
     environment:
-      # Defaults for internal container networking if omitted in .env
-      - ENVIRONMENT=${ENVIRONMENT:-production}
-      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-authnz_app}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-authnz}}
-      - REDIS_HOST=${REDIS_HOST:-redis}
-      - REDIS_PORT=${REDIS_PORT:-6379}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-authnz_app}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-authnz}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REQUIRE_REDIS=${REQUIRE_REDIS:-true}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-9d4e5f6a7b8c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e}
       - PASSWORD_HASH_ALGORITHM=${PASSWORD_HASH_ALGORITHM:-argon2id}
-      - OPA_ENABLED=${OPA_ENABLED:-false}
-      - OPA_URL=${OPA_URL:-http://opa:8181/v1/data/authnz/allow}
+      - OPA_ENABLED=${OPA_ENABLED:-true}
+      - OPA_URL=http://opa:8181/v1/data/authnz/allow
     depends_on:
       postgres:
         condition: service_healthy

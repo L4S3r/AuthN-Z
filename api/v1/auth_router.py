@@ -14,6 +14,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, 
 from api.dependencies import (
     hasher,
     user_repo,
+    ws_repo,
     audit_log,
     email_svc,
     perm_eval,
@@ -59,6 +60,7 @@ async def register(req: RegisterRequest, request: Request):
                 "clearance": 1,
             },
         })
+
         client_ip = request.client.host if request.client else "unknown"
         await audit_log.record_security_event(
             event_name="USER_REGISTERED",

@@ -89,10 +89,10 @@ class SessionStore(abstractSessionStore):
                     host=host_env,
                     port=port_env,
                     password=password_env,
-                    db=db,
+                    db=db_env,
                     decode_responses=True,
-                    socket_connect_timeout=0.2,
-                    socket_timeout=0.2,
+                    socket_connect_timeout=2.0,
+                    socket_timeout=2.0,
                 )
                 self.r.ping()
             except Exception as exc:

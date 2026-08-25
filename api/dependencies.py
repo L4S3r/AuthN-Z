@@ -70,19 +70,21 @@ perm_eval = PermissionEvaluator(user_repo=user_repo, workspace_repo=ws_repo)
 security = HTTPBearer(auto_error=False)
 
 
-# =============================================================================
-# Cookie & Transport Utilities
-# =============================================================================
 def get_cookie_domain_and_tls(request: Request) -> Tuple[Optional[str], bool]:
-    """Determine cookie domain and TLS security configuration based on environment and headers."""
-    if settings.is_production:
-        is_https = True
-        domain = ".l4s3r.site"
-    else:
-        proto = (request.headers.get("x-forwarded-proto") or "").lower()
-        is_https = request.url.scheme == "https" or proto == "https"
-        domain = None
-    return domain, is_https
+    """Determine cookie domain and TLS security configuration based on environment and request host."""
+    host = (request.headers.get("host") or request.url.hostname or "").lower().split(":")[0]
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "").lower()
+    is_https = proto == "https" or request.url.scheme == "https"
+
+    # If accessing via localhost / 127.0.0.1 / local IPs, use host-only cookies without forcing TLS
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "testserver") or host.endswith(".local"):
+        return None, is_https
+
+    # If accessing on production domain l4s3r.site, share cookie across *.l4s3r.site
+    if host.endswith(".l4s3r.site") or host == "l4s3r.site":
+        return ".l4s3r.site", True
+
+    return None, is_https
 
 
 def set_auth_cookies(

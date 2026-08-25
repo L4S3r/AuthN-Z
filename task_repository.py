@@ -72,7 +72,7 @@ class TaskRepository:
             if found_id:
                 return found_id
 
-        # Fallback to existing first workspace
+        # Fallback to existing first workspace if any
         first_ws = await session.execute(
             select(Workspace.id).order_by(Workspace.created_at.asc()).limit(1)
         )
@@ -80,18 +80,7 @@ class TaskRepository:
         if existing_id:
             return existing_id
 
-        # Auto-provision default workspace if none exist
-        default_uid = uuid.uuid4()
-        default_ws = Workspace(
-            id=default_uid,
-            name="Default Workspace",
-            slug="default",
-            description="Primary workspace for team collaboration.",
-            created_by="system",
-        )
-        session.add(default_ws)
-        await session.flush()
-        return default_uid
+        raise ValueError("Workspace not found. A valid workspace must be created before managing tasks.")
 
     @staticmethod
     def _format_task(task: Task) -> Dict[str, Any]:
