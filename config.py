@@ -30,6 +30,7 @@ class AuthNZSettings(BaseSettings):
     ARGON2_TIME_COST: int = Field(default=3, description="Argon2id time cost parameter")
     ARGON2_MEMORY_COST: int = Field(default=65536, description="Argon2id memory cost parameter in KiB (64 MiB)")
     ARGON2_PARALLELISM: int = Field(default=4, description="Argon2id parallelism thread count")
+    WEBAUTHN_ENABLED: bool = Field(default=True, description="Enable WebAuthn / FIDO2 Passkey authentication service")
 
     # PostgreSQL Database Backend
     DATABASE_URL: Optional[str] = Field(default=None, description="Async PostgreSQL connection URL (postgresql+asyncpg://...)")

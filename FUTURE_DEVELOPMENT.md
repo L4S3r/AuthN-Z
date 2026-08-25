@@ -57,10 +57,12 @@ Implemented and active across all repositories:
 Enable biometric, hardware-key (YubiKey), and passwordless authentication standards.
 
 ### Status
-Implemented and active via `webauthn_service.py` and `api/v1/webauthn_router.py`:
-- W3C WebAuthn Level 3 registration options and credential verification.
-- Passkey authentication challenges with sign counter clone detection.
-- Platform biometric support (Touch ID, Windows Hello, Android Biometrics) & hardware security keys.
+Implemented and cryptographically verified via `fido2` (`python-fido2`), `webauthn_service.py`, and `api/v1/webauthn_router.py`:
+- W3C WebAuthn Level 3 / FIDO2 `Fido2Server` ceremony orchestration.
+- Full `attestationObject` CBOR parsing, origin/challenge verification, and COSE public key persistence.
+- Cryptographic ECDSA assertion signature verification (`authenticate_complete`).
+- Strictly-monotonic sign counter tracking with automatic clone/regression detection raising `CRITICAL` security audit events (`WEBAUTHN_CLONE_DETECTED`).
+- Support for platform authenticators (Apple Touch ID / Face ID, Windows Hello, Android Biometrics) and roaming hardware security keys (YubiKey).
 
 ---
 

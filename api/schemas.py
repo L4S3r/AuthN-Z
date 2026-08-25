@@ -68,9 +68,10 @@ class MFACompleteRequest(BaseModel):
 # =============================================================================
 class WebAuthnRegisterVerifyRequest(BaseModel):
     client_data_json: str = Field(..., description="Base64url encoded clientDataJSON")
-    attestation_object: Optional[str] = Field(default=None, description="Base64url encoded attestationObject")
+    attestation_object: str = Field(..., description="Base64url encoded attestationObject")
     credential_id: Optional[str] = Field(default=None, description="Base64url encoded credentialId")
     device_label: Optional[str] = Field(default="Passkey / Hardware Key", description="User device label")
+    transports: Optional[List[str]] = Field(default=None, description="Optional transports list e.g. ['internal', 'hybrid', 'usb']")
 
 
 class WebAuthnAuthOptionsRequest(BaseModel):
@@ -79,7 +80,10 @@ class WebAuthnAuthOptionsRequest(BaseModel):
 
 class WebAuthnAuthVerifyRequest(BaseModel):
     client_data_json: str = Field(..., description="Base64url encoded clientDataJSON")
+    authenticator_data: str = Field(..., description="Base64url encoded authenticatorData")
+    signature: str = Field(..., description="Base64url encoded signature")
     credential_id: str = Field(..., description="Base64url encoded credential ID")
+    user_handle: Optional[str] = Field(default=None, description="Base64url encoded user handle")
     identifier: Optional[str] = Field(default=None, description="Optional username/email context")
 
 

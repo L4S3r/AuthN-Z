@@ -35,6 +35,12 @@ async def get_registration_options(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Generate PublicKeyCredentialCreationOptions challenge for passkey creation."""
+    if not getattr(settings, "WEBAUTHN_ENABLED", True):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WebAuthn / Passkey service is currently disabled.",
+        )
+
     user = await user_repo.get_by_id(current_user["user_id"])
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
@@ -66,6 +72,12 @@ async def verify_registration(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Complete passkey registration and store public credential metadata."""
+    if not getattr(settings, "WEBAUTHN_ENABLED", True):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WebAuthn / Passkey service is currently disabled.",
+        )
+
     user_id = current_user["user_id"]
     user = await user_repo.get_by_id(user_id)
     if not user:
@@ -80,6 +92,7 @@ async def verify_registration(
             attestation_object_b64=req.attestation_object,
             credential_id_b64=req.credential_id,
             device_label=req.device_label,
+            transports=req.transports,
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -119,6 +132,12 @@ async def get_authentication_options(
     req: Optional[WebAuthnAuthOptionsRequest] = None,
 ):
     """Generate PublicKeyCredentialRequestOptions challenge for passwordless passkey login."""
+    if not getattr(settings, "WEBAUTHN_ENABLED", True):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WebAuthn / Passkey service is currently disabled.",
+        )
+
     user_passkeys = []
     user_id = None
 
@@ -149,6 +168,12 @@ async def verify_authentication(
     response: Response,
 ):
     """Verify passkey signature and issue authenticated JWT tokens & session."""
+    if not getattr(settings, "WEBAUTHN_ENABLED", True):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WebAuthn / Passkey service is currently disabled.",
+        )
+
     client_ip = request.client.host if request.client else "unknown"
 
     # 1. Look up user by identifier or search by credential ID
@@ -198,15 +223,27 @@ async def verify_authentication(
         verification = webauthn_svc.verify_authentication_response(
             client_data_json_b64=req.client_data_json,
             credential_id_b64=req.credential_id,
+            authenticator_data_b64=req.authenticator_data,
+            signature_b64=req.signature,
             user_passkeys=user_passkeys,
+            user_handle_b64=req.user_handle,
         )
     except ValueError as e:
-        await audit_log.record_auth_failure(
-            identifier=user["email"],
-            reason=f"WEBAUTHN_AUTH_FAILED: {str(e)}",
-            ip_address=client_ip,
+        err_msg = str(e)
+        severity = "CRITICAL" if ("clone" in err_msg.lower() or "regression" in err_msg.lower()) else "WARNING"
+        event_name = "WEBAUTHN_CLONE_DETECTED" if severity == "CRITICAL" else "WEBAUTHN_AUTH_FAILED"
+
+        await audit_log.record_security_event(
+            event_name=event_name,
+            severity=severity,
+            details={
+                "identifier": user["email"] if user else req.identifier,
+                "credential_id": req.credential_id,
+                "reason": err_msg,
+                "ip_address": client_ip,
+            },
         )
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=err_msg)
 
     # Update last_used_at and sign count on passkey
     await user_repo.update_user(user["id"], {"metadata": metadata})

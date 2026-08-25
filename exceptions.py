@@ -199,6 +199,30 @@ class RateLimitExceededException(AuthNZException):
         )
 
 
+class WebAuthnVerificationException(AuthNZException):
+    """Raised when WebAuthn attestation or assertion cryptographic verification fails."""
+
+    def __init__(self, detail: str = "WebAuthn verification failed."):
+        super().__init__(
+            detail=detail,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="WEBAUTHN_VERIFICATION_FAILED",
+            title="WebAuthn Verification Failed",
+        )
+
+
+class WebAuthnCloneDetectedException(AuthNZException):
+    """Raised when WebAuthn sign counter regression indicates a cloned or replayed authenticator."""
+
+    def __init__(self, detail: str = "Authenticator clone detected: sign counter regression."):
+        super().__init__(
+            detail=detail,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="WEBAUTHN_CLONE_DETECTED",
+            title="WebAuthn Clone Detected",
+        )
+
+
 # =============================================================================
 # RFC 7807 Global Exception Handlers for FastAPI
 # =============================================================================
