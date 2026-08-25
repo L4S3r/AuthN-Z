@@ -1,5 +1,5 @@
 """
-Auth N&Z - FastAPI Application Server (server.py)
+Auth N&Z - FastAPI Application Server built for TaskTracker (server.py)
 -------------------------------------------------
 Provides HTTP REST endpoints for the complete authentication,
 authorization, multi-factor verification, and audit telemetry system.
@@ -719,6 +719,21 @@ async def admin_create_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: Admin privileges required to provision custom roles.",
         )
+
+    # Privilege escalation guard: Only superadmins can provision superadmin accounts
+    requested_roles = [str(r).strip().lower() for r in (req.roles or [])]
+    if any(r in ("superadmin", "super-admin", "super_admin") for r in requested_roles):
+        if not await perm_eval.has_role(current_user["user_id"], "superadmin"):
+            await audit_log.record_access_denial(
+                subject_id=current_user["user_id"],
+                action="create_superadmin_user",
+                resource="admin/users",
+                reason="SUPERADMIN_ROLE_REQUIRED",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Superadmin privileges required to grant superadmin role.",
+            )
 
     try:
         hashed_password = hasher.hash(req.password)
@@ -1584,27 +1599,52 @@ async def get_audit_trail(
     subject_id: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Query security audit telemetry records. Requires 'admin' or 'superadmin' role."""
-    if not await perm_eval.has_role(current_user["user_id"], "admin"):
-        await audit_log.record_access_denial(
-            subject_id=current_user["user_id"],
-            action="read",
-            resource="audit_logs",
-            reason="ADMIN_ROLE_REQUIRED",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: Admin role required to query audit logs.",
-        )
+    """Query security audit telemetry records. Requires 'admin' or 'superadmin' role (scoped or global)."""
+    user_id = current_user["user_id"]
+    is_superadmin = await perm_eval.has_role(user_id, "superadmin")
+    is_global_admin = await perm_eval.has_role(user_id, "admin")
 
     filters = {}
+    if workspace_id:
+        ws_id = await ws_repo._resolve_ws_id(workspace_id) or workspace_id
+        is_ws_admin = await perm_eval.has_role(user_id, "admin", scope=ws_id)
+        if not (is_superadmin or is_global_admin or is_ws_admin):
+            await audit_log.record_access_denial(
+                subject_id=user_id,
+                action="read",
+                resource=f"workspaces/{ws_id}/audit-logs",
+                reason="ADMIN_ROLE_REQUIRED",
+                workspace_id=ws_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Admin role required for this workspace's audit telemetry.",
+            )
+        filters["workspace_id"] = ws_id
+    else:
+        if not (is_superadmin or is_global_admin):
+            await audit_log.record_access_denial(
+                subject_id=user_id,
+                action="read",
+                resource="audit_logs",
+                reason="ADMIN_ROLE_REQUIRED",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Global Admin or Superadmin role required to query global audit logs.",
+            )
+
     if event_type:
         filters["event_type"] = event_type
     if severity:
         filters["severity"] = severity.upper()
-    if workspace_id:
-        filters["workspace_id"] = await ws_repo._resolve_ws_id(workspace_id)
     if subject_id:
+        # Non-superadmins/non-global-admins can only filter their own subject_id unless they are workspace admin
+        if not (is_superadmin or is_global_admin) and subject_id != user_id and not workspace_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Cannot query other users' audit events without global admin privileges.",
+            )
         filters["subject_id"] = subject_id
 
     logs = await audit_log.query_events(filters, limit=min(limit, 200), offset=offset)
@@ -2021,13 +2061,53 @@ async def get_tasks(
     assignee_email: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Retrieve workspace sprint tasks with optional filtering."""
-    tasks = await task_repo.list_tasks(
-        workspace_id=workspace_id,
-        status=status,
-        priority=priority,
-        assignee_email=assignee_email,
-    )
+    """Retrieve workspace sprint tasks with strict tenant workspace membership verification."""
+    user_id = current_user["user_id"]
+    is_superadmin = await perm_eval.has_role(user_id, "superadmin")
+
+    if workspace_id:
+        ws_id = await ws_repo._resolve_ws_id(workspace_id) or workspace_id
+        is_authorized = await perm_eval.has_role(user_id, "viewer", scope=ws_id)
+        if not is_authorized:
+            await audit_log.record_access_denial(
+                subject_id=user_id,
+                action="view_tasks",
+                resource=f"workspaces/{ws_id}/tasks",
+                reason="WORKSPACE_MEMBERSHIP_REQUIRED",
+                workspace_id=ws_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: You are not an active member of this workspace.",
+            )
+        tasks = await task_repo.list_tasks(
+            workspace_id=ws_id,
+            status=status,
+            priority=priority,
+            assignee_email=assignee_email,
+        )
+    else:
+        # If no workspace_id provided, superadmin can view all; standard users only receive tasks from their authorized workspaces
+        all_tasks = await task_repo.list_tasks(
+            workspace_id=None,
+            status=status,
+            priority=priority,
+            assignee_email=assignee_email,
+        )
+        if is_superadmin:
+            tasks = all_tasks
+        else:
+            user = await repo.get_by_id(user_id)
+            user_workspaces = await ws_repo.list_workspaces_for_user(
+                user_id=user_id,
+                email=user.get("email") if user else None,
+            )
+            allowed_ws_ids = {
+                str(w["id"]) for w in user_workspaces
+                if w.get("member_status") == "active" or w.get("role") or w.get("member_role")
+            }
+            tasks = [t for t in all_tasks if str(t.get("workspace_id")) in allowed_ws_ids]
+
     return {"status": "SUCCESS", "count": len(tasks), "tasks": tasks}
 
 
@@ -2036,7 +2116,7 @@ async def get_single_task(
     task_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Retrieve a single task by ID. Verifies active membership in the task's workspace."""
+    """Retrieve a single task by ID. Strictly verifies active membership in the task's workspace."""
     task = await task_repo.get_task(task_id)
     if not task:
         raise HTTPException(
@@ -2047,16 +2127,19 @@ async def get_single_task(
     ws_id = task.get("workspace_id") or "ws_default"
     user_id = current_user["user_id"]
 
-    # Verify workspace membership clearance if not superadmin
-    is_superadmin = await perm_eval.has_role(user_id, "superadmin")
-    if not is_superadmin and ws_id != "ws_default":
-        user = await repo.get_by_id(user_id)
-        member = await ws_repo.get_member(ws_id, user_id=user_id, email=user.get("email") if user else None)
-        if not member or member.get("status") != "active":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied: You are not an active member of this workspace.",
-            )
+    is_authorized = await perm_eval.has_role(user_id, "viewer", scope=ws_id)
+    if not is_authorized:
+        await audit_log.record_access_denial(
+            subject_id=user_id,
+            action="view_task",
+            resource=f"tasks/{task_id}",
+            reason="WORKSPACE_MEMBERSHIP_REQUIRED",
+            workspace_id=ws_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You are not an active member of this workspace.",
+        )
 
     return {"status": "SUCCESS", "task": task}
 
@@ -2528,7 +2611,20 @@ async def mark_all_notifications_as_read(
 async def list_team_members(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """List all workspace members and pending email invitations."""
+    """List all workspace members and pending email invitations. Requires active viewer clearance."""
+    user_id = current_user["user_id"]
+    if not await perm_eval.has_role(user_id, "viewer"):
+        await audit_log.record_access_denial(
+            subject_id=user_id,
+            action="view",
+            resource="team_members",
+            reason="VIEWER_ROLE_REQUIRED",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Active viewer or member role required.",
+        )
+
     members = await task_repo.list_team_members()
     return {"status": "SUCCESS", "count": len(members), "members": members}
 
@@ -2863,24 +2959,26 @@ async def get_workspace_details(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Retrieve workspace profile, metadata, and member metrics."""
-    is_authorized = await perm_eval.has_role(current_user["user_id"], "viewer", scope=workspace_id) or await perm_eval.has_role(current_user["user_id"], "superadmin")
+    ws_id = await ws_repo._resolve_ws_id(workspace_id) or workspace_id
+    is_authorized = await perm_eval.has_role(current_user["user_id"], "viewer", scope=ws_id)
     if not is_authorized:
         await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="view",
-            resource=f"workspaces/{workspace_id}",
+            resource=f"workspaces/{ws_id}",
             reason="WORKSPACE_MEMBERSHIP_REQUIRED",
+            workspace_id=ws_id,
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: You are not a member of this workspace.",
         )
 
-    ws = await ws_repo.get_workspace(workspace_id)
+    ws = await ws_repo.get_workspace(ws_id)
     if not ws:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found.")
 
-    metrics = await ws_repo.count_members(workspace_id)
+    metrics = await ws_repo.count_members(ws_id)
     return {"status": "SUCCESS", "workspace": ws, "metrics": metrics}
 
 
@@ -2891,13 +2989,15 @@ async def update_workspace(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Update workspace name, slug, or description. Requires Workspace Admin or Superadmin role."""
-    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    ws_id = await ws_repo._resolve_ws_id(workspace_id) or workspace_id
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
     if not is_admin:
         await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="update",
-            resource=f"workspaces/{workspace_id}",
+            resource=f"workspaces/{ws_id}",
             reason="ADMIN_ROLE_REQUIRED",
+            workspace_id=ws_id,
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -2906,7 +3006,7 @@ async def update_workspace(
 
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     try:
-        updated = await ws_repo.update_workspace(workspace_id, updates)
+        updated = await ws_repo.update_workspace(ws_id, updates)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -2916,7 +3016,8 @@ async def update_workspace(
     await audit_log.record_security_event(
         event_name="WORKSPACE_UPDATED",
         severity="INFO",
-        details={"workspace_id": workspace_id, "updates": updates, "updated_by": current_user["user_id"]},
+        details={"workspace_id": ws_id, "updates": updates, "updated_by": current_user["user_id"]},
+        workspace_id=ws_id,
     )
     return {"status": "SUCCESS", "workspace": updated}
 
@@ -2927,13 +3028,15 @@ async def delete_workspace(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Delete a workspace and cascade delete all its tasks and member associations. Requires Workspace Admin or Superadmin."""
-    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    ws_id = await ws_repo._resolve_ws_id(workspace_id) or workspace_id
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
     if not is_admin:
         await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="delete",
-            resource=f"workspaces/{workspace_id}",
+            resource=f"workspaces/{ws_id}",
             reason="ADMIN_ROLE_REQUIRED",
+            workspace_id=ws_id,
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -2941,7 +3044,7 @@ async def delete_workspace(
         )
 
     try:
-        deleted = await ws_repo.delete_workspace(workspace_id)
+        deleted = await ws_repo.delete_workspace(ws_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -2951,9 +3054,10 @@ async def delete_workspace(
     await audit_log.record_security_event(
         event_name="WORKSPACE_DELETED",
         severity="WARNING",
-        details={"workspace_id": workspace_id, "deleted_by": current_user["user_id"]},
+        details={"workspace_id": ws_id, "deleted_by": current_user["user_id"]},
+        workspace_id=ws_id,
     )
-    return {"status": "SUCCESS", "deleted_workspace_id": workspace_id}
+    return {"status": "SUCCESS", "deleted_workspace_id": ws_id}
 
 
 # =============================================================================
@@ -2967,14 +3071,22 @@ async def list_workspace_members(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """List all members and pending invitations for a specific workspace."""
-    is_authorized = await perm_eval.has_role(current_user["user_id"], "viewer", scope=workspace_id) or await perm_eval.has_role(current_user["user_id"], "superadmin")
+    ws_id = await ws_repo._resolve_ws_id(workspace_id) or workspace_id
+    is_authorized = await perm_eval.has_role(current_user["user_id"], "viewer", scope=ws_id)
     if not is_authorized:
+        await audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="list_members",
+            resource=f"workspaces/{ws_id}/members",
+            reason="WORKSPACE_MEMBERSHIP_REQUIRED",
+            workspace_id=ws_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: You are not a member of this workspace.",
         )
 
-    members = await ws_repo.list_members(workspace_id=workspace_id, status=status_filter)
+    members = await ws_repo.list_members(workspace_id=ws_id, status=status_filter)
     return {"status": "SUCCESS", "count": len(members), "members": members}
 
 
@@ -2985,13 +3097,15 @@ async def invite_workspace_member(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Invite a new colleague to a specific workspace with a defined role. Requires Workspace Admin or Superadmin."""
-    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    ws_id = await ws_repo._resolve_ws_id(workspace_id) or workspace_id
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
     if not is_admin:
         await audit_log.record_access_denial(
             subject_id=current_user["user_id"],
             action="invite",
-            resource=f"workspaces/{workspace_id}/members",
+            resource=f"workspaces/{ws_id}/members",
             reason="ADMIN_ROLE_REQUIRED",
+            workspace_id=ws_id,
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -3003,7 +3117,7 @@ async def invite_workspace_member(
 
     try:
         invitation = await ws_repo.invite_member(
-            workspace_id=workspace_id,
+            workspace_id=ws_id,
             email=req.email,
             name=req.name,
             role=req.role or "viewer",
@@ -3028,7 +3142,7 @@ async def invite_workspace_member(
         event_name="WORKSPACE_MEMBER_INVITED",
         severity="INFO",
         details={
-            "workspace_id": workspace_id,
+            "workspace_id": ws_id,
             "invited_email": req.email,
             "role": req.role,
             "department": req.department,
@@ -3036,6 +3150,7 @@ async def invite_workspace_member(
             "invite_token": invitation["invite_token"],
             "email_dispatched": email_res.get("delivered", False),
         },
+        workspace_id=ws_id,
     )
 
     return {
@@ -3055,14 +3170,22 @@ async def update_workspace_member_role(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Change a colleague's clearance role within a specific workspace. Requires Workspace Admin or Superadmin."""
-    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    ws_id = await ws_repo._resolve_ws_id(workspace_id) or workspace_id
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
     if not is_admin:
+        await audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="update_member_role",
+            resource=f"workspaces/{ws_id}/members/{user_id_or_email}/role",
+            reason="ADMIN_ROLE_REQUIRED",
+            workspace_id=ws_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: Admin role required to update member roles.",
         )
 
-    updated = await ws_repo.update_member_role(workspace_id, user_id_or_email, req.role)
+    updated = await ws_repo.update_member_role(ws_id, user_id_or_email, req.role)
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found in this workspace.")
 
@@ -3070,11 +3193,12 @@ async def update_workspace_member_role(
         event_name="WORKSPACE_MEMBER_ROLE_UPDATED",
         severity="INFO",
         details={
-            "workspace_id": workspace_id,
+            "workspace_id": ws_id,
             "member": user_id_or_email,
             "new_role": req.role,
             "updated_by": current_user["user_id"],
         },
+        workspace_id=ws_id,
     )
     return {"status": "SUCCESS", "message": f"Role updated to '{req.role}' for {user_id_or_email}."}
 
@@ -3086,8 +3210,16 @@ async def remove_workspace_member(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Remove a colleague from a specific workspace or cancel their invitation. Requires Workspace Admin or Superadmin."""
-    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=workspace_id)
+    ws_id = await ws_repo._resolve_ws_id(workspace_id) or workspace_id
+    is_admin = await perm_eval.has_role(current_user["user_id"], "admin", scope=ws_id)
     if not is_admin:
+        await audit_log.record_access_denial(
+            subject_id=current_user["user_id"],
+            action="remove_member",
+            resource=f"workspaces/{ws_id}/members/{user_id_or_email}",
+            reason="ADMIN_ROLE_REQUIRED",
+            workspace_id=ws_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: Admin role required to remove members.",
@@ -3105,7 +3237,7 @@ async def remove_workspace_member(
             detail="Cannot remove your own administrator membership from the workspace.",
         )
 
-    removed = await ws_repo.remove_member(workspace_id, user_id_or_email)
+    removed = await ws_repo.remove_member(ws_id, user_id_or_email)
     if not removed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found in this workspace.")
 
@@ -3113,10 +3245,11 @@ async def remove_workspace_member(
         event_name="WORKSPACE_MEMBER_REMOVED",
         severity="WARNING",
         details={
-            "workspace_id": workspace_id,
+            "workspace_id": ws_id,
             "removed_member": user_id_or_email,
             "removed_by": current_user["user_id"],
         },
+        workspace_id=ws_id,
     )
     return {"status": "SUCCESS", "message": f"Member {user_id_or_email} removed from workspace."}
 
@@ -3302,18 +3435,19 @@ async def switch_active_workspace(
 ):
     """Switch the authenticated user's active tenant workspace context, returning refreshed scoped JWT tokens."""
     target_ws_id = req.workspace_id.strip()
+    resolved_id = await ws_repo._resolve_ws_id(target_ws_id) or target_ws_id
     user_id = current_user["user_id"]
     user = await repo.get_by_id(user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
     is_superadmin = await perm_eval.has_role(user_id, "superadmin")
-    ws = await ws_repo.get_workspace(target_ws_id)
+    ws = await ws_repo.get_workspace(resolved_id)
     if not ws:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target workspace not found.")
 
-    member = await ws_repo.get_member(target_ws_id, user_id=user_id, email=user.get("email"))
-    if not member and not is_superadmin:
+    member = await ws_repo.get_member(resolved_id, user_id=user_id, email=user.get("email"))
+    if (not member or member.get("status") != "active") and not is_superadmin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: You are not an active member of this workspace.",
@@ -3326,9 +3460,9 @@ async def switch_active_workspace(
         roles.append("superadmin")
 
     # Issue refreshed JWT tokens scoped to target workspace
-    access_token = token_svc.create_access_token(user_id, claims={"roles": roles, "workspace_id": target_ws_id})
-    refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles, "workspace_id": target_ws_id})
-    session_id = sess_store.create_session(user_id, session_data={"roles": roles, "workspace_id": target_ws_id})
+    access_token = token_svc.create_access_token(user_id, claims={"roles": roles, "workspace_id": resolved_id})
+    refresh_token = token_svc.create_refresh_token(user_id, claims={"roles": roles, "workspace_id": resolved_id})
+    session_id = sess_store.create_session(user_id, session_data={"roles": roles, "workspace_id": resolved_id})
 
     # Set rotated httpOnly cookies for the new workspace scope
     set_auth_cookies(response, request, access_token, refresh_token)
