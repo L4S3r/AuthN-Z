@@ -194,15 +194,17 @@ class AuditLogger(abstractAuditLogger):
     async def record_auth_success(
         self,
         subject_id: str,
-        method: str,
+        method: str = "password",
         ip_address: Optional[str] = None,
         user_agent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         workspace_id: Optional[str] = None,
+        auth_method: Optional[str] = None,
     ) -> None:
         """Record a successful authentication event."""
+        effective_method = auth_method or method or "password"
         extra_meta = dict(metadata or {})
-        extra_meta["auth_method"] = method
+        extra_meta["auth_method"] = effective_method
         await self._insert_event(
             event_type="AUTH_SUCCESS",
             severity="INFO",

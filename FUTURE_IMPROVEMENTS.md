@@ -245,6 +245,21 @@ dependencies = [
 * **Implementation Plan:**
   1. Use Redis Pub/Sub channels (`authnz:events:token_revoked`, `authnz:events:lockout`, `authnz:events:permission_changed`) to synchronize in-memory caches across multi-worker Uvicorn clusters and multi-region instances instantly.
 
+### 4.4 Client-Side Query Caching & Server-Side Metadata TTL Caching
+* **Goal:** Eliminate aggressive short-polling loops and reduce PostgreSQL read traffic by ~90-95% on resource-constrained mini-server / VPS deployments.
+* **Implementation Plan:**
+  1. **Client-Side Query Caching (React Query / SWR / Zustand):**
+     - Set `staleTime: 5 * 60 * 1000` (5 minutes) and `gcTime: 10 * 60 * 1000` on read-only user context endpoints (`/auth/me`, `/auth/webauthn/credentials`, `/auth/trusted-devices`).
+     - Disable automatic window focus refetching (`refetchOnWindowFocus: false`, `refetchOnMount: false`).
+     - Use event-driven query invalidation on mutation events (e.g. invalidate `['webauthn', 'credentials']` on passkey registration/deletion).
+     - Transition notifications from HTTP short-polling (`GET /notifications`) to the established WebSocket channel (`/ws/workspaces/...`).
+  2. **HTTP Caching & Conditional Headers:**
+     - Emit `Cache-Control: private, max-age=60, stale-while-revalidate=300` headers on user metadata endpoints.
+     - Implement `ETag` and conditional request handling returning `304 Not Modified` without database JSON serialization.
+  3. **Server-Side L1/L2 Profile Caching:**
+     - Cache serialized user profiles and permission sets in Redis / In-Memory LRU (`user:profile:<user_id>`) with a 60-second TTL.
+     - Invalidate cache entries on profile updates, role changes, or passkey enrollments.
+
 ---
 
 ## Phase 5: Developer Experience & Admin Control Plane (P2 / P3)

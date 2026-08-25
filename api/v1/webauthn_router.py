@@ -263,9 +263,10 @@ async def verify_authentication(
     set_auth_cookies(response, request, access_token, refresh_token)
 
     await audit_log.record_auth_success(
-        subject_id=user["id"],
-        auth_method="webauthn_passkey",
+        subject_id=str(user["id"]),
+        method="webauthn_passkey",
         ip_address=client_ip,
+        user_agent=request.headers.get("user-agent", "unknown"),
     )
 
     safe_meta = dict(metadata)

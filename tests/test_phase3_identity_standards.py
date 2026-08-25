@@ -377,3 +377,60 @@ def test_webauthn_router_endpoint_options_flow():
             assert "challenge" in auth_data["options"]
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_webauthn_router_endpoint_auth_verify_flow():
+    """Verify HTTP API endpoint execution for /auth/webauthn/authenticate/verify and audit logging."""
+    from unittest.mock import AsyncMock, patch
+    from fastapi.testclient import TestClient
+    from server import app
+
+    client = TestClient(app)
+
+    mock_user = {
+        "id": "u_test_auth_456",
+        "username": "authtest",
+        "email": "authtest@example.com",
+        "is_active": 1,
+        "roles": ["viewer"],
+        "metadata": {
+            "passkeys": [
+                {
+                    "credential_id": "cred_id_test_abc",
+                    "public_key": "dummy_key",
+                    "sign_count": 0,
+                    "device_label": "Windows Hello",
+                }
+            ]
+        },
+    }
+
+    with patch("api.v1.webauthn_router.user_repo.get_by_identifier", new_callable=AsyncMock) as mock_get_ident, \
+         patch("api.v1.webauthn_router.user_repo.update_user", new_callable=AsyncMock) as mock_update, \
+         patch("api.v1.webauthn_router.webauthn_svc.verify_authentication_response") as mock_verify, \
+         patch("api.v1.webauthn_router.audit_log.record_auth_success", new_callable=AsyncMock) as mock_audit:
+
+        mock_get_ident.return_value = mock_user
+        mock_update.return_value = True
+        mock_verify.return_value = {
+            "status": "SUCCESS",
+            "user_id": "u_test_auth_456",
+            "passkey": mock_user["metadata"]["passkeys"][0],
+        }
+
+        verify_payload = {
+            "client_data_json": "eyJjaGFsbGVuZ2UiOiAidGVzdCJ9",
+            "authenticator_data": "dGVzdF9hdXRoX2RhdGE",
+            "signature": "dGVzdF9zaWduYXR1cmU",
+            "credential_id": "cred_id_test_abc",
+            "identifier": "authtest@example.com",
+        }
+
+        res = client.post("/auth/webauthn/authenticate/verify", json=verify_payload)
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "SUCCESS"
+        assert data["user_id"] == "u_test_auth_456"
+        assert "access_token" in data
+        assert "refresh_token" in data
+        assert mock_audit.called is True
