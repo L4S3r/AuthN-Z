@@ -8,3 +8,4 @@
 __pycache__/
 *.json
 digest.txt
+REFACTORING_REPORT.md

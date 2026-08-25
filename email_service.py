@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from config import settings
+
 logger = logging.getLogger("auth_nz.email_service")
 
 
@@ -30,20 +32,14 @@ class EmailService:
         self.audit_logger = audit_logger
 
     def reload_config(self) -> None:
-        """Reload configuration dynamically from environment variables with safe defaults."""
+        """Reload configuration dynamically from settings with safe defaults."""
         try:
-            load_dotenv()
-            self.smtp_host = os.getenv("SMTP_HOST")
-            port_env = os.getenv("SMTP_PORT", "587")
-            try:
-                self.smtp_port = int(port_env.strip()) if port_env and port_env.strip().isdigit() else 587
-            except Exception:
-                self.smtp_port = 587
-
-            self.smtp_user = os.getenv("SMTP_USER")
-            self.smtp_password = os.getenv("SMTP_PASSWORD")
-            self.smtp_from = os.getenv("SMTP_FROM", "TaskTracker Security <no-reply@l4s3r.site>")
-            self.frontend_url = (os.getenv("FRONTEND_URL") or "http://localhost:3000").rstrip("/")
+            self.smtp_host = settings.SMTP_HOST
+            self.smtp_port = settings.SMTP_PORT
+            self.smtp_user = settings.SMTP_USER
+            self.smtp_password = settings.SMTP_PASSWORD
+            self.smtp_from = settings.SMTP_FROM
+            self.frontend_url = (settings.FRONTEND_URL or "http://localhost:3000").rstrip("/")
         except Exception as exc:
             logger.warning("Error reloading email configuration: %s. Using default settings.", exc)
             self.smtp_host = None

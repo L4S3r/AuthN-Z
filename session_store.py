@@ -63,27 +63,27 @@ class abstractSessionStore(ABC):
         pass
 
 
+from config import settings
 import logging
 
 logger = logging.getLogger("auth_nz.session_store")
 
 
 class SessionStore(abstractSessionStore):
-    def __init__(self, host="localhost", port=6379, db=0, ttl=1800):
+    def __init__(self, host=None, port=None, db=None, ttl=1800):
         self.ttl = ttl
         self._in_memory_sessions: Dict[str, Dict[str, Any]] = {}
         self._in_memory_user_index: Dict[str, Set[str]] = {}
 
-        host_env = os.getenv("REDIS_HOST", host or "127.0.0.1")
-        port_env = int(os.getenv("REDIS_PORT", port or 6379))
-        password_env = os.getenv("REDIS_PASSWORD", None)
-        is_prod = os.getenv("ENVIRONMENT", "development").lower() == "production"
-        require_redis = os.getenv("REQUIRE_REDIS", "false").lower() in ("true", "1") or is_prod
-
-        if host_env == "localhost":
-            host_env = "127.0.0.1"
-
-        if redis is not None:
+        host_env = host or settings.REDIS_HOST
+        port_env = port or settings.REDIS_PORT
+        db_env = db if db is not None else settings.REDIS_DB
+        password_env = settings.REDIS_PASSWORD
+        require_redis = settings.REQUIRE_REDIS or settings.is_production
+        is_testing = settings.is_testing
+        if is_testing and not require_redis:
+            self.r = None
+        elif redis is not None:
             try:
                 self.r = redis.Redis(
                     host=host_env,
@@ -91,8 +91,8 @@ class SessionStore(abstractSessionStore):
                     password=password_env,
                     db=db,
                     decode_responses=True,
-                    socket_connect_timeout=0.5,
-                    socket_timeout=0.5,
+                    socket_connect_timeout=0.2,
+                    socket_timeout=0.2,
                 )
                 self.r.ping()
             except Exception as exc:
@@ -174,9 +174,18 @@ class SessionStore(abstractSessionStore):
         parsed = dict(session)
         if "data" in parsed and isinstance(parsed["data"], str):
             try:
-                parsed["data"] = json.loads(parsed["data"])
+                data_dict = json.loads(parsed["data"])
+                parsed["data"] = data_dict
+                if isinstance(data_dict, dict):
+                    for k, v in data_dict.items():
+                        if k not in parsed:
+                            parsed[k] = v
             except (ValueError, TypeError):
                 parsed["data"] = {}
+        elif isinstance(parsed.get("data"), dict):
+            for k, v in parsed["data"].items():
+                if k not in parsed:
+                    parsed[k] = v
         return parsed
 
     def update_session_data(self, session_id: str, session_data: Dict[str, Any]) -> bool:

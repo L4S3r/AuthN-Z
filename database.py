@@ -20,28 +20,14 @@ from sqlalchemy.ext.asyncio import (
 )
 
 
+from config import settings
+
 def get_database_url() -> str:
     """
-    Retrieve database URL from environment variables.
-    Supports DATABASE_URL or individual POSTGRES_* / PG* variables.
+    Retrieve database URL from centralized settings.
     Converts standard postgresql:// schemes to postgresql+asyncpg:// for async compatibility.
     """
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        user = os.getenv("POSTGRES_USER") or os.getenv("PGUSER") or "authnz_app"
-        password = os.getenv("POSTGRES_PASSWORD") or os.getenv("PGPASSWORD") or ""
-        host = os.getenv("POSTGRES_HOST") or os.getenv("PGHOST") or "127.0.0.1"
-        port = os.getenv("POSTGRES_PORT") or os.getenv("PGPORT") or "5432"
-        db_name = os.getenv("POSTGRES_DB") or os.getenv("PGDATABASE") or "authnz"
-
-        auth_part = f"{user}:{password}" if password else user
-        url = f"postgresql+asyncpg://{auth_part}@{host}:{port}/{db_name}"
-
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    elif url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-    return url
+    return settings.get_database_url()
 
 
 _async_engine: Optional[AsyncEngine] = None

@@ -135,23 +135,49 @@ class abstractMFAProvider(ABC):
         """
         ...
 class MFAProvider(abstractMFAProvider):
-    def generate_secret(self,user_id:str)->str:
+    def generate_secret(self, user_id: Optional[str] = None) -> str:
         """Generate a cryptographically secure 160-bit base32-encoded shared secret."""
         secret = secrets.token_bytes(20)
         return base64.b32encode(secret).decode("utf-8")
+
     def get_provisioning_uri(
         self,
-        user_id: str,
-        secret: str,
-        account_name: str,
-        issuer_name: str = "Task Tracker",
+        *args,
+        issuer: Optional[str] = None,
+        issuer_name: Optional[str] = None,
+        **kwargs,
     ) -> str:
-        escaped_issuer=quote(issuer_name)
-        escaped_account=quote(account_name)
-        return(
+        """
+        Generate an 'otpauth://totp/...' URI used to produce QR codes for authenticator applications.
+        Supports both (secret, account_name, issuer=...) and (user_id, secret, account_name, issuer_name=...).
+        """
+        secret = kwargs.get("secret")
+        account_name = kwargs.get("account_name")
+        effective_issuer = issuer or issuer_name or kwargs.get("issuer") or "Auth N&Z"
+
+        if len(args) >= 4:
+            _, secret, account_name, arg_issuer = args[:4]
+            effective_issuer = arg_issuer or effective_issuer
+        elif len(args) == 3:
+            if "@" in str(args[1]) or "." in str(args[1]):
+                secret, account_name, effective_issuer = args
+            else:
+                _, secret, account_name = args
+        elif len(args) == 2:
+            secret, account_name = args
+        elif len(args) == 1:
+            secret = args[0]
+
+        escaped_issuer = quote(str(effective_issuer or "Auth N&Z"))
+        escaped_account = quote(str(account_name or "user"))
+        return (
             f"otpauth://totp/{escaped_issuer}:{escaped_account}?"
             f"secret={secret}&issuer={escaped_issuer}&algorithm=SHA1&digits=6&period=30"
         )
+
+    def _hash_backup_code(self, code: str) -> str:
+        clean_code = str(code).strip()
+        return hashlib.sha256(clean_code.encode("utf-8")).hexdigest()
     def verify_totp_code(
         self,
         secret: str,

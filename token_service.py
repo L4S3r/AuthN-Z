@@ -119,6 +119,7 @@ class abstractTokenService(ABC):
         """
         ...
 
+from config import settings
 import logging
 
 logger = logging.getLogger("auth_nz.token_service")
@@ -128,21 +129,19 @@ class TokenService(abstractTokenService):
     def __init__(
         self,
         secret_key: Optional[str] = None,
-        algorithm: str = "HS256",
+        algorithm: Optional[str] = None,
         redis_client: Optional[Any] = None,
     ):
-        self.algorithm = algorithm
-        self.secret_key = secret_key or self._get_or_generate_secret_key()
-        host_env = os.getenv("REDIS_HOST", "127.0.0.1")
-        port_env = int(os.getenv("REDIS_PORT", "6379"))
-        password_env = os.getenv("REDIS_PASSWORD", None)
-        is_prod = os.getenv("ENVIRONMENT", "development").lower() == "production"
-        require_redis = os.getenv("REQUIRE_REDIS", "false").lower() in ("true", "1") or is_prod
-
-        if host_env == "localhost":
-            host_env = "127.0.0.1"
-
-        if redis_client is not None:
+        self.algorithm = algorithm or settings.JWT_ALGORITHM
+        self.secret_key = secret_key or settings.get_jwt_secret()
+        host_env = settings.REDIS_HOST
+        port_env = settings.REDIS_PORT
+        password_env = settings.REDIS_PASSWORD
+        require_redis = settings.REQUIRE_REDIS or settings.is_production
+        is_testing = settings.is_testing
+        if is_testing and not require_redis and redis_client is None:
+            self.r = None
+        elif redis_client is not None:
             self.r = redis_client
         elif redis is not None:
             try:
@@ -152,8 +151,8 @@ class TokenService(abstractTokenService):
                     password=password_env,
                     db=0,
                     decode_responses=True,
-                    socket_connect_timeout=0.5,
-                    socket_timeout=0.5,
+                    socket_connect_timeout=0.2,
+                    socket_timeout=0.2,
                 )
                 self.r.ping()
             except Exception as exc:
@@ -247,6 +246,9 @@ class TokenService(abstractTokenService):
 
     def decode_and_verify(self, token: str) -> Dict[str, Any]:
         """Validate token signature, expiration, issuer, family, and return decoded payload/claims dictionary."""
+        if self.is_token_revoked(token):
+            raise ValueError("Token has been revoked")
+
         try:
             payload = jwt.decode(
                 token,
@@ -268,16 +270,27 @@ class TokenService(abstractTokenService):
             raise ValueError(f"Invalid token: {e}")
 
     def revoke_token(self, token_identifier: str, expires_at: Optional[int] = None) -> bool:
-        """Add a token jti to the Redis revocation blocklist with matching TTL."""
+        """Add a token jti or full token to the Redis/in-memory revocation blocklist with matching TTL."""
         ttl = 604800  # Default 7 days fallback
+        jti = token_identifier
+        try:
+            unverified = jwt.decode(token_identifier, options={"verify_signature": False})
+            if "jti" in unverified:
+                jti = unverified["jti"]
+                if expires_at is None and "exp" in unverified:
+                    expires_at = unverified["exp"]
+        except Exception:
+            pass
+
         if expires_at is not None:
             now_ts = int(datetime.now(timezone.utc).timestamp())
             ttl = max(1, expires_at - now_ts)
 
         if self.r is not None:
             try:
-                key = f"revoked_token:{token_identifier}"
-                self.r.set(key, "1", ex=ttl)
+                self.r.set(f"revoked_token:{jti}", "1", ex=ttl)
+                if jti != token_identifier:
+                    self.r.set(f"revoked_token:{token_identifier}", "1", ex=ttl)
                 return True
             except Exception as exc:
                 logger.error(
@@ -285,21 +298,41 @@ class TokenService(abstractTokenService):
                     exc,
                 )
 
-        self._in_memory_blocklist.add(token_identifier)
+        self._in_memory_blocklist.add(jti)
+        if jti != token_identifier:
+            self._in_memory_blocklist.add(token_identifier)
         return True
 
     def is_token_revoked(self, token_identifier: str) -> bool:
-        """Check if a token jti is in the Redis or fallback revocation blocklist."""
+        """Check if a token jti or raw token is in the Redis or fallback revocation blocklist."""
         if self.r is not None:
             try:
-                key = f"revoked_token:{token_identifier}"
-                return bool(self.r.exists(key))
+                if self.r.exists(f"revoked_token:{token_identifier}"):
+                    return True
             except Exception as exc:
                 logger.error(
                     "Failed to query token revocation in Redis (%s). Falling back to memory.",
                     exc,
                 )
-        return token_identifier in self._in_memory_blocklist
+        if token_identifier in self._in_memory_blocklist:
+            return True
+
+        try:
+            unverified = jwt.decode(token_identifier, options={"verify_signature": False})
+            if "jti" in unverified:
+                jti = unverified["jti"]
+                if self.r is not None:
+                    try:
+                        if self.r.exists(f"revoked_token:{jti}"):
+                            return True
+                    except Exception:
+                        pass
+                if jti in self._in_memory_blocklist:
+                    return True
+        except Exception:
+            pass
+
+        return False
 
     def revoke_family(self, family_id: str, lifetime_seconds: int = 604800) -> bool:
         """Revoke an entire token family upon token reuse / theft detection."""

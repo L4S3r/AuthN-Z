@@ -31,7 +31,7 @@ def event_loop():
     loop.close()
 
 
-@pytest_asyncio.fixture(scope="session", autouse=True)
+@pytest_asyncio.fixture(scope="session")
 async def setup_test_database():
     """
     Safety-guarded test database setup.
@@ -64,7 +64,7 @@ async def setup_test_database():
 
 
 @pytest_asyncio.fixture
-async def async_client() -> AsyncClient:
+async def async_client(setup_test_database) -> AsyncClient:
     """Async HTTP test client bound to the FastAPI application."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
