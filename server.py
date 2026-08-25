@@ -8,11 +8,14 @@ Run locally with:
     uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 """
 
+from contextlib import asynccontextmanager
 from typing import Any, Dict
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
+from database import get_engine
+from models import Base
 from exceptions import register_exception_handlers
 from api.router import api_router
 from api.dependencies import (
@@ -43,8 +46,22 @@ docs_url = "/docs" if settings.docs_enabled else None
 redoc_url = "/redoc" if settings.docs_enabled else None
 openapi_url = "/openapi.json" if settings.docs_enabled else None
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan context manager handling async startup and table verification."""
+    try:
+        engine = get_engine()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception:
+        pass
+    yield
+
+
 # FastAPI Application Factory
 app = FastAPI(
+    lifespan=lifespan,
     title="Auth N&Z - Identity and Access Management System",
     description=(
         "Auth N&Z (Authentication & Authorization Engine)\n\n"
