@@ -328,3 +328,52 @@ def test_webauthn_negative_expired_or_consumed_challenge():
     with pytest.raises(ValueError) as exc_info:
         webauthn.verify_registration_response("u1", reg_res["client_data_json"], reg_res["attestation_object"])
     assert "invalid or expired" in str(exc_info.value).lower()
+
+
+def test_webauthn_router_endpoint_options_flow():
+    """Verify HTTP API endpoint execution for /auth/webauthn/register/options and /authenticate/options."""
+    from unittest.mock import AsyncMock, patch
+    from fastapi.testclient import TestClient
+    from server import app
+    from api.dependencies import get_current_user
+
+    client = TestClient(app)
+
+    # Mock authenticated user dependency
+    app.dependency_overrides[get_current_user] = lambda: {
+        "status": "SUCCESS",
+        "user_id": "u_test_123",
+        "email": "test@example.com",
+    }
+
+    mock_user = {
+        "id": "u_test_123",
+        "username": "testuser",
+        "email": "test@example.com",
+        "metadata": {"passkeys": []},
+    }
+
+    try:
+        with patch("api.v1.webauthn_router.user_repo.get_by_id", new_callable=AsyncMock) as mock_get_id, \
+             patch("api.v1.webauthn_router.user_repo.get_by_identifier", new_callable=AsyncMock) as mock_get_ident:
+
+            mock_get_id.return_value = mock_user
+            mock_get_ident.return_value = mock_user
+
+            # 1. POST /auth/webauthn/register/options
+            reg_res = client.post("/auth/webauthn/register/options")
+            assert reg_res.status_code == 200
+            reg_data = reg_res.json()
+            assert reg_data["status"] == "SUCCESS"
+            assert "options" in reg_data
+            assert "challenge" in reg_data["options"]
+
+            # 2. POST /auth/webauthn/authenticate/options
+            auth_res = client.post("/auth/webauthn/authenticate/options", json={"identifier": "test@example.com"})
+            assert auth_res.status_code == 200
+            auth_data = auth_res.json()
+            assert auth_data["status"] == "SUCCESS"
+            assert "options" in auth_data
+            assert "challenge" in auth_data["options"]
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)

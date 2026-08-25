@@ -10,6 +10,7 @@ import json
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
+from config import settings
 from api.dependencies import (
     user_repo,
     webauthn_svc,
