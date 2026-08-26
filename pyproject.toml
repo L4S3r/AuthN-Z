@@ -3,11 +3,11 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "auth-nz"
-version = "1.0.0"
+name = "l4s3r-authnz"
+version = "1.0.1"
 description = "Production-grade, NIST-compliant Async Authentication & Authorization IAM Engine for Python/FastAPI"
 readme = "README.md"
-authors = [{ name = "L4S3r Security Team" }]
+authors = [{ name = "L4S3r" }]
 license = { text = "MIT" }
 requires-python = ">=3.10"
 keywords = ["authentication", "authorization", "rbac", "abac", "mfa", "totp", "jwt", "fastapi", "security", "iam"]
@@ -75,6 +75,10 @@ py-modules = [
     "metrics",
     "server",
     "cli",
+    "models",
+    "adapter",
+    "task_repository",
+    "seed_admin",
 ]
 
 [project.optional-dependencies]

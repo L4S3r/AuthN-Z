@@ -107,15 +107,17 @@ class abstractUserRepository(ABC):
 
 
 class UserRepository(abstractUserRepository):
-    """PostgreSQL Async implementation of the User Repository."""
+    """PostgreSQL Async implementation of the User Repository with pluggable model adapter."""
 
     def __init__(
         self,
         db_url: Optional[str] = None,
         session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+        user_model: Optional[Any] = None,
     ):
         self._custom_session_factory = session_factory
         self._db_url = db_url
+        self.user_model = user_model or User
 
     @property
     def session_factory(self) -> async_sessionmaker[AsyncSession]:
@@ -128,21 +130,22 @@ class UserRepository(abstractUserRepository):
         self._custom_session_factory = val
 
     @staticmethod
-    def _format_user(user: User) -> Dict[str, Any]:
+    def _format_user(user: Any) -> Dict[str, Any]:
         """Format SQLAlchemy User model instance to dictionary matching previous repository shape."""
-        roles = user.roles if isinstance(user.roles, list) else []
-        meta = user.metadata_ if isinstance(user.metadata_, dict) else {}
+        roles = getattr(user, "roles", []) if isinstance(getattr(user, "roles", []), list) else []
+        meta = getattr(user, "metadata_", {}) if isinstance(getattr(user, "metadata_", {}), dict) else {}
+        created_at = getattr(user, "created_at", datetime.now(timezone.utc))
         created_str = (
-            user.created_at.isoformat()
-            if isinstance(user.created_at, datetime)
-            else str(user.created_at)
+            created_at.isoformat()
+            if isinstance(created_at, datetime)
+            else str(created_at)
         )
         return {
             "id": str(user.id),
-            "username": user.username,
-            "email": user.email,
-            "hashed_password": user.hashed_password,
-            "is_active": 1 if user.is_active else 0,
+            "username": getattr(user, "username", ""),
+            "email": getattr(user, "email", ""),
+            "hashed_password": getattr(user, "hashed_password", ""),
+            "is_active": 1 if getattr(user, "is_active", True) else 0,
             "created_at": created_str,
             "roles": roles,
             "metadata": meta,
@@ -182,7 +185,7 @@ class UserRepository(abstractUserRepository):
         else:
             meta = dict(metadata_raw or {})
 
-        new_user = User(
+        new_user = self.user_model(
             id=user_id,
             username=username,
             email=email,
@@ -210,7 +213,7 @@ class UserRepository(abstractUserRepository):
             return None
 
         async with self.session_factory() as session:
-            stmt = select(User).where(User.id == uid)
+            stmt = select(self.user_model).where(self.user_model.id == uid)
             result = await session.execute(stmt)
             user = result.scalars().first()
             return self._format_user(user) if user else None
@@ -222,10 +225,10 @@ class UserRepository(abstractUserRepository):
             return None
 
         async with self.session_factory() as session:
-            stmt = select(User).where(
+            stmt = select(self.user_model).where(
                 or_(
-                    func.lower(User.username) == clean_id,
-                    func.lower(User.email) == clean_id,
+                    func.lower(self.user_model.username) == clean_id,
+                    func.lower(self.user_model.email) == clean_id,
                 )
             )
             result = await session.execute(stmt)
@@ -274,7 +277,7 @@ class UserRepository(abstractUserRepository):
 
         try:
             async with self.session_factory() as session:
-                stmt = update(User).where(User.id == uid).values(**filtered_updates)
+                stmt = update(self.user_model).where(self.user_model.id == uid).values(**filtered_updates)
                 result = await session.execute(stmt)
                 await session.commit()
                 return (result.rowcount or 0) > 0
@@ -291,7 +294,7 @@ class UserRepository(abstractUserRepository):
             return False
 
         async with self.session_factory() as session:
-            stmt = delete(User).where(User.id == uid)
+            stmt = delete(self.user_model).where(self.user_model.id == uid)
             result = await session.execute(stmt)
             await session.commit()
             return (result.rowcount or 0) > 0
@@ -306,7 +309,7 @@ class UserRepository(abstractUserRepository):
             return False
 
         async with self.session_factory() as session:
-            stmt = update(User).where(User.id == uid).values(is_active=bool(is_active))
+            stmt = update(self.user_model).where(self.user_model.id == uid).values(is_active=bool(is_active))
             result = await session.execute(stmt)
             await session.commit()
             return (result.rowcount or 0) > 0
@@ -318,9 +321,9 @@ class UserRepository(abstractUserRepository):
     ) -> List[Dict[str, Any]]:
         """List all users with optional status and role filtering."""
         async with self.session_factory() as session:
-            stmt = select(User).order_by(User.created_at.asc())
+            stmt = select(self.user_model).order_by(self.user_model.created_at.asc())
             if is_active is not None:
-                stmt = stmt.where(User.is_active == bool(is_active))
+                stmt = stmt.where(self.user_model.is_active == bool(is_active))
             result = await session.execute(stmt)
             users = result.scalars().all()
 
@@ -432,8 +435,8 @@ class UserRepository(abstractUserRepository):
 
         async with self.session_factory() as session:
             stmt = (
-                select(PasswordResetToken, User)
-                .join(User, PasswordResetToken.user_id == User.id)
+                select(PasswordResetToken, self.user_model)
+                .join(self.user_model, PasswordResetToken.user_id == self.user_model.id)
                 .where(
                     PasswordResetToken.token_hash == token_hash,
                     PasswordResetToken.used_at.is_(None),
@@ -445,7 +448,7 @@ class UserRepository(abstractUserRepository):
                 return None
 
             prt, user = row
-            if not user.is_active:
+            if not getattr(user, "is_active", True):
                 return None
 
             if prt.expires_at:
@@ -464,9 +467,9 @@ class UserRepository(abstractUserRepository):
                 "created_at": prt.created_at.isoformat() if prt.created_at else "",
                 "used_at": prt.used_at.isoformat() if prt.used_at else None,
                 "ip_address": prt.ip_address,
-                "username": user.username,
-                "email": user.email,
-                "is_active": 1 if user.is_active else 0,
+                "username": getattr(user, "username", ""),
+                "email": getattr(user, "email", ""),
+                "is_active": 1 if getattr(user, "is_active", True) else 0,
             }
 
     async def consume_password_reset_token(
@@ -504,8 +507,8 @@ class UserRepository(abstractUserRepository):
 
             # Update password
             await session.execute(
-                update(User)
-                .where(User.id == uid)
+                update(self.user_model)
+                .where(self.user_model.id == uid)
                 .values(hashed_password=new_hashed_password)
             )
             await session.commit()

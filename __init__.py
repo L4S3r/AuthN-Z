@@ -16,7 +16,29 @@ Core Capabilities:
 """
 
 # Version
-__version__ = "1.0.0"
+__version__ = "1.0.1"
+
+# Models & Mixins
+from models import (
+    Base,
+    AuthNZUserMixin,
+    User,
+    PasswordResetToken,
+    Workspace,
+    WorkspaceMember,
+    Task,
+    TeamMember,
+    AuditLog,
+    TrustedDevice,
+    Notification,
+)
+
+# Adapter & Configuration
+from adapter import (
+    configure_authnz,
+    AuthNZ,
+    AuthNZAdapter,
+)
 
 # Core Facades and Services
 from authenticator import Authenticator
@@ -41,7 +63,23 @@ from database import get_engine, get_session_factory, get_db_session
 from config import settings, AuthNZSettings
 
 # FastAPI Router & Gateway
-from api.router import api_router
+from api.router import (
+    api_router,
+    create_authnz_router,
+    auth_router,
+    mfa_router,
+    webauthn_router,
+    device_trust_router,
+    workspace_router,
+    team_router,
+    oauth_router,
+    audit_router,
+    notification_router,
+    websocket_router,
+    task_router,
+    health_router,
+    policy_router,
+)
 
 # Declarative Dependency Guards
 from guards import (
@@ -73,6 +111,22 @@ from exceptions import (
 __all__ = [
     # Version
     "__version__",
+    # Adapter & Configuration
+    "configure_authnz",
+    "AuthNZ",
+    "AuthNZAdapter",
+    # Models & Mixins
+    "Base",
+    "AuthNZUserMixin",
+    "User",
+    "PasswordResetToken",
+    "Workspace",
+    "WorkspaceMember",
+    "Task",
+    "TeamMember",
+    "AuditLog",
+    "TrustedDevice",
+    "Notification",
     # Core Services
     "Authenticator",
     "PasswordHasher",
@@ -100,6 +154,20 @@ __all__ = [
     "AuthNZSettings",
     # API & Gateways
     "api_router",
+    "create_authnz_router",
+    "auth_router",
+    "mfa_router",
+    "webauthn_router",
+    "device_trust_router",
+    "workspace_router",
+    "team_router",
+    "oauth_router",
+    "audit_router",
+    "notification_router",
+    "websocket_router",
+    "task_router",
+    "health_router",
+    "policy_router",
     # Dependency Guards
     "CurrentUser",
     "CurrentWorkspace",

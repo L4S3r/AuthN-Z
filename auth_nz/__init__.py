@@ -1,11 +1,34 @@
 """
 Auth N&Z - Package Module (auth_nz/__init__.py)
 -----------------------------------------------
-Exports the full public IAM SDK.
+Exports the full public IAM SDK, Adapter Framework, Models, and Routers.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
+# Models & Mixins
+from models import (
+    Base,
+    AuthNZUserMixin,
+    User,
+    PasswordResetToken,
+    Workspace,
+    WorkspaceMember,
+    Task,
+    TeamMember,
+    AuditLog,
+    TrustedDevice,
+    Notification,
+)
+
+# Adapter & Configuration
+from adapter import (
+    configure_authnz,
+    AuthNZ,
+    AuthNZAdapter,
+)
+
+# Guards & Dependency Injection
 from guards import (
     CurrentUser,
     CurrentWorkspace,
@@ -14,6 +37,8 @@ from guards import (
     require_permission,
     get_current_workspace,
 )
+
+# Exceptions & Error Handlers
 from exceptions import (
     AuthNZException,
     InvalidCredentialsException,
@@ -31,8 +56,12 @@ from exceptions import (
     WebAuthnCloneDetectedException,
     register_exception_handlers,
 )
+
+# Configuration & Database
 from config import settings, AuthNZSettings
 from database import get_engine, get_session_factory, get_db_session
+
+# Services & Cryptography
 from authenticator import Authenticator, abstractAuthenticator
 from password_hasher import PasswordHasher, abstractPasswordHasher
 from token_service import TokenService, abstractTokenService
@@ -49,10 +78,45 @@ from webauthn_service import WebAuthnService
 from metrics import MetricsCollector, metrics_collector
 from opa_client import OPAClient
 from policy_engine import DeclarativePolicyEngine, DistributedPolicyManager
-from api.router import api_router
+
+# Routers & Router Factory
+from api.router import (
+    api_router,
+    create_authnz_router,
+    auth_router,
+    mfa_router,
+    webauthn_router,
+    device_trust_router,
+    workspace_router,
+    team_router,
+    oauth_router,
+    audit_router,
+    notification_router,
+    websocket_router,
+    task_router,
+    health_router,
+    policy_router,
+)
 
 __all__ = [
     "__version__",
+    # Adapter & Configuration
+    "configure_authnz",
+    "AuthNZ",
+    "AuthNZAdapter",
+    # Models & Mixins
+    "Base",
+    "AuthNZUserMixin",
+    "User",
+    "PasswordResetToken",
+    "Workspace",
+    "WorkspaceMember",
+    "Task",
+    "TeamMember",
+    "AuditLog",
+    "TrustedDevice",
+    "Notification",
+    # Services
     "Authenticator",
     "abstractAuthenticator",
     "PasswordHasher",
@@ -77,18 +141,36 @@ __all__ = [
     "OPAClient",
     "DeclarativePolicyEngine",
     "DistributedPolicyManager",
+    # Database & Settings
     "get_engine",
     "get_session_factory",
     "get_db_session",
     "settings",
     "AuthNZSettings",
+    # Routers
     "api_router",
+    "create_authnz_router",
+    "auth_router",
+    "mfa_router",
+    "webauthn_router",
+    "device_trust_router",
+    "workspace_router",
+    "team_router",
+    "oauth_router",
+    "audit_router",
+    "notification_router",
+    "websocket_router",
+    "task_router",
+    "health_router",
+    "policy_router",
+    # Guards
     "CurrentUser",
     "CurrentWorkspace",
     "require_auth",
     "require_role",
     "require_permission",
     "get_current_workspace",
+    # Exceptions
     "AuthNZException",
     "InvalidCredentialsException",
     "AccountLockedException",

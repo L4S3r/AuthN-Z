@@ -1,9 +1,11 @@
 # Auth N&Z - Enterprise Identity, Authentication & Authorization Engine
 
+[![PyPI Version](https://img.shields.io/pypi/v/l4s3r-authnz.svg)](https://pypi.org/project/l4s3r-authnz/)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/l4s3r-authnz.svg)](https://pypi.org/project/l4s3r-authnz/)
 [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-green.svg)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-31%20passed%20%28100%25%29-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-43%20passed%20%28100%25%29-brightgreen.svg)]()
 
 **Auth N&Z** is a modular, production-grade, NIST-compliant Identity and Access Management (IAM) framework and multi-tenant authorization engine built with Python, FastAPI, and asynchronous SQLAlchemy 2.0 (`asyncpg`).
 
@@ -52,6 +54,8 @@
 
 ```
 Auth N&Z/
+├── adapter.py                # Unified configuration & adapter layer (configure_authnz, AuthNZ)
+├── models.py                 # SQLAlchemy 2.0 models & AuthNZUserMixin (BYOU pattern)
 ├── config.py                 # Typed configuration via pydantic-settings
 ├── exceptions.py             # RFC 7807 Problem Details error boundaries
 ├── guards.py                 # Declarative FastAPI dependency guards
@@ -67,7 +71,7 @@ Auth N&Z/
 ├── api/
 │   ├── dependencies.py       # Shared singletons and dependency injection
 │   ├── schemas.py            # Pydantic v2 schemas
-│   ├── router.py             # Top-level aggregated API gateway router
+│   ├── router.py             # Router factory (create_authnz_router) & aggregated gateway
 │   └── v1/
 │       ├── auth_router.py         # /auth (login, register, refresh, me, logout)
 │       ├── mfa_router.py          # /auth/mfa (setup, verify, disable, complete)
@@ -115,14 +119,16 @@ Auth N&Z/
 
 ### 1. Installation
 
-Install as a Python package in any FastAPI microservice:
+Install via PyPI:
 ```bash
-pip install -e .
+pip install l4s3r-authnz
 ```
 
-Or install runtime dependencies:
+Or install from source in editable mode:
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/L4S3r/AuthN-Z.git
+cd AuthN-Z
+pip install -e .
 ```
 
 ### 2. Environment Configuration
@@ -138,7 +144,7 @@ PASSWORD_HASH_ALGORITHM=argon2id
 OPA_ENABLED=false
 ```
 
-### 3. Start the API Gateway (Bare-Metal / Recommended for Mini-Servers)
+### 3. Start the API Gateway (Standalone / Mini-Server)
 ```bash
 uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -146,67 +152,80 @@ Interactive Swagger docs: **http://localhost:8000/docs**
 
 ---
 
-### 🐳 4. (OPTIONAL) Docker & Docker Compose Setup
+## Framework & Adapter Integration Patterns
 
-> [!NOTE]
-> **This Docker setup is 100% optional.**
-> For resource-constrained servers (such as mini-servers with 4GB RAM or low-spec VPS), **bare-metal Python execution via systemd** (Step 3 above) is strongly recommended, as it consumes only **~50 MB of RAM** without Docker daemon overhead.
+Auth N&Z can be integrated at 3 different architectural levels:
 
-If you are deploying to a cloud container host or want an instant all-in-one local development stack (API + PostgreSQL + Redis + OPA):
+### Pattern A: Modular Adapter & Custom User Model (BYOU)
 
-```bash
-# Spin up complete stack (Gateway + PostgreSQL + Redis + OPA)
-docker compose up -d
+Retain your application's own `User` table identity with custom columns and selectively mount only the routes you need:
 
-# View container logs
-docker compose logs -f auth-api
+```python
+from fastapi import FastAPI
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from auth_nz.models import AuthNZUserMixin
+from auth_nz.routers import create_authnz_router
+from auth_nz.adapter import configure_authnz
 
-# Stop containers
-docker compose down
+# 1. Define custom User model inheriting AuthNZUserMixin
+class Base(DeclarativeBase):
+    pass
+
+class User(Base, AuthNZUserMixin):
+    __tablename__ = "users"
+    company_name: Mapped[str]
+    stripe_customer_id: Mapped[str | None] = mapped_column(nullable=True)
+
+# 2. Configure Auth N&Z with your custom model & settings
+configure_authnz(
+    user_model=User,
+    jwt_secret_key="custom_secret_key_here",
+)
+
+# 3. Mount ONLY the routes you want (e.g. Auth + MFA + WebAuthn, no domain tasks)
+app = FastAPI(title="My SaaS Application")
+
+app.include_router(
+    create_authnz_router(
+        enable_auth=True,
+        enable_mfa=True,
+        enable_webauthn=True,
+        enable_workspaces=False,
+        enable_tasks=False,
+    ),
+    prefix="/api/v1",
+)
 ```
 
 ---
 
-## 🛡️ Consuming Auth N&Z in External Microservices
+### Pattern B: Lightweight Resource Server Guards (Zero-DB Mode)
 
-Secure external FastAPI routes in 1 line:
+In downstream microservices (e.g. Billing, Inventory), validate incoming JWT tokens and enforce RBAC/ABAC permissions with zero database overhead:
 
 ```python
 from fastapi import FastAPI, Depends
-from auth_nz import (
-    api_router as authnz_router,
-    register_exception_handlers,
-    require_auth,
-    require_role,
-    require_permission,
-    get_current_workspace,
-    CurrentUser,
-    CurrentWorkspace,
-)
+from auth_nz.guards import require_auth, require_role, require_permission, CurrentUser
 
-app = FastAPI(title="Consumer Microservice")
+app = FastAPI(title="Billing Microservice")
 
-# 1. Register RFC 7807 Error Boundaries
-register_exception_handlers(app)
+@app.get("/invoices")
+async def get_invoices(user: CurrentUser = Depends(require_permission("invoices:read"))):
+    return {"status": "ok", "user": user.email}
 
-# 2. Mount Auth N&Z Endpoints
-app.include_router(authnz_router)
+@app.delete("/invoices/{invoice_id}")
+async def delete_invoice(user: CurrentUser = Depends(require_role("admin"))):
+    return {"status": "deleted"}
+```
 
-# 3. Guard Routes with Typed Dependency Injection
-@app.get("/api/me")
-async def get_profile(user: CurrentUser = Depends(require_auth())):
-    return {"id": user.id, "email": user.email, "clearance": user.clearance}
+---
 
-@app.post("/api/invoices")
-async def create_invoice(
-    user: CurrentUser = Depends(require_permission("billing:create")),
-    workspace: CurrentWorkspace = Depends(get_current_workspace()),
-):
-    return {"status": "created", "workspace": workspace.name}
+### Pattern C: Turnkey IAM Microservice & Mini-Server
 
-@app.delete("/api/projects/{project_id}")
-async def delete_project(user: CurrentUser = Depends(require_role("admin"))):
-    return {"status": "deleted by admin"}
+Run the standalone server out of the box with the complete suite (Auth, Passkeys, Multi-Tenant Workspaces, Task Tracker, Telemetry, and Admin CLI):
+
+```bash
+uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
 ---

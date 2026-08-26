@@ -30,12 +30,18 @@ class Base(DeclarativeBase):
     pass
 
 
-class User(Base):
+class AuthNZUserMixin:
     """
-    User accounts and authentication identity credentials.
-    """
-    __tablename__ = "users"
+    SQLAlchemy 2.0 Mixin providing core Auth N&Z authentication, identity, and security fields.
+    Host applications can inherit this mixin into their custom User model to retain their own table
+    identity and add custom application fields (e.g. stripe_id, company, avatar).
 
+    Example:
+        class User(Base, AuthNZUserMixin):
+            __tablename__ = "users"
+            company: Mapped[str] = mapped_column(String(100))
+            stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    """
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
@@ -82,6 +88,14 @@ class User(Base):
         default=dict,
         server_default=text("'{}'::jsonb"),
     )
+
+
+class User(Base, AuthNZUserMixin):
+    """
+    User accounts and authentication identity credentials.
+    Default turnkey model for Auth N&Z.
+    """
+    __tablename__ = "users"
 
     # Relationships
     password_reset_tokens: Mapped[List["PasswordResetToken"]] = relationship(

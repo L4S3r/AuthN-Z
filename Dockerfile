@@ -6,13 +6,13 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
-# Install build tools for native C-extensions (bcrypt, cffi, asyncpg)
+# Install build tools for native C-extensions (bcrypt, cffi, asyncpg, cryptography)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY requirements.txt pyproject.toml ./
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 # =============================================================================
@@ -21,7 +21,7 @@ FROM python:3.12-slim AS runtime
 
 WORKDIR /app
 
-# Install minimal libpq runtime dependency for PostgreSQL
+# Install minimal libpq runtime dependency for PostgreSQL and curl for health checks
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
@@ -41,6 +41,9 @@ ENV PATH=/home/authnz/.local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000
+
+# Install package in editable/user mode so authnz CLI is available
+RUN pip install --no-deps --user -e .
 
 USER authnz
 
