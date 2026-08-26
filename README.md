@@ -5,7 +5,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-green.svg)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-43%20passed%20%28100%25%29-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-44%20passed%20%28100%25%29-brightgreen.svg)]()
 
 **Auth N&Z** is a modular, production-grade, NIST-compliant Identity and Access Management (IAM) framework and multi-tenant authorization engine built with Python, FastAPI, and asynchronous SQLAlchemy 2.0 (`asyncpg`).
 
@@ -131,30 +131,65 @@ cd AuthN-Z
 pip install -e .
 ```
 
-### 2. Environment Configuration
+---
 
-Create a `.env` file:
+### 2. Local Environment Configuration
+
+Copy the template configuration and customize your secrets:
+```bash
+cp .env.example .env
+```
+
+Key variables in `.env`:
 ```dotenv
-ENVIRONMENT=production
+ENVIRONMENT=development
 JWT_SECRET_KEY=your_super_secret_high_entropy_key_32_bytes_long
-DATABASE_URL=postgresql+asyncpg://authnz_app:password@localhost:5432/authnz
+DATABASE_URL=postgresql+asyncpg://authnz_app:password123@localhost:5432/authnz
 REDIS_HOST=localhost
 REDIS_PORT=6379
+REQUIRE_REDIS=false
 PASSWORD_HASH_ALGORITHM=argon2id
 OPA_ENABLED=false
 ```
 
-### 3. Start the API Gateway (Standalone / Mini-Server)
+---
+
+### 3. Running the Standalone Gateway
+
+#### Option A: Bare-Metal Python / Uvicorn (Fastest for Local Dev & Low-RAM Mini-Servers)
 ```bash
+# Start FastAPI gateway
 uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 ```
 Interactive Swagger docs: **http://localhost:8000/docs**
 
 ---
 
+#### Option B: Self-Contained Docker Compose Stack
+Launch the complete stack (FastAPI Gateway + PostgreSQL 16 + Redis 7 + Open Policy Agent):
+
+```bash
+# 1. Start all containers in detached mode
+docker compose up -d
+
+# 2. Bootstrap initial root administrator account
+docker compose exec auth-api python seed_admin.py
+
+# 3. Verify container health and table statistics
+docker compose exec auth-api python db_manager.py stats
+
+# 4. View real-time application logs
+docker compose logs -f auth-api
+
+# 5. Tear down containers and volumes
+docker compose down -v
+```
+
+---
+
 ## Framework & Adapter Integration Patterns
 
-Auth N&Z can be integrated at 3 different architectural levels:
+Auth N&Z is designed to integrate into external FastAPI applications at 3 architectural levels:
 
 ### Pattern A: Modular Adapter & Custom User Model (BYOU)
 
@@ -162,39 +197,50 @@ Retain your application's own `User` table identity with custom columns and sele
 
 ```python
 from fastapi import FastAPI
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from auth_nz.models import AuthNZUserMixin
-from auth_nz.routers import create_authnz_router
-from auth_nz.adapter import configure_authnz
+from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
-# 1. Define custom User model inheriting AuthNZUserMixin
-class Base(DeclarativeBase):
-    pass
+# 1. Import Core Identity Base, Mixin, and Adapter
+from auth_nz.models import Base, AuthNZUserMixin
+from auth_nz.adapter import AuthNZ
+from auth_nz.guards import CurrentUser, require_auth, require_role, require_permission
 
+# 2. Define custom User model inheriting AuthNZUserMixin on shared Base
 class User(Base, AuthNZUserMixin):
     __tablename__ = "users"
     company_name: Mapped[str]
     stripe_customer_id: Mapped[str | None] = mapped_column(nullable=True)
 
-# 2. Configure Auth N&Z with your custom model & settings
-configure_authnz(
+# 3. Create Async Database Session Factory
+engine = create_async_engine("postgresql+asyncpg://user:pass@localhost:5432/my_app")
+session_factory = async_sessionmaker(engine)
+
+# 4. Initialize AuthNZ Adapter with your custom model & session factory
+authnz = AuthNZ(
     user_model=User,
+    session_factory=session_factory,
     jwt_secret_key="custom_secret_key_here",
 )
 
-# 3. Mount ONLY the routes you want (e.g. Auth + MFA + WebAuthn, no domain tasks)
+# 5. Mount ONLY the desired routes (e.g. Auth + MFA + WebAuthn, exclude turnkey tasks)
 app = FastAPI(title="My SaaS Application")
 
 app.include_router(
-    create_authnz_router(
+    authnz.create_router(
         enable_auth=True,
         enable_mfa=True,
         enable_webauthn=True,
-        enable_workspaces=False,
-        enable_tasks=False,
+        enable_device_trust=True,
+        enable_workspaces=False,  # Exclude standalone workspace domain if not needed
+        enable_tasks=False,       # Exclude standalone task tracker
     ),
     prefix="/api/v1",
 )
+
+# 6. Protect host endpoints with 1-line declarative guards
+@app.get("/api/v1/profile")
+async def get_profile(user: CurrentUser = Depends(require_auth())):
+    return {"id": user.id, "email": user.email, "roles": user.roles}
 ```
 
 ---
@@ -206,8 +252,10 @@ In downstream microservices (e.g. Billing, Inventory), validate incoming JWT tok
 ```python
 from fastapi import FastAPI, Depends
 from auth_nz.guards import require_auth, require_role, require_permission, CurrentUser
+from auth_nz.exceptions import register_exception_handlers
 
 app = FastAPI(title="Billing Microservice")
+register_exception_handlers(app)
 
 @app.get("/invoices")
 async def get_invoices(user: CurrentUser = Depends(require_permission("invoices:read"))):
@@ -220,42 +268,70 @@ async def delete_invoice(user: CurrentUser = Depends(require_role("admin"))):
 
 ---
 
-### Pattern C: Turnkey IAM Microservice & Mini-Server
+### Pattern C: Turnkey Standalone IAM Microservice
 
 Run the standalone server out of the box with the complete suite (Auth, Passkeys, Multi-Tenant Workspaces, Task Tracker, Telemetry, and Admin CLI):
 
-```bash
-uvicorn server:app --host 0.0.0.0 --port 8000
+```python
+from fastapi import FastAPI
+from auth_nz import api_router, register_exception_handlers
+
+app = FastAPI(title="Turnkey Auth Gateway")
+register_exception_handlers(app)
+app.include_router(api_router)
 ```
 
 ---
 
-## 💻 Administration CLI (`authnz` / `cli.py`)
+## 💻 Administration & Control Plane Utilities
 
-Auth N&Z provides a scriptable control plane utility:
+Auth N&Z includes comprehensive CLI tools for operator administration:
+
+### 1. Interactive Control Plane (`cli.py` / `authnz`)
 
 ```bash
 # User Management
-python cli.py users list
-python cli.py users create --username alice --email alice@example.com --password SecretPassword123! --role admin
-python cli.py users reset-password --email alice@example.com --password NewSecretPassword123!
-python cli.py users delete --email alice@example.com
+authnz users list
+authnz users create --username alice --email alice@example.com --password SecretPassword123! --role admin
+authnz users reset-password --email alice@example.com --password NewSecretPassword123!
+authnz users delete --email alice@example.com
 
 # Workspace Administration
-python cli.py workspaces list
-python cli.py workspaces create --name "Acme Corp" --slug "acme"
+authnz workspaces list
+authnz workspaces create --name "Acme Corp" --slug "acme"
 
 # Declarative Policies & OPA
-python cli.py policies inspect
-python cli.py policies reload
-python cli.py policies simulate --email alice@example.com --action read --resource-type documents
+authnz policies inspect
+authnz policies reload
+authnz policies simulate --email alice@example.com --action read --resource-type documents
 
 # Security Audit Inspection
-python cli.py audit tail --limit 25 --severity CRITICAL
+authnz audit tail --limit 25 --severity CRITICAL
 
 # Diagnostics & Observability
-python cli.py health check
-python cli.py metrics dump
+authnz health check
+authnz metrics dump
+```
+
+### 2. Database Inspection & Maintenance (`db_manager.py`)
+
+```bash
+python db_manager.py stats                    # Record counts across all tables
+python db_manager.py audit -n 50 -s CRITICAL   # Filter security audit logs
+python db_manager.py workspaces               # List workspaces with member counts
+python db_manager.py users -r admin           # Filter registered users by role
+python db_manager.py devices                  # Inspect enrolled trusted devices
+python db_manager.py purge-audit --yes        # Safely purge telemetry logs
+```
+
+### 3. Bootstrap & Promotion Utilities
+
+```bash
+# Bootstrap root administrator without exposing HTTP endpoints
+python seed_admin.py
+
+# Promote existing user account to Superadmin
+python promote_admin.py -i admin@example.com --super --clearance 5
 ```
 
 ---
@@ -266,7 +342,7 @@ Execute the comprehensive offline test suite:
 ```bash
 pytest
 ```
-*Result: 30 passed, 1 skipped (live PostgreSQL E2E), 100% success in ~6.5s.*
+*Result: 44 passed, 1 skipped (live PostgreSQL integration guard), 100% success.*
 
 ---
 

@@ -173,7 +173,7 @@ def test_submodule_package_exports():
     assert hasattr(auth_nz, "mfa_router")
     assert hasattr(auth_nz, "webauthn_router")
     assert hasattr(auth_nz, "task_router")
-    assert auth_nz.__version__ == "1.0.1"
+    assert auth_nz.__version__ == "1.0.4"
 
 
 def test_default_api_router_backwards_compatibility():

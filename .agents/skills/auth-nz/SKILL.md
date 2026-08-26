@@ -32,7 +32,7 @@ The core framework is built with **Python 3.10+**, **FastAPI**, **SQLAlchemy 2.0
                                          ▼
                       ┌────────────────────────────────────────┐
                       │         Auth N&Z Adapter Layer         │
-                      │     (adapter.py / configure_authnz)    │
+                      │   (adapter.py / AuthNZ / configure)    │
                       └──────────────────┬─────────────────────┘
                                          │
        ┌──────────────────┬──────────────┼───────────────┬──────────────────┐
@@ -60,13 +60,17 @@ The core framework is built with **Python 3.10+**, **FastAPI**, **SQLAlchemy 2.0
 
 | Submodule / File | Responsibility | Key Exports / API |
 | :--- | :--- | :--- |
-| `auth_nz.models` (`models.py`) | Relational SQLAlchemy ORM models & Mixins | `AuthNZUserMixin`, `Base`, `User`, `Workspace`, `WorkspaceMember`, `Task`, `AuditLog`, `TrustedDevice`, `Notification` |
+| `auth_nz.models` (`models.py`) | Core BYOU declarative identity models & Mixin | `Base`, `AuthNZUserMixin`, `PasswordResetToken`, `TrustedDevice` |
+| `default_user.py` | Turnkey default User model (when no custom BYOU model is supplied) | `User` (subclasses `Base`, `AuthNZUserMixin`) |
+| `workspace_models.py` | Turnkey workspace & task domain models | `Workspace`, `WorkspaceMember`, `Task`, `TeamMember`, `AuditLog`, `Notification` |
 | `auth_nz.routers` (`api/router.py`) | Selective Router Factory & Domain Sub-Routers | `create_authnz_router()`, `api_router`, `auth_router`, `mfa_router`, `webauthn_router`, `workspace_router`, `task_router` |
-| `auth_nz.adapter` (`adapter.py`) | Programmatic configuration and adapter wrapper | `configure_authnz()`, `AuthNZ`, `AuthNZAdapter` |
+| `auth_nz.adapter` (`adapter.py`) | Programmatic configuration and object-oriented adapter wrapper | `configure_authnz()`, `AuthNZ`, `AuthNZAdapter` |
 | `auth_nz.guards` (`guards.py`) | 1-line declarative FastAPI security dependency guards | `require_auth()`, `require_role()`, `require_permission()`, `get_current_workspace()`, `CurrentUser`, `CurrentWorkspace` |
 | `auth_nz.database` (`database.py`) | Async SQLAlchemy engine and session lifecycle | `get_engine()`, `get_session_factory()`, `get_db_session()` |
 | `auth_nz.exceptions` (`exceptions.py`) | RFC 7807 problem details error boundaries | `register_exception_handlers()`, `AuthNZException`, `InvalidCredentialsException` |
 | `cli.py` (`authnz`) | Scriptable administration CLI control plane | `authnz users`, `authnz workspaces`, `authnz policies`, `authnz audit`, `authnz health` |
+| `db_manager.py` | PostgreSQL database inspection, querying, and maintenance | `stats`, `audit`, `workspaces`, `members`, `users`, `tasks`, `purge-audit` |
+| `seed_admin.py` | Out-of-band root administrator provisioning | `seed_admin.py --username admin --email admin@example.com --password ...` |
 
 ---
 
@@ -109,57 +113,72 @@ async def admin_purge(user: CurrentUser = Depends(require_role("admin"))):
 When embedding authentication directly into a host application with custom database tables:
 
 ```python
-from fastapi import FastAPI
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from auth_nz.models import AuthNZUserMixin
-from auth_nz.routers import create_authnz_router
-from auth_nz.adapter import configure_authnz
+from fastapi import FastAPI, Depends
+from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from auth_nz.models import Base, AuthNZUserMixin
+from auth_nz.adapter import AuthNZ
+from auth_nz.guards import CurrentUser, require_auth
 
-# 1. Define host app's User table inheriting AuthNZUserMixin
-class Base(DeclarativeBase):
-    pass
-
+# 1. Define host app's User table inheriting AuthNZUserMixin on shared Base
 class User(Base, AuthNZUserMixin):
     __tablename__ = "users"
     company_name: Mapped[str]
     stripe_customer_id: Mapped[str | None] = mapped_column(nullable=True)
 
-# 2. Configure Auth N&Z with the host model & settings
-configure_authnz(
+# 2. Create Async Database Session Factory
+engine = create_async_engine("postgresql+asyncpg://user:pass@localhost:5432/my_app")
+session_factory = async_sessionmaker(engine)
+
+# 3. Initialize AuthNZ Adapter with your custom model & session factory
+authnz = AuthNZ(
     user_model=User,
+    session_factory=session_factory,
     jwt_secret_key="my_super_secret_high_entropy_jwt_signing_key",
 )
 
-# 3. Selectively mount desired endpoints
+# 4. Selectively mount desired endpoints
 app = FastAPI(title="SaaS Core")
 
 app.include_router(
-    create_authnz_router(
+    authnz.create_router(
         enable_auth=True,        # /auth/login, /auth/register, /auth/me, /auth/refresh
         enable_mfa=True,         # /auth/mfa/setup, /auth/mfa/verify
         enable_webauthn=True,    # /auth/webauthn (FIDO2 Passkeys)
+        enable_device_trust=True,# /auth/trusted-devices
         enable_workspaces=False, # Disable multi-tenancy
-        enable_tasks=False,      # Disable demo task tracker
+        enable_tasks=False,      # Disable turnkey task tracker
     ),
     prefix="/api/v1",
 )
+
+# 5. Protect endpoints
+@app.get("/api/v1/profile")
+async def get_profile(user: CurrentUser = Depends(require_auth())):
+    return {"id": user.id, "email": user.email, "company": user.metadata.get("company_name")}
 ```
 
 ---
 
-### Recipe 3: Running as a Turnkey Standalone IAM Microservice
+### Recipe 3: Running as a Turnkey Standalone IAM Microservice & Docker Stack
 
-When deploying Auth N&Z as a dedicated centralized auth server (e.g. on a mini-server or cloud container):
+When deploying Auth N&Z as a dedicated centralized auth server:
 
 ```bash
-# 1. Start via bare-metal Python (consumes ~50 MB RAM, recommended for mini-servers)
+# Option A: Bare-metal Python / Uvicorn (~50 MB RAM)
 uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 
-# 2. Or start complete local container stack (API + PostgreSQL + Redis + OPA)
+# Option B: Complete Docker Compose Stack (API + PostgreSQL 16 + Redis 7 + OPA)
 docker compose up -d
+
+# Bootstrap root admin inside container
+docker compose exec auth-api python seed_admin.py
+
+# Inspect database statistics
+docker compose exec auth-api python db_manager.py stats
 ```
 
-Swagger API documentation is immediately available at `http://localhost:8000/docs`.
+Interactive OpenAPI Swagger UI is immediately available at `http://localhost:8000/docs`.
 
 ---
 
@@ -196,4 +215,4 @@ Run the automated offline test suite:
 ```bash
 pytest
 ```
-*43 passed unit and integration tests across cryptography, guards, router factory, policies, OPA, and telemetry.*
+*44 passed unit and integration tests across cryptography, guards, router factory, policies, OPA, observability, and BYOU isolation.*
