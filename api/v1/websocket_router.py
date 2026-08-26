@@ -13,7 +13,7 @@ import urllib.parse
 import uuid
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
-from models import Notification
+from workspace_models import Notification
 from database import get_session_factory
 from api.dependencies import (
     sess_store,

@@ -1,23 +1,29 @@
 """
-SQLAlchemy Declarative Models for PostgreSQL (Auth N&Z)
-======================================================
-Defines the relational PostgreSQL schema mapped with native UUID primary/foreign keys,
-JSONB metadata/attribute columns, proper datetime with time zone types, and foreign key cascades.
+SQLAlchemy Declarative Models for PostgreSQL (Auth N&Z) - Core Identity
+========================================================================
+Defines the CORE identity schema shared by both BYOU (Bring-Your-Own-User)
+host applications and the turnkey standalone server: the base declarative
+registry, the security-fields mixin, and the two support tables that are
+genuinely auth-scoped rather than workspace/task-domain (password reset
+tokens, trusted devices for MFA).
+
+Workspace/Task/Team/Notification/AuditLog models intentionally do NOT live
+here anymore - see workspace_models.py. The default turnkey User model
+(used only when a host hasn't supplied their own via BYOU) lives in
+default_user.py, so importing this module never registers a "users" table
+by itself and never collides with a host's own custom User class.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 import uuid
 
 from sqlalchemy import (
     Boolean,
-    Column,
     DateTime,
     ForeignKey,
-    Index,
     String,
     Text,
-    UniqueConstraint,
     func,
     text,
 )
@@ -37,10 +43,19 @@ class AuthNZUserMixin:
     identity and add custom application fields (e.g. stripe_id, company, avatar).
 
     Example:
+        from auth_nz.models import Base, AuthNZUserMixin
+
         class User(Base, AuthNZUserMixin):
             __tablename__ = "users"
             company: Mapped[str] = mapped_column(String(100))
             stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    IMPORTANT: import Base from this module (or from auth_nz.models) for your
+    own User class rather than declaring `class Base(DeclarativeBase): pass`
+    yourself. Sharing this Base's metadata/registry is what lets
+    PasswordResetToken and TrustedDevice below resolve their foreign keys to
+    your table, and lets a single Base.metadata.create_all() / Alembic
+    target_metadata capture your whole schema in one pass.
     """
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -90,42 +105,13 @@ class AuthNZUserMixin:
     )
 
 
-class User(Base, AuthNZUserMixin):
-    """
-    User accounts and authentication identity credentials.
-    Default turnkey model for Auth N&Z.
-    """
-    __tablename__ = "users"
-
-    # Relationships
-    password_reset_tokens: Mapped[List["PasswordResetToken"]] = relationship(
-        "PasswordResetToken",
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
-    trusted_devices: Mapped[List["TrustedDevice"]] = relationship(
-        "TrustedDevice",
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
-    workspace_memberships: Mapped[List["WorkspaceMember"]] = relationship(
-        "WorkspaceMember",
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
-    notifications: Mapped[List["Notification"]] = relationship(
-        "Notification",
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
-
-    def __repr__(self) -> str:
-        return f"<User(id={self.id}, username='{self.username}', email='{self.email}')>"
-
-
 class PasswordResetToken(Base):
     """
     High-entropy cryptographic password reset tokens.
+
+    FKs to "users.id" by table name - works against either the built-in
+    default User (default_user.py) or a BYOU host's own User class, as long
+    as that class shares this module's Base.
     """
     __tablename__ = "password_reset_tokens"
 
@@ -164,379 +150,19 @@ class PasswordResetToken(Base):
         nullable=True,
     )
 
-    # Relationships
-    user: Mapped["User"] = relationship("User", back_populates="password_reset_tokens")
+    # Relationships (string-resolved: works against whichever class named
+    # "User" is registered on this Base in the running process - either the
+    # default turnkey User or a BYOU host's own User).
+    #
+    # Uses backref (not back_populates) deliberately: back_populates requires
+    # the User class to explicitly declare a matching `password_reset_tokens`
+    # property, which a bare BYOU host's User(Base, AuthNZUserMixin) has no
+    # reason to know about. backref auto-generates that reverse attribute on
+    # whichever User class is present, so a host doesn't need to add anything.
+    user: Mapped["User"] = relationship("User", backref="password_reset_tokens")
 
     def __repr__(self) -> str:
         return f"<PasswordResetToken(id={self.id}, user_id={self.user_id}, used={self.used_at is not None})>"
-
-
-class Workspace(Base):
-    """
-    Multi-tenant workspace organization boundaries.
-    """
-    __tablename__ = "workspaces"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
-    name: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-    )
-    slug: Mapped[str] = mapped_column(
-        String(255),
-        unique=True,
-        nullable=False,
-        index=True,
-    )
-    description: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-    )
-    created_by: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-
-    # Relationships
-    members: Mapped[List["WorkspaceMember"]] = relationship(
-        "WorkspaceMember",
-        back_populates="workspace",
-        cascade="all, delete-orphan",
-    )
-    tasks: Mapped[List["Task"]] = relationship(
-        "Task",
-        back_populates="workspace",
-        cascade="all, delete-orphan",
-    )
-    notifications: Mapped[List["Notification"]] = relationship(
-        "Notification",
-        back_populates="workspace",
-        cascade="all, delete-orphan",
-    )
-
-    def __repr__(self) -> str:
-        return f"<Workspace(id={self.id}, name='{self.name}', slug='{self.slug}')>"
-
-
-class WorkspaceMember(Base):
-    """
-    Role-based memberships and scoped invitations within a specific workspace.
-    """
-    __tablename__ = "workspace_members"
-    __table_args__ = (
-        UniqueConstraint("workspace_id", "email", name="uq_workspace_members_workspace_email"),
-        Index("idx_wm_invite_token", "invite_token"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
-    workspace_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("workspaces.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
-    email: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-        index=True,
-    )
-    name: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    role: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="viewer",
-        server_default="viewer",
-    )
-    department: Mapped[str] = mapped_column(
-        String(100),
-        nullable=False,
-        default="General",
-        server_default="General",
-    )
-    status: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="active",
-        server_default="active",
-    )
-    invited_by: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    invite_token: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    expires_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-    invited_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-
-    # Relationships
-    workspace: Mapped["Workspace"] = relationship("Workspace", back_populates="members")
-    user: Mapped[Optional["User"]] = relationship("User", back_populates="workspace_memberships")
-
-    def __repr__(self) -> str:
-        return f"<WorkspaceMember(id={self.id}, workspace_id={self.workspace_id}, email='{self.email}', role='{self.role}')>"
-
-
-class Task(Base):
-    """
-    Sprint deliverables, action items, and task cards scoped to workspaces.
-    """
-    __tablename__ = "tasks"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
-    workspace_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("workspaces.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    title: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-    description: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-    )
-    status: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="todo",
-        server_default="todo",
-    )
-    priority: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="medium",
-        server_default="medium",
-    )
-    assignee_email: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    assignee_name: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    assignees: Mapped[List[Dict[str, Any]]] = mapped_column(
-        JSONB,
-        nullable=False,
-        default=list,
-        server_default=text("'[]'::jsonb"),
-    )
-    created_by: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-    )
-    tags: Mapped[List[str]] = mapped_column(
-        JSONB,
-        nullable=False,
-        default=list,
-        server_default=text("'[]'::jsonb"),
-    )
-    due_date: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-
-    # Relationships
-    workspace: Mapped["Workspace"] = relationship("Workspace", back_populates="tasks")
-    notifications: Mapped[List["Notification"]] = relationship("Notification", back_populates="task")
-
-    def __repr__(self) -> str:
-        return f"<Task(id={self.id}, workspace_id={self.workspace_id}, title='{self.title[:30]}', status='{self.status}')>"
-
-
-class TeamMember(Base):
-    """
-    Legacy system-wide team member and invitation registry.
-    """
-    __tablename__ = "team_members"
-    __table_args__ = (
-        Index("idx_tm_invite_token", "invite_token"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
-    email: Mapped[str] = mapped_column(
-        String(255),
-        unique=True,
-        nullable=False,
-        index=True,
-    )
-    name: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    role: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="viewer",
-        server_default="viewer",
-    )
-    department: Mapped[str] = mapped_column(
-        String(100),
-        nullable=False,
-        default="General",
-        server_default="General",
-    )
-    status: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="active",
-        server_default="active",
-    )
-    invited_by: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    invite_token: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    expires_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-    invited_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-
-    def __repr__(self) -> str:
-        return f"<TeamMember(id={self.id}, email='{self.email}', role='{self.role}')>"
-
-
-class AuditLog(Base):
-    """
-    Tamper-evident structured security telemetry and audit events.
-    """
-    __tablename__ = "audit_logs"
-    __table_args__ = (
-        Index("idx_audit_subject", "subject_id"),
-        Index("idx_audit_event", "event_type"),
-        Index("idx_audit_timestamp", "timestamp"),
-        Index("idx_audit_workspace", "workspace_id"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
-    workspace_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("workspaces.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    event_type: Mapped[str] = mapped_column(
-        String(100),
-        nullable=False,
-    )
-    severity: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="INFO",
-        server_default="INFO",
-    )
-    subject_id: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    action: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    resource: Mapped[Optional[str]] = mapped_column(
-        String(255),
-        nullable=True,
-    )
-    reason: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-    )
-    ip_address: Mapped[Optional[str]] = mapped_column(
-        String(100),
-        nullable=True,
-    )
-    user_agent: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-    )
-    # Avoid collision with Base.metadata
-    metadata_: Mapped[Dict[str, Any]] = mapped_column(
-        "metadata",
-        JSONB,
-        nullable=False,
-        default=dict,
-        server_default=text("'{}'::jsonb"),
-    )
-    timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-
-    # Relationships
-    workspace: Mapped[Optional["Workspace"]] = relationship("Workspace")
-
-    def __repr__(self) -> str:
-        return f"<AuditLog(id={self.id}, event_type='{self.event_type}', severity='{self.severity}')>"
 
 
 class TrustedDevice(Base):
@@ -544,10 +170,6 @@ class TrustedDevice(Base):
     Remembered trusted devices for MFA scoping and bypass tracking.
     """
     __tablename__ = "trusted_devices"
-    __table_args__ = (
-        Index("idx_td_user", "user_id"),
-        Index("idx_td_token", "token_hash"),
-    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -591,76 +213,10 @@ class TrustedDevice(Base):
         server_default=func.now(),
     )
 
-    # Relationships
-    user: Mapped["User"] = relationship("User", back_populates="trusted_devices")
+    # Relationships. backref, not back_populates - see PasswordResetToken
+    # above for why: a bare BYOU User class shouldn't need to know it's
+    # expected to declare a `trusted_devices` property.
+    user: Mapped["User"] = relationship("User", backref="trusted_devices")
 
     def __repr__(self) -> str:
         return f"<TrustedDevice(id={self.id}, user_id={self.user_id}, label='{self.device_label}')>"
-
-
-class Notification(Base):
-    """
-    In-app user notifications for tasks, mentions, and security events.
-    """
-    __tablename__ = "notifications"
-    __table_args__ = (
-        Index("idx_notif_user", "user_id"),
-        Index("idx_notif_read", "user_id", "is_read"),
-        Index("idx_notif_created", "created_at"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    workspace_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("workspaces.id", ondelete="CASCADE"),
-        nullable=True,
-    )
-    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("tasks.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    type: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-    )
-    title: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-    message: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-    link: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-    )
-    is_read: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=False,
-        server_default=text("false"),
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-
-    # Relationships
-    user: Mapped["User"] = relationship("User", back_populates="notifications")
-    workspace: Mapped[Optional["Workspace"]] = relationship("Workspace", back_populates="notifications")
-    task: Mapped[Optional["Task"]] = relationship("Task", back_populates="notifications")
-
-    def __repr__(self) -> str:
-        return f"<Notification(id={self.id}, user_id={self.user_id}, type='{self.type}', read={self.is_read})>"

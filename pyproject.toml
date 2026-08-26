@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "l4s3r-authnz"
-version = "1.0.2"
+version = "1.0.3"
 description = "Production-grade, NIST-compliant Async Authentication & Authorization IAM Engine for Python/FastAPI"
 readme = "README.md"
 authors = [{ name = "L4S3r" }]
@@ -76,6 +76,8 @@ py-modules = [
     "server",
     "cli",
     "models",
+    "default_user",
+    "workspace_models",
     "adapter",
     "task_repository",
     "seed_admin",

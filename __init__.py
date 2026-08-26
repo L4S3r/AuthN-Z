@@ -22,14 +22,16 @@ __version__ = "1.0.1"
 from models import (
     Base,
     AuthNZUserMixin,
-    User,
     PasswordResetToken,
+    TrustedDevice,
+)
+from default_user import User
+from workspace_models import (
     Workspace,
     WorkspaceMember,
     Task,
     TeamMember,
     AuditLog,
-    TrustedDevice,
     Notification,
 )
 

@@ -23,7 +23,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from database import get_session_factory
-from models import PasswordResetToken, User
+from models import PasswordResetToken
+from default_user import User as _DefaultUser
 
 
 class abstractUserRepository(ABC):
@@ -117,7 +118,7 @@ class UserRepository(abstractUserRepository):
     ):
         self._custom_session_factory = session_factory
         self._db_url = db_url
-        self.user_model = user_model or User
+        self.user_model = user_model or _DefaultUser
 
     @property
     def session_factory(self) -> async_sessionmaker[AsyncSession]:

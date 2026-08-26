@@ -16,7 +16,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from database import get_session_factory
-from models import AuditLog, Workspace
+from workspace_models import AuditLog, Workspace
 
 logger = logging.getLogger("auth_nz.audit_logger")
 

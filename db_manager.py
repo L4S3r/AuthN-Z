@@ -33,13 +33,15 @@ load_dotenv()
 from sqlalchemy import select, func, delete, text
 from database import get_session_factory, get_engine
 from models import (
-    User,
+    TrustedDevice,
+    PasswordResetToken,
+)
+from default_user import User
+from workspace_models import (
     Workspace,
     WorkspaceMember,
     Task,
     TeamMember,
-    TrustedDevice,
-    PasswordResetToken,
     Notification,
     AuditLog,
 )

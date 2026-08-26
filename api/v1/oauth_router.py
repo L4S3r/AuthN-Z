@@ -28,7 +28,7 @@ from api.dependencies import (
 from api.schemas import OAuthExchangeRequest
 from oauth_provider import generate_pkce_pair, generate_oauth_state
 from database import get_session_factory
-from models import WorkspaceMember
+from workspace_models import WorkspaceMember
 
 logger = logging.getLogger("auth_nz.oauth_router")
 

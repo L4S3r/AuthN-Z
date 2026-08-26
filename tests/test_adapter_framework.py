@@ -19,7 +19,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 import auth_nz
-from auth_nz.models import Base as DefaultBase, AuthNZUserMixin, User as DefaultUser
+from auth_nz.models import Base as DefaultBase, AuthNZUserMixin
+from default_user import User as DefaultUser
 from auth_nz.routers import (
     create_authnz_router,
     auth_router,
@@ -187,3 +188,37 @@ def test_default_api_router_backwards_compatibility():
     assert "/workspaces" in paths
     assert "/tasks" in paths
     assert "/health" in paths
+
+
+def test_model_separation_and_byou_isolation():
+    """Verify that models.py, default_user.py, and workspace_models.py are properly separated."""
+    import models
+    import default_user
+    import workspace_models
+    import auth_nz.models
+
+    # models.py core exports
+    assert hasattr(models, "Base")
+    assert hasattr(models, "AuthNZUserMixin")
+    assert hasattr(models, "PasswordResetToken")
+    assert hasattr(models, "TrustedDevice")
+
+    # default_user.py exports
+    assert hasattr(default_user, "User")
+    assert issubclass(default_user.User, models.Base)
+    assert issubclass(default_user.User, models.AuthNZUserMixin)
+
+    # workspace_models.py exports
+    assert hasattr(workspace_models, "Workspace")
+    assert hasattr(workspace_models, "WorkspaceMember")
+    assert hasattr(workspace_models, "Task")
+    assert hasattr(workspace_models, "TeamMember")
+    assert hasattr(workspace_models, "AuditLog")
+    assert hasattr(workspace_models, "Notification")
+
+    # auth_nz.models public BYOU surface
+    assert hasattr(auth_nz.models, "Base")
+    assert hasattr(auth_nz.models, "AuthNZUserMixin")
+    assert hasattr(auth_nz.models, "PasswordResetToken")
+    assert hasattr(auth_nz.models, "TrustedDevice")
+

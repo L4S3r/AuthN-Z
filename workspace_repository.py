@@ -21,7 +21,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from database import get_session_factory
-from models import Task, TeamMember, User, Workspace, WorkspaceMember
+from workspace_models import Task, TeamMember, Workspace, WorkspaceMember
+from default_user import User
 
 logger = logging.getLogger("auth_nz.workspace_repository")
 

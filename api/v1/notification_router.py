@@ -13,7 +13,7 @@ from sqlalchemy import func, select, update as sql_update
 
 from api.dependencies import get_current_user
 from database import get_session_factory
-from models import Notification
+from workspace_models import Notification
 
 logger = logging.getLogger("auth_nz.notification_router")
 
