@@ -7,6 +7,8 @@
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-44%20passed%20%28100%25%29-brightgreen.svg)]()
 
+> "I don't care if the user exists; I care if they are authorized to perform this specific action."
+
 **Auth N&Z** is a modular, production-grade, NIST-compliant Identity and Access Management (IAM) framework and multi-tenant authorization engine built with Python, FastAPI, and asynchronous SQLAlchemy 2.0 (`asyncpg`).
 
 ---
