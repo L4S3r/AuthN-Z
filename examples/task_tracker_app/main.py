@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import uuid
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
+from auth_nz import settings
 
 # 1. Import from Auth N&Z Package
 from auth_nz import (
@@ -30,6 +31,9 @@ app = FastAPI(
     title="Task Tracker (Secured by Auth N&Z)",
     description="Example enterprise sprint tracker consuming Auth N&Z for authentication and multi-tenant authorization.",
     version="1.0.0",
+    docs_url="/docs" if settings.docs_enabled else None,
+    redoc_url="/redoc" if settings.docs_enabled else None,
+    openapi_url="/openapi.json" if settings.docs_enabled else None
 )
 
 # 3. Register RFC 7807 Error Boundaries
