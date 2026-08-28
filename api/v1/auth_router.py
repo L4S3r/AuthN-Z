@@ -28,6 +28,7 @@ from api.dependencies import (
     set_trusted_device_cookie,
     clear_trusted_device_cookie,
     check_rate_limit,
+    handle_conditional_response,
 )
 from api.schemas import (
     RegisterRequest,
@@ -601,7 +602,11 @@ async def reset_password(req: ResetPasswordRequest, request: Request, response: 
 
 
 @router.get("/auth/me", tags=["User Context"])
-async def get_my_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
+async def get_my_profile(
+    request: Request,
+    response: Response,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Retrieve identity context of the authenticated user."""
     user = await user_repo.get_by_id(current_user["user_id"])
     if not user:
@@ -637,7 +642,7 @@ async def get_my_profile(current_user: Dict[str, Any] = Depends(get_current_user
         "metadata": safe_meta,
         "created_at": user.get("created_at"),
     }
-    return {
+    payload = {
         "status": "SUCCESS",
         "user_id": user["id"],
         "name": safe_name,
@@ -648,3 +653,4 @@ async def get_my_profile(current_user: Dict[str, Any] = Depends(get_current_user
         "metadata": safe_meta,
         "user": safe_user,
     }
+    return handle_conditional_response(request, response, payload)

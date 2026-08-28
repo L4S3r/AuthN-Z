@@ -16,7 +16,7 @@ import hashlib
 import json
 import secrets
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from sqlalchemy import delete, func, or_, select, update
@@ -26,6 +26,158 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from database import get_session_factory
 from models import PasswordResetToken
 from default_user import User as _DefaultUser
+import logging
+from config import settings
+
+logger = logging.getLogger("auth_nz.user_repository")
+
+
+class UserProfileCache:
+    """Multi-tiered L1 (In-Memory LRU/TTL) and L2 (Redis) profile and metadata cache."""
+
+    def __init__(self, redis_client: Optional[Any] = None, node_id: Optional[str] = None):
+        self._l1_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._l1_ident_map: Dict[str, Tuple[str, float]] = {}
+        self.redis_client = redis_client
+        self.node_id = node_id or str(uuid.uuid4())
+
+    def set_redis_client(self, redis_client: Any) -> None:
+        self.redis_client = redis_client
+
+    def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        if not getattr(settings, "USER_CACHE_ENABLED", True) or not user_id:
+            return None
+        now = datetime.now(timezone.utc).timestamp()
+        uid_str = str(user_id).strip()
+
+        # 1. Check L1 Memory Cache
+        entry = self._l1_cache.get(uid_str)
+        if entry:
+            data, exp = entry
+            if now < exp:
+                return dict(data)
+            self._l1_cache.pop(uid_str, None)
+
+        # 2. Check L2 Redis Cache
+        if self.redis_client is not None:
+            try:
+                cached_json = self.redis_client.get(f"authnz:cache:user:{uid_str}")
+                if cached_json:
+                    data = json.loads(cached_json)
+                    l1_exp = now + getattr(settings, "USER_CACHE_L1_TTL_SECONDS", 30)
+                    self._l1_cache[uid_str] = (dict(data), l1_exp)
+                    return dict(data)
+            except Exception as exc:
+                logger.debug("Redis profile cache get error: %s", exc)
+
+        return None
+
+    def get_user_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
+        if not getattr(settings, "USER_CACHE_ENABLED", True) or not identifier:
+            return None
+        now = datetime.now(timezone.utc).timestamp()
+        clean_id = identifier.strip().lower()
+
+        # 1. Check L1 Identifier Index
+        mapped = self._l1_ident_map.get(clean_id)
+        if mapped:
+            user_id, exp = mapped
+            if now < exp:
+                user = self.get_user(user_id)
+                if user:
+                    return user
+            self._l1_ident_map.pop(clean_id, None)
+
+        # 2. Check L2 Redis Identifier Index
+        if self.redis_client is not None:
+            try:
+                user_id = self.redis_client.get(f"authnz:cache:ident:{clean_id}")
+                if user_id:
+                    user = self.get_user(user_id)
+                    if user:
+                        l1_exp = now + getattr(settings, "USER_CACHE_L1_TTL_SECONDS", 30)
+                        self._l1_ident_map[clean_id] = (user_id, l1_exp)
+                        return user
+            except Exception as exc:
+                logger.debug("Redis ident cache get error: %s", exc)
+
+        return None
+
+    def set_user(self, user_dict: Dict[str, Any]) -> None:
+        if not getattr(settings, "USER_CACHE_ENABLED", True) or not user_dict or not user_dict.get("id"):
+            return
+        user_id = str(user_dict["id"]).strip()
+        now = datetime.now(timezone.utc).timestamp()
+        l1_exp = now + getattr(settings, "USER_CACHE_L1_TTL_SECONDS", 30)
+        data_copy = dict(user_dict)
+
+        self._l1_cache[user_id] = (data_copy, l1_exp)
+
+        username = str(user_dict.get("username", "")).strip().lower()
+        email = str(user_dict.get("email", "")).strip().lower()
+        if username:
+            self._l1_ident_map[username] = (user_id, l1_exp)
+        if email:
+            self._l1_ident_map[email] = (user_id, l1_exp)
+
+        # Periodic cleanup of expired entries
+        if len(self._l1_cache) > 2000:
+            self._l1_cache = {k: v for k, v in self._l1_cache.items() if now < v[1]}
+            self._l1_ident_map = {k: v for k, v in self._l1_ident_map.items() if now < v[1]}
+
+        # L2 Redis storage
+        if self.redis_client is not None:
+            try:
+                serialized = json.dumps(data_copy, default=str)
+                ttl = getattr(settings, "USER_CACHE_TTL_SECONDS", 60)
+                pipe = self.redis_client.pipeline()
+                pipe.setex(f"authnz:cache:user:{user_id}", ttl, serialized)
+                if username:
+                    pipe.setex(f"authnz:cache:ident:{username}", ttl, user_id)
+                if email:
+                    pipe.setex(f"authnz:cache:ident:{email}", ttl, user_id)
+                pipe.execute()
+            except Exception as exc:
+                logger.debug("Redis profile cache set error: %s", exc)
+
+    def invalidate(
+        self,
+        user_id: Optional[str] = None,
+        identifier: Optional[str] = None,
+        publish_event: bool = True,
+    ) -> None:
+        """Invalidate user cache entry across L1, L2, and multi-node pub/sub."""
+        if user_id:
+            uid_str = str(user_id).strip()
+            self._l1_cache.pop(uid_str, None)
+            self._l1_ident_map = {k: v for k, v in self._l1_ident_map.items() if v[0] != uid_str}
+
+        if identifier:
+            clean_id = identifier.strip().lower()
+            self._l1_ident_map.pop(clean_id, None)
+
+        if self.redis_client is not None:
+            try:
+                keys = []
+                if user_id:
+                    keys.append(f"authnz:cache:user:{str(user_id).strip()}")
+                if identifier:
+                    keys.append(f"authnz:cache:ident:{identifier.strip().lower()}")
+                if keys:
+                    self.redis_client.delete(*keys)
+                if publish_event:
+                    envelope = {
+                        "user_id": str(user_id).strip() if user_id else None,
+                        "identifier": str(identifier).strip().lower() if identifier else None,
+                        "_origin_node_id": self.node_id,
+                    }
+                    self.redis_client.publish("authnz:cache:invalidate", json.dumps(envelope))
+            except Exception as exc:
+                logger.debug("Redis profile cache invalidation error: %s", exc)
+
+    def clear(self) -> None:
+        self._l1_cache.clear()
+        self._l1_ident_map.clear()
 
 
 class abstractUserRepository(ABC):
@@ -118,10 +270,12 @@ class UserRepository(abstractUserRepository):
         db_url: Optional[str] = None,
         session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
         user_model: Optional[Any] = None,
+        redis_client: Optional[Any] = None,
     ):
         self._custom_session_factory = session_factory
         self._db_url = db_url
         self.user_model = user_model or _DefaultUser
+        self.cache = UserProfileCache(redis_client=redis_client)
 
     @property
     def session_factory(self) -> async_sessionmaker[AsyncSession]:
@@ -213,12 +367,15 @@ class UserRepository(abstractUserRepository):
                 sess.add(new_user)
                 if should_commit:
                     await sess.commit()
-            return await self.get_by_id(str(user_id), session=session)  # type: ignore
+            created = await self.get_by_id(str(user_id), session=session)  # type: ignore
+            if created and session is None:
+                self.cache.set_user(created)
+            return created
         except IntegrityError as e:
             raise ValueError(f"User with this username or email address already exists: {e}")
 
     async def get_by_id(self, user_id: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
-        """Fetch a user record by UUID."""
+        """Fetch a user record by UUID with L1/L2 caching."""
         if not user_id:
             return None
         try:
@@ -226,17 +383,33 @@ class UserRepository(abstractUserRepository):
         except (ValueError, AttributeError):
             return None
 
+        # Check cache if query is not bound to an existing session
+        if session is None:
+            cached = self.cache.get_user(str(uid))
+            if cached is not None:
+                return cached
+
         async with self._use_session(session) as (sess, _):
             stmt = select(self.user_model).where(self.user_model.id == uid)
             result = await sess.execute(stmt)
             user = result.scalars().first()
-            return self._format_user(user) if user else None
+            formatted = self._format_user(user) if user else None
+
+        if formatted is not None and session is None:
+            self.cache.set_user(formatted)
+
+        return formatted
 
     async def get_by_identifier(self, identifier: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
-        """Lookup a user by case-insensitive username or email."""
+        """Lookup a user by case-insensitive username or email with L1/L2 caching."""
         clean_id = (identifier or "").strip().lower()
         if not clean_id:
             return None
+
+        if session is None:
+            cached = self.cache.get_user_by_identifier(clean_id)
+            if cached is not None:
+                return cached
 
         async with self._use_session(session) as (sess, _):
             stmt = select(self.user_model).where(
@@ -247,7 +420,12 @@ class UserRepository(abstractUserRepository):
             )
             result = await sess.execute(stmt)
             user = result.scalars().first()
-            return self._format_user(user) if user else None
+            formatted = self._format_user(user) if user else None
+
+        if formatted is not None and session is None:
+            self.cache.set_user(formatted)
+
+        return formatted
 
     async def update_user(self, user_id: str, updates: Dict[str, Any], session: Optional[AsyncSession] = None) -> bool:
         """Atomically update user fields."""
@@ -295,7 +473,10 @@ class UserRepository(abstractUserRepository):
                 result = await sess.execute(stmt)
                 if should_commit:
                     await sess.commit()
-                return (result.rowcount or 0) > 0
+                if (result.rowcount or 0) > 0:
+                    self.cache.invalidate(user_id=str(uid))
+                    return True
+                return False
         except IntegrityError as e:
             raise ValueError(f"Update failed due to unique constraint: {e}")
 
@@ -313,7 +494,10 @@ class UserRepository(abstractUserRepository):
             result = await sess.execute(stmt)
             if should_commit:
                 await sess.commit()
-            return (result.rowcount or 0) > 0
+            if (result.rowcount or 0) > 0:
+                self.cache.invalidate(user_id=str(uid))
+                return True
+            return False
 
     async def set_status(self, user_id: str, is_active: bool, session: Optional[AsyncSession] = None) -> bool:
         """Activate or suspend a user account."""
@@ -329,7 +513,10 @@ class UserRepository(abstractUserRepository):
             result = await sess.execute(stmt)
             if should_commit:
                 await sess.commit()
-            return (result.rowcount or 0) > 0
+            if (result.rowcount or 0) > 0:
+                self.cache.invalidate(user_id=str(uid))
+                return True
+            return False
 
     async def list_users(
         self,
@@ -534,6 +721,7 @@ class UserRepository(abstractUserRepository):
             )
             if should_commit:
                 await sess.commit()
+            self.cache.invalidate(user_id=str(uid))
             return str(user_id)
 
 

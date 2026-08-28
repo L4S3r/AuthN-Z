@@ -81,6 +81,8 @@ def configure_authnz(
             deps.oauth_mgr.r = redis_client
         if hasattr(deps.webauthn_svc, "r"):
             deps.webauthn_svc.r = redis_client
+        if hasattr(deps.user_repo, "cache") and hasattr(deps.user_repo.cache, "set_redis_client"):
+            deps.user_repo.cache.set_redis_client(redis_client)
 
     if session_factory is not None:
         deps.user_repo.session_factory = session_factory

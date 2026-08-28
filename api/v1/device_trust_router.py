@@ -14,6 +14,7 @@ from api.dependencies import (
     audit_log,
     get_current_user,
     clear_trusted_device_cookie,
+    handle_conditional_response,
 )
 
 logger = logging.getLogger("auth_nz.device_trust_router")
@@ -24,6 +25,7 @@ router = APIRouter(tags=["Device Trust"])
 @router.get("/auth/trusted-devices")
 async def list_my_trusted_devices(
     request: Request,
+    response: Response,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """List all active trusted devices for the authenticated user."""
@@ -32,11 +34,12 @@ async def list_my_trusted_devices(
     if current_token:
         current_token = str(current_token).strip().strip('"').strip("'")
     devices = await device_trust_svc.list_trusted_devices(user_id, current_token=current_token)
-    return {
+    payload = {
         "status": "SUCCESS",
         "devices": devices,
         "count": len(devices),
     }
+    return handle_conditional_response(request, response, payload)
 
 
 @router.delete("/auth/trusted-devices/{device_id}")

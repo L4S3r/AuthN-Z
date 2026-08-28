@@ -14,6 +14,7 @@ from sqlalchemy import func, select, update as sql_update
 from api.dependencies import get_current_user
 from database import get_session_factory
 from workspace_models import Notification
+from api.v1.websocket_router import ws_manager
 
 logger = logging.getLogger("auth_nz.notification_router")
 
@@ -100,6 +101,14 @@ async def mark_notification_as_read(
         if (res.rowcount or 0) == 0:
             raise HTTPException(status_code=404, detail="Notification not found.")
 
+    try:
+        await ws_manager.send_to_user(
+            user_id,
+            {"event": "notification.read", "id": notification_id},
+        )
+    except Exception as exc:
+        logger.debug("Failed to dispatch WebSocket notification.read event: %s", exc)
+
     return {"status": "SUCCESS", "id": notification_id, "is_read": 1}
 
 
@@ -123,5 +132,13 @@ async def mark_all_notifications_as_read(
         )
         await session.execute(stmt)
         await session.commit()
+
+    try:
+        await ws_manager.send_to_user(
+            user_id,
+            {"event": "notification.read_all"},
+        )
+    except Exception as exc:
+        logger.debug("Failed to dispatch WebSocket notification.read_all event: %s", exc)
 
     return {"status": "SUCCESS", "message": "All notifications marked as read."}

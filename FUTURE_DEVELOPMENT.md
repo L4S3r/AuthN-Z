@@ -97,20 +97,15 @@ Implemented and active via `api/dependencies.py`, `authenticator.py`, and `audit
 
 ---
 
-## 7. Client-Side Query Caching & Server-Side Metadata TTL Caching
+## 7. Client-Side Query Caching & Server-Side Metadata TTL Caching (COMPLETED)
 
 ### Objective
 Drastically reduce PostgreSQL query load and network roundtrips on resource-constrained mini-servers / VPS instances by eliminating short-polling loops and caching read-heavy identity metadata.
 
-### Implementation Blueprint
-1. **Client-Side Query Optimization (React Query / SWR / Zustand)**:
-   - Configure `staleTime: 5 * 60 * 1000` (5 min) and `gcTime: 10 * 60 * 1000` on read-only user context endpoints (`/auth/me`, `/auth/webauthn/credentials`, `/auth/trusted-devices`).
-   - Disable aggressive window focus refetching (`refetchOnWindowFocus: false`, `refetchOnMount: false`).
-   - Use event-driven query invalidation on mutations (e.g. invalidate `['webauthn', 'credentials']` on passkey registration/deletion).
-   - Leverage active WebSocket channels (`/ws/workspaces/...`) for real-time notification push instead of HTTP polling `/notifications`.
-2. **HTTP Caching & Conditional Requests**:
-   - Return `Cache-Control: private, max-age=60, stale-while-revalidate=300` headers on user metadata endpoints.
-   - Support `ETag` / `If-None-Match` returning `304 Not Modified` without database JSON serialization.
-3. **Server-Side L1/L2 Profile Caching**:
-   - Cache user profile metadata in Redis / In-Memory LRU (`user:profile:<user_id>`) with a 60-second TTL.
-   - Invalidate cache entries on profile updates, role changes, or passkey enrollments.
+### Status
+Implemented and verified across backend multi-tier caching, HTTP conditional 304 handling, WebSocket reactive push, and frontend TanStack Query caching:
+- **Server-Side L1/L2 Profile Caching**: `UserProfileCache` in `user_repository.py` providing in-memory L1 fast-path lookup (<1ms) and distributed Redis L2 cache keys (`authnz:cache:user:{id}`) with automatic TTL expiry and invalidation on profile updates, role assignments, account suspension, password reset, and passkey enrollment.
+- **HTTP Conditional Caching & ETags**: `generate_etag` and `handle_conditional_response` in `api/dependencies.py` returning `ETag` and `Cache-Control: private, max-age=60, stale-while-revalidate=300` headers on `GET /auth/me`, `GET /auth/webauthn/credentials`, and `GET /auth/trusted-devices`, with instant `304 Not Modified` fast-path execution.
+- **Multi-Worker Pub/Sub Invalidation**: Distributed Redis Pub/Sub channel (`authnz:cache:*`) in `api/v1/websocket_router.py` synchronizing local in-memory L1 cache evictions across multi-worker Uvicorn clusters with loopback suppression.
+- **Zero-Polling Real-Time Notifications**: WebSocket push events (`notification.received`, `notification.read`, `notification.read_all`) in `api/v1/notification_router.py` and `api/v1/websocket_router.py`, eliminating background HTTP short-polling.
+- **Client-Side Query Configuration**: TanStack Query client with `staleTime: 5m`, `gcTime: 10m`, `refetchOnWindowFocus: false`, `refetchOnMount: false`, `refetchOnReconnect: true`, and event-driven mutation invalidation.

@@ -94,6 +94,13 @@ class AuthNZSettings(BaseSettings):
     # Observability & Monitoring
     SENTRY_DSN: Optional[str] = Field(default=None, description="Sentry DSN for error and performance tracing")
 
+    # Profile & Metadata Caching (Phase 4.4)
+    USER_CACHE_ENABLED: bool = Field(default=True, description="Enable L1/L2 user profile caching")
+    USER_CACHE_TTL_SECONDS: int = Field(default=60, description="TTL in seconds for cached user metadata in Redis")
+    USER_CACHE_L1_TTL_SECONDS: int = Field(default=30, description="TTL in seconds for in-memory L1 cache")
+    HTTP_CACHE_MAX_AGE: int = Field(default=60, description="Client Cache-Control max-age in seconds")
+    HTTP_CACHE_STALE_WHILE_REVALIDATE: int = Field(default=300, description="stale-while-revalidate duration in seconds")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

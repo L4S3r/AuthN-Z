@@ -19,6 +19,7 @@ from api.dependencies import (
     audit_log,
     get_current_user,
     set_auth_cookies,
+    handle_conditional_response,
 )
 from api.schemas import (
     WebAuthnRegisterVerifyRequest,
@@ -292,6 +293,8 @@ async def verify_authentication(
 
 @router.get("/credentials")
 async def list_registered_credentials(
+    request: Request,
+    response: Response,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """List all registered passkeys and hardware keys for the current user."""
@@ -307,7 +310,8 @@ async def list_registered_credentials(
             metadata = {}
 
     passkeys = metadata.get("passkeys", [])
-    return {"status": "SUCCESS", "count": len(passkeys), "passkeys": passkeys}
+    payload = {"status": "SUCCESS", "count": len(passkeys), "passkeys": passkeys}
+    return handle_conditional_response(request, response, payload)
 
 
 @router.delete("/credentials/{credential_id}")

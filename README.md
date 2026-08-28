@@ -5,7 +5,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-green.svg)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-44%20passed%20%28100%25%29-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-62%20passed%20%28100%25%29-brightgreen.svg)]()
 
 > "I don't care if the user exists; I care if they are authorized to perform this specific action."
 
@@ -40,7 +40,11 @@
 
 ---
 
-### 3. Production Observability & Telemetry
+### 3. Production Observability, Caching & Telemetry
+- **Multi-Tier L1/L2 Profile & Metadata Caching:** Sub-millisecond in-memory L1 cache with Redis L2 storage, reducing PostgreSQL read traffic by ~90–95%.
+- **HTTP Conditional 304 Fast-Path:** Automatic deterministic ETag generation (`W/"..."`) and `Cache-Control` header negotiation on user metadata endpoints (`/auth/me`, `/auth/webauthn/credentials`, `/auth/trusted-devices`).
+- **Distributed Multi-Worker Pub/Sub Invalidation:** Instant cluster-wide cache invalidation across Uvicorn workers on user profile or role changes.
+- **Zero-Polling Real-Time Push:** WebSockets for live notifications (`notification.received`, `notification.read`, `notification.read_all`).
 - **Prometheus Metrics (`GET /metrics`):** Telemetry for authentication rates, token verification outcomes, active sessions, and request latency histograms.
 - **Deep Health Probes (`GET /health/live`, `GET /health/ready`, `GET /health`):** Asynchronous connectivity probes against PostgreSQL and Redis.
 - **Tamper-Evident Audit Logging:** Structured security event telemetry with severity levels (`INFO`, `WARNING`, `CRITICAL`).

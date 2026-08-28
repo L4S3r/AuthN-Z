@@ -7,6 +7,8 @@ and contextual request dependencies for FastAPI domain routers.
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timezone
+import hashlib
+import json
 import os
 import secrets
 import logging
@@ -42,10 +44,10 @@ logger = logging.getLogger("auth_nz.dependencies")
 # =============================================================================
 # Core Engine Singletons
 # =============================================================================
-hasher = concretePasswordHasher()
-user_repo = concreteUserRepository()
-ws_repo = WorkspaceRepository()
 sess_store = concreteSessionStore()
+hasher = concretePasswordHasher()
+user_repo = concreteUserRepository(redis_client=getattr(sess_store, "r", None))
+ws_repo = WorkspaceRepository()
 token_svc = concreteTokenService(redis_client=getattr(sess_store, "r", None))
 mfa_prov = concreteMFAProvider()
 audit_log = AuditLogger()
@@ -290,3 +292,49 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return res
+
+
+# =============================================================================
+# HTTP Caching & Conditional 304 Helpers (Phase 4.4)
+# =============================================================================
+def generate_etag(data: Any) -> str:
+    """Generate a stable deterministic ETag hash for JSON-serializable payloads."""
+    serialized = json.dumps(data, sort_keys=True, default=str)
+    return f'W/"{hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]}"'
+
+
+def handle_conditional_response(
+    request: Request,
+    response: Response,
+    payload: Dict[str, Any],
+    max_age: Optional[int] = None,
+    stale_while_revalidate: Optional[int] = None,
+) -> Any:
+    """
+    Apply ETag and Cache-Control headers, returning a 304 Not Modified response
+    if the incoming If-None-Match header matches the computed ETag.
+    """
+    etag = generate_etag(payload)
+    age = max_age if max_age is not None else getattr(settings, "HTTP_CACHE_MAX_AGE", 60)
+    swr = (
+        stale_while_revalidate
+        if stale_while_revalidate is not None
+        else getattr(settings, "HTTP_CACHE_STALE_WHILE_REVALIDATE", 300)
+    )
+
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = f"private, max-age={age}, stale-while-revalidate={swr}"
+
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match:
+        candidates = [t.strip() for t in if_none_match.split(",")]
+        if etag in candidates or "*" in candidates:
+            return Response(
+                status_code=status.HTTP_304_NOT_MODIFIED,
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": f"private, max-age={age}, stale-while-revalidate={swr}",
+                },
+            )
+
+    return payload

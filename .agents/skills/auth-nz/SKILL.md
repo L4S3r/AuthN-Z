@@ -2,16 +2,17 @@
 name: auth-nz-core
 description: >-
   Comprehensive guide, architectural reference, and integration runbook for the published l4s3r-authnz
-  (Authentication & Authorization) engine and adapter framework. Use when scaffolding, integrating, or extending
-  production-grade authentication, BYOU custom models, multi-tenant RBAC/ABAC authorization, MFA/TOTP, WebAuthn passkeys,
-  JWT token families, device trust binding, password hashing, OAuth2/OIDC, and session management into Python/FastAPI/SQLAlchemy projects.
+  (Authentication & Authorization) engine, multi-tier caching layer, and adapter framework. Use when scaffolding,
+  integrating, or extending production-grade authentication, BYOU custom models, multi-tenant RBAC/ABAC authorization,
+  MFA/TOTP, WebAuthn passkeys, JWT token families, device trust binding, password hashing, OAuth2/OIDC, L1/L2 profile
+  caching, HTTP 304 ETag negotiation, and session management into Python/FastAPI/SQLAlchemy projects.
 ---
 
 # Auth N&Z Core Engine & Framework Guide (`l4s3r-authnz`)
 
 This skill provides an architectural blueprint and runbook for **Auth N&Z** (`l4s3r-authnz`), a modular, production-grade, NIST-compliant Identity and Access Management (IAM) framework and authorization adapter for Python and FastAPI.
 
-- **PyPI Package**: `l4s3r-authnz`
+- **PyPI Package**: `l4s3r-authnz` (v1.1.0)
 - **Installation**: `pip install l4s3r-authnz`
 - **Repository**: [https://github.com/L4S3r/AuthN-Z](https://github.com/L4S3r/AuthN-Z)
 - **Primary CLI**: `authnz`
@@ -45,9 +46,9 @@ The core framework is built with **Python 3.10+**, **FastAPI**, **SQLAlchemy 2.0
        └──────────────────┴──────────────┼───────────────┴──────────────────┘
                                          ▼
                       ┌────────────────────────────────────────┐
-                      │    Repositories & Policy Evaluator     │
-                      │  UserRepository | WorkspaceRepository  │
-                      │         PermissionEvaluator            │
+                      │    Repositories, Cache & Evaluators    │
+                      │  UserRepository | UserProfileCache     │
+                      │  WorkspaceRepository | PermissionEval   │
                       └──────────────────┬─────────────────────┘
                                          ▼
                       ┌────────────────────────────────────────┐
@@ -63,9 +64,11 @@ The core framework is built with **Python 3.10+**, **FastAPI**, **SQLAlchemy 2.0
 | `auth_nz.models` (`models.py`) | Core BYOU declarative identity models & Mixin | `Base`, `AuthNZUserMixin`, `PasswordResetToken`, `TrustedDevice` |
 | `default_user.py` | Turnkey default User model (when no custom BYOU model is supplied) | `User` (subclasses `Base`, `AuthNZUserMixin`) |
 | `workspace_models.py` | Turnkey workspace & task domain models | `Workspace`, `WorkspaceMember`, `Task`, `TeamMember`, `AuditLog`, `Notification` |
+| `user_repository.py` | User persistence and multi-tier caching engine | `UserRepository`, `UserProfileCache`, `abstractUserRepository` |
 | `auth_nz.routers` (`api/router.py`) | Selective Router Factory & Domain Sub-Routers | `create_authnz_router()`, `api_router`, `auth_router`, `mfa_router`, `webauthn_router`, `workspace_router`, `task_router` |
 | `auth_nz.adapter` (`adapter.py`) | Programmatic configuration and object-oriented adapter wrapper | `configure_authnz()`, `AuthNZ`, `AuthNZAdapter` |
 | `auth_nz.guards` (`guards.py`) | 1-line declarative FastAPI security dependency guards | `require_auth()`, `require_role()`, `require_permission()`, `get_current_workspace()`, `CurrentUser`, `CurrentWorkspace` |
+| `api.dependencies` (`dependencies.py`) | Shared singletons, security schemes, and HTTP 304 ETag helpers | `generate_etag()`, `handle_conditional_response()`, `get_current_user` |
 | `auth_nz.database` (`database.py`) | Async SQLAlchemy engine and session lifecycle | `get_engine()`, `get_session_factory()`, `get_db_session()` |
 | `auth_nz.exceptions` (`exceptions.py`) | RFC 7807 problem details error boundaries | `register_exception_handlers()`, `AuthNZException`, `InvalidCredentialsException` |
 | `cli.py` (`authnz`) | Scriptable administration CLI control plane | `authnz users`, `authnz workspaces`, `authnz policies`, `authnz audit`, `authnz health` |
@@ -160,29 +163,62 @@ async def get_profile(user: CurrentUser = Depends(require_auth())):
 
 ---
 
-### Recipe 3: Running as a Turnkey Standalone IAM Microservice & Docker Stack
+### Recipe 3: Multi-Tier Profile Caching & HTTP 304 Fast-Path
 
-When deploying Auth N&Z as a dedicated centralized auth server:
+Auth N&Z automatically caches identity metadata in L1 memory (<1ms) and L2 Redis (60s TTL), with conditional HTTP ETag evaluation:
 
-```bash
-# Option A: Bare-metal Python / Uvicorn (~50 MB RAM)
-uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+```python
+from fastapi import APIRouter, Request, Response, Depends
+from api.dependencies import get_current_user, handle_conditional_response, user_repo
 
-# Option B: Complete Docker Compose Stack (API + PostgreSQL 16 + Redis 7 + OPA)
-docker compose up -d
+router = APIRouter()
 
-# Bootstrap root admin inside container
-docker compose exec auth-api python seed_admin.py
-
-# Inspect database statistics
-docker compose exec auth-api python db_manager.py stats
+@router.get("/user/settings")
+async def get_settings(
+    request: Request,
+    response: Response,
+    current_user: dict = Depends(get_current_user),
+):
+    user = await user_repo.get_by_id(current_user["user_id"])
+    payload = {"status": "SUCCESS", "settings": user.get("metadata", {})}
+    # Emits ETag & Cache-Control, returns 304 Not Modified if client cache is fresh
+    return handle_conditional_response(request, response, payload)
 ```
-
-Interactive OpenAPI Swagger UI is immediately available at `http://localhost:8000/docs`.
 
 ---
 
-### Recipe 4: CLI Administration (`authnz`)
+### Recipe 4: Client-Side TanStack Query & Reactive WebSocket Push
+
+Frontend client applications should use conservative caching and WebSocket event listeners to eliminate polling:
+
+```typescript
+import { QueryClient } from '@tanstack/react-query';
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 5 * 60 * 1000,    // 5 minutes
+      gcTime: 10 * 60 * 1000,       // 10 minutes
+      refetchOnWindowFocus: false,  // Prevents tab-switch request storms
+      refetchOnMount: false,
+      refetchOnReconnect: true,
+    },
+  },
+});
+
+// Event-driven mutation invalidations
+export const onPasskeyMutated = () => {
+  queryClient.invalidateQueries({ queryKey: ['webauthn', 'credentials'] });
+};
+
+export const onProfileMutated = () => {
+  queryClient.invalidateQueries({ queryKey: ['auth', 'me'] });
+};
+```
+
+---
+
+### Recipe 5: CLI Administration (`authnz`)
 
 ```bash
 # Manage Users
@@ -215,4 +251,4 @@ Run the automated offline test suite:
 ```bash
 pytest
 ```
-*44 passed unit and integration tests across cryptography, guards, router factory, policies, OPA, observability, and BYOU isolation.*
+*62 passed unit and integration tests across cryptography, guards, router factory, policies, OPA, observability, L1/L2 query caching, ETags, and BYOU isolation.*

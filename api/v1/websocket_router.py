@@ -137,7 +137,7 @@ async def redis_ws_pubsub_listener(manager: ConnectionManager, redis_url: Option
                 socket_connect_timeout=5,
             )
             pubsub = _pubsub_client.pubsub()
-            await pubsub.psubscribe("ws:workspace:*", "ws:user:*")
+            await pubsub.psubscribe("ws:workspace:*", "ws:user:*", "authnz:cache:*")
             logger.info("Distributed WebSocket Redis Pub/Sub listener active (Node ID: %s)", manager.node_id)
 
             async for msg in pubsub.listen():
@@ -177,6 +177,11 @@ async def redis_ws_pubsub_listener(manager: ConnectionManager, redis_url: Option
                             await ws.send_json(clean_payload)
                         except Exception:
                             pass
+                elif channel.startswith("authnz:cache:"):
+                    user_id = clean_payload.get("user_id")
+                    ident = clean_payload.get("identifier")
+                    if user_repo and hasattr(user_repo, "cache"):
+                        user_repo.cache.invalidate(user_id=user_id, identifier=ident, publish_event=False)
 
         except asyncio.CancelledError:
             logger.info("Redis Pub/Sub listener cancelled for graceful shutdown.")
