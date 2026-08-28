@@ -71,18 +71,32 @@ security = HTTPBearer(auto_error=False)
 
 
 def get_cookie_domain_and_tls(request: Request) -> Tuple[Optional[str], bool]:
-    """Determine cookie domain and TLS security configuration based on environment and request host."""
-    host = (request.headers.get("host") or request.url.hostname or "").lower().split(":")[0]
-    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "").lower()
-    is_https = proto == "https" or request.url.scheme == "https"
+    """Determine cookie domain and TLS security configuration based on environment, settings, and request host."""
+    # 1. Resolve host and protocol based on proxy trust setting
+    if settings.TRUSTED_PROXY_HEADERS:
+        host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.hostname or "").lower().split(":")[0]
+        proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "").lower()
+    else:
+        host = (request.headers.get("host") or request.url.hostname or "").lower().split(":")[0]
+        proto = (request.url.scheme or "").lower()
 
-    # If accessing via localhost / 127.0.0.1 / local IPs, use host-only cookies without forcing TLS
+    # 2. Determine TLS requirement
+    if settings.COOKIE_SECURE is not None:
+        is_https = settings.COOKIE_SECURE
+    else:
+        is_https = proto == "https" or request.url.scheme == "https"
+
+    # 3. Explicit configured cookie domain takes precedence
+    if settings.COOKIE_DOMAIN:
+        return settings.COOKIE_DOMAIN, is_https
+
+    # 4. If accessing via localhost / 127.0.0.1 / local IPs, use host-only cookies without forcing TLS
     if host in ("localhost", "127.0.0.1", "0.0.0.0", "testserver") or host.endswith(".local"):
         return None, is_https
 
-    # If accessing on production domain l4s3r.site, share cookie across *.l4s3r.site
+    # 5. Default domain matching fallback
     if host.endswith(".l4s3r.site") or host == "l4s3r.site":
-        return ".l4s3r.site", True
+        return ".l4s3r.site", is_https
 
     return None, is_https
 

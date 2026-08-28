@@ -5,6 +5,7 @@ Persistent PostgreSQL storage for team tasks, sprints, members, and invitations 
 async SQLAlchemy (asyncpg) with connection pooling and non-blocking I/O.
 """
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -12,7 +13,7 @@ import secrets
 from typing import Any, Dict, List, Optional
 import uuid
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import Text, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -41,6 +42,15 @@ class TaskRepository:
     @session_factory.setter
     def session_factory(self, val: async_sessionmaker[AsyncSession]):
         self._custom_session_factory = val
+
+    @asynccontextmanager
+    async def _use_session(self, session: Optional[AsyncSession] = None):
+        """Context manager yielding caller-provided session without auto-committing, or self-owned session with auto-commit."""
+        if session is not None:
+            yield session, False
+        else:
+            async with self.session_factory() as new_session:
+                yield new_session, True
 
     async def _resolve_workspace_id(
         self, session: AsyncSession, ws_input: Optional[str]
@@ -139,13 +149,20 @@ class TaskRepository:
     async def list_tasks(
         self,
         workspace_id: Optional[str] = None,
+        workspace_ids: Optional[List[uuid.UUID]] = None,
         status: Optional[str] = None,
         priority: Optional[str] = None,
         assignee_email: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """List tasks with optional workspace and attribute filtering."""
-        async with self.session_factory() as session:
-            stmt = select(Task).order_by(Task.created_at.desc())
+        limit: Optional[int] = None,
+        offset: int = 0,
+        session: Optional[AsyncSession] = None,
+    ) -> Dict[str, Any]:
+        """List tasks with optional workspace, status, priority, and assignee filtering and DB-level pagination."""
+        if workspace_id is not None and workspace_ids is not None:
+            raise ValueError("Cannot provide both 'workspace_id' and 'workspace_ids'.")
+
+        async with self._use_session(session) as (sess, _):
+            stmt = select(Task)
 
             if workspace_id:
                 try:
@@ -153,7 +170,7 @@ class TaskRepository:
                     stmt = stmt.where(Task.workspace_id == ws_uid)
                 except (ValueError, AttributeError):
                     # Lookup by workspace slug
-                    ws_res = await session.execute(
+                    ws_res = await sess.execute(
                         select(Workspace.id).where(
                             func.lower(Workspace.slug) == workspace_id.strip().lower()
                         )
@@ -161,36 +178,45 @@ class TaskRepository:
                     found_ws_id = ws_res.scalar_one_or_none()
                     if found_ws_id:
                         stmt = stmt.where(Task.workspace_id == found_ws_id)
+            elif workspace_ids is not None:
+                stmt = stmt.where(Task.workspace_id.in_(workspace_ids))
 
             if status:
                 stmt = stmt.where(Task.status == status.strip())
             if priority:
                 stmt = stmt.where(Task.priority == priority.strip())
-
-            result = await session.execute(stmt)
-            tasks = result.scalars().all()
-
-        formatted: List[Dict[str, Any]] = []
-        for t in tasks:
-            task_dict = self._format_task(t)
             if assignee_email:
                 target_email = assignee_email.strip().lower()
-                primary_match = (
-                    task_dict.get("assignee_email") or ""
-                ).strip().lower() == target_email
-                assignee_list = task_dict.get("assignees") or []
-                list_match = any(
-                    isinstance(a, dict)
-                    and (a.get("email") or "").strip().lower() == target_email
-                    for a in assignee_list
+                escaped_email = (
+                    target_email.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
                 )
-                if not (primary_match or list_match):
-                    continue
-            formatted.append(task_dict)
+                stmt = stmt.where(
+                    or_(
+                        func.lower(Task.assignee_email) == target_email,
+                        Task.assignees.cast(Text).ilike(f'%"{escaped_email}"%', escape="\\"),
+                    )
+                )
 
-        return formatted
+            # Compute total count matching all filters before pagination
+            count_stmt = select(func.count()).select_from(stmt.subquery())
+            total_count = (await sess.execute(count_stmt)).scalar() or 0
 
-    async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+            # Apply deterministic ordering and DB pagination
+            stmt = stmt.order_by(Task.created_at.desc(), Task.id.asc()).offset(offset)
+            if limit is not None:
+                stmt = stmt.limit(limit)
+
+            result = await sess.execute(stmt)
+            tasks = result.scalars().all()
+
+        formatted = [self._format_task(t) for t in tasks]
+        return {"tasks": formatted, "total": total_count}
+
+    async def get_task(
+        self, task_id: str, session: Optional[AsyncSession] = None
+    ) -> Optional[Dict[str, Any]]:
         """Fetch a task record by UUID."""
         if not task_id:
             return None
@@ -199,13 +225,15 @@ class TaskRepository:
         except (ValueError, AttributeError):
             return None
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = select(Task).where(Task.id == tid)
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             task = result.scalars().first()
             return self._format_task(task) if task else None
 
-    async def create_task(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    async def create_task(
+        self, data: Dict[str, Any], session: Optional[AsyncSession] = None
+    ) -> Dict[str, Any]:
         """Insert a new sprint task card."""
         task_id_raw = data.get("id")
         if task_id_raw:
@@ -251,8 +279,8 @@ class TaskRepository:
             assignees[0]["name"] if assignees else None
         )
 
-        async with self.session_factory() as session:
-            ws_id = await self._resolve_workspace_id(session, data.get("workspace_id"))
+        async with self._use_session(session) as (sess, should_commit):
+            ws_id = await self._resolve_workspace_id(sess, data.get("workspace_id"))
             new_task = Task(
                 id=task_id,
                 workspace_id=ws_id,
@@ -267,13 +295,17 @@ class TaskRepository:
                 tags=tags,
                 due_date=data.get("due_date"),
             )
-            session.add(new_task)
-            await session.commit()
+            sess.add(new_task)
+            if should_commit:
+                await sess.commit()
 
-        return await self.get_task(str(task_id))  # type: ignore
+        return await self.get_task(str(task_id), session=session)  # type: ignore
 
     async def update_task(
-        self, task_id: str, updates: Dict[str, Any]
+        self,
+        task_id: str,
+        updates: Dict[str, Any],
+        session: Optional[AsyncSession] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update fields of an existing task."""
         if not task_id:
@@ -325,12 +357,12 @@ class TaskRepository:
                     filtered[key] = value
 
         if not filtered:
-            return await self.get_task(task_id)
+            return await self.get_task(task_id, session=session)
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             if "workspace_id" in filtered:
                 filtered["workspace_id"] = await self._resolve_workspace_id(
-                    session, filtered["workspace_id"]
+                    sess, filtered["workspace_id"]
                 )
 
             stmt = (
@@ -338,14 +370,17 @@ class TaskRepository:
                 .where(Task.id == tid)
                 .values(**filtered, updated_at=func.now())
             )
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             if (result.rowcount or 0) == 0:
                 return None
 
-        return await self.get_task(task_id)
+        return await self.get_task(task_id, session=session)
 
-    async def delete_task(self, task_id: str) -> bool:
+    async def delete_task(
+        self, task_id: str, session: Optional[AsyncSession] = None
+    ) -> bool:
         """Permanently remove a task card."""
         if not task_id:
             return False
@@ -354,23 +389,26 @@ class TaskRepository:
         except (ValueError, AttributeError):
             return False
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             stmt = delete(Task).where(Task.id == tid)
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             return (result.rowcount or 0) > 0
 
     # =========================================================================
     # Team Management & Invitation Operations
     # =========================================================================
 
-    async def list_team_members(self) -> List[Dict[str, Any]]:
+    async def list_team_members(
+        self, session: Optional[AsyncSession] = None
+    ) -> List[Dict[str, Any]]:
         """List all registered users and pending team members combined."""
-        async with self.session_factory() as session:
-            users_res = await session.execute(select(User))
+        async with self._use_session(session) as (sess, _):
+            users_res = await sess.execute(select(User))
             users = users_res.scalars().all()
 
-            tm_res = await session.execute(select(TeamMember))
+            tm_res = await sess.execute(select(TeamMember))
             invites = tm_res.scalars().all()
 
         members_map: Dict[str, Dict[str, Any]] = {}
@@ -446,6 +484,7 @@ class TaskRepository:
         department: str = "General",
         invited_by: str = "admin",
         expires_days: int = 7,
+        session: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
         """Record a secure invitation token for a new team member using ON CONFLICT DO UPDATE."""
         clean_email = email.strip().lower()
@@ -480,9 +519,10 @@ class TaskRepository:
             },
         )
 
-        async with self.session_factory() as session:
-            await session.execute(stmt)
-            await session.commit()
+        async with self._use_session(session) as (sess, should_commit):
+            await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
 
         return {
             "id": str(member_id),
@@ -497,15 +537,17 @@ class TaskRepository:
             "invited_at": now.isoformat(),
         }
 
-    async def get_invitation_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+    async def get_invitation_by_token(
+        self, token: str, session: Optional[AsyncSession] = None
+    ) -> Optional[Dict[str, Any]]:
         """Resolve and validate an invitation by token."""
         clean_token = (token or "").strip()
         if not clean_token:
             return None
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = select(TeamMember).where(TeamMember.invite_token == clean_token)
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             inv = result.scalars().first()
             if not inv:
                 return None
@@ -542,32 +584,38 @@ class TaskRepository:
 
             return data
 
-    async def accept_invitation(self, token: str) -> bool:
+    async def accept_invitation(
+        self, token: str, session: Optional[AsyncSession] = None
+    ) -> bool:
         """Mark invitation as accepted and active."""
         clean_token = (token or "").strip()
         if not clean_token:
             return False
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             stmt = (
                 update(TeamMember)
                 .where(TeamMember.invite_token == clean_token)
                 .values(status="active", invite_token=None)
             )
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             return (result.rowcount or 0) > 0
 
-    async def remove_member(self, email: str) -> bool:
+    async def remove_member(
+        self, email: str, session: Optional[AsyncSession] = None
+    ) -> bool:
         """Remove a team member or cancel an invitation."""
         clean_email = (email or "").strip().lower()
         if not clean_email:
             return False
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             stmt = delete(TeamMember).where(
                 func.lower(TeamMember.email) == clean_email
             )
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             return (result.rowcount or 0) > 0

@@ -6,6 +6,7 @@ workspace memberships, role assignments, and team invitations using async SQLAlc
 """
 
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -37,17 +38,18 @@ class abstractWorkspaceRepository(ABC):
         created_by: str,
         slug: Optional[str] = None,
         description: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
         """Create a new workspace and automatically assign creator as workspace admin."""
         pass
 
     @abstractmethod
-    async def get_workspace(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+    async def get_workspace(self, workspace_id: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
         """Retrieve a workspace by its unique primary identifier."""
         pass
 
     @abstractmethod
-    async def get_workspace_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
+    async def get_workspace_by_slug(self, slug: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
         """Retrieve a workspace by its URL slug identifier."""
         pass
 
@@ -56,12 +58,13 @@ class abstractWorkspaceRepository(ABC):
         self,
         user_id: str,
         email: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> List[Dict[str, Any]]:
         """List all workspaces where the given user is an active member or pending invitee."""
         pass
 
     @abstractmethod
-    async def list_all_workspaces(self) -> List[Dict[str, Any]]:
+    async def list_all_workspaces(self, session: Optional[AsyncSession] = None) -> List[Dict[str, Any]]:
         """List all registered workspaces across the system."""
         pass
 
@@ -70,12 +73,13 @@ class abstractWorkspaceRepository(ABC):
         self,
         workspace_id: str,
         updates: Dict[str, Any],
+        session: Optional[AsyncSession] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update workspace metadata (name, slug, description)."""
         pass
 
     @abstractmethod
-    async def delete_workspace(self, workspace_id: str) -> bool:
+    async def delete_workspace(self, workspace_id: str, session: Optional[AsyncSession] = None) -> bool:
         """Delete a workspace and cascade deletion of its members and tasks."""
         pass
 
@@ -90,6 +94,7 @@ class abstractWorkspaceRepository(ABC):
         department: str = "General",
         status: str = "active",
         invited_by: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
         """Directly add or link an active member to a workspace."""
         pass
@@ -104,6 +109,7 @@ class abstractWorkspaceRepository(ABC):
         department: str = "General",
         invited_by: str = "Admin",
         expires_days: int = 7,
+        session: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
         """Issue a cryptographic single-use invitation to join a specific workspace."""
         pass
@@ -115,6 +121,7 @@ class abstractWorkspaceRepository(ABC):
         user_id: Optional[str] = None,
         email: Optional[str] = None,
         identifier: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> Optional[Dict[str, Any]]:
         """Retrieve a member record within a workspace scope by user_id or email."""
         pass
@@ -124,12 +131,13 @@ class abstractWorkspaceRepository(ABC):
         self,
         workspace_id: str,
         status: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> List[Dict[str, Any]]:
         """List all members and pending invitations within a specific workspace."""
         pass
 
     @abstractmethod
-    async def get_invitation_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+    async def get_invitation_by_token(self, token: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
         """Resolve and validate an invitation token across all workspaces."""
         pass
 
@@ -139,6 +147,7 @@ class abstractWorkspaceRepository(ABC):
         token: str,
         user_id: Optional[str] = None,
         name: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> Optional[Dict[str, Any]]:
         """Mark an invitation token as consumed, link the user ID, and activate membership."""
         pass
@@ -149,6 +158,7 @@ class abstractWorkspaceRepository(ABC):
         workspace_id: str,
         user_id_or_email: str,
         new_role: str,
+        session: Optional[AsyncSession] = None,
     ) -> bool:
         """Update a member's clearance role within a specific workspace."""
         pass
@@ -158,6 +168,7 @@ class abstractWorkspaceRepository(ABC):
         self,
         workspace_id: str,
         user_id_or_email: str,
+        session: Optional[AsyncSession] = None,
     ) -> bool:
         """Remove a member from a workspace or cancel a pending invitation."""
         pass
@@ -183,6 +194,15 @@ class WorkspaceRepository(abstractWorkspaceRepository):
     @session_factory.setter
     def session_factory(self, val: async_sessionmaker[AsyncSession]):
         self._custom_session_factory = val
+
+    @asynccontextmanager
+    async def _use_session(self, session: Optional[AsyncSession] = None):
+        """Context manager yielding caller-provided session without auto-committing, or self-owned session with auto-commit."""
+        if session is not None:
+            yield session, False
+        else:
+            async with self.session_factory() as new_session:
+                yield new_session, True
 
     @staticmethod
     def _hash_token(token: str) -> str:
@@ -223,12 +243,14 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         )
         return ws_slug_check.scalar_one_or_none()
 
-    async def _resolve_ws_id(self, workspace_id_or_slug: str) -> Optional[str]:
+    async def _resolve_ws_id(
+        self, workspace_id_or_slug: str, session: Optional[AsyncSession] = None
+    ) -> Optional[str]:
         """Resolve workspace ID or slug to canonical workspace UUID string."""
         if not workspace_id_or_slug:
             return None
-        async with self.session_factory() as session:
-            ws_uuid = await self._resolve_ws_uuid(session, workspace_id_or_slug)
+        async with self._use_session(session) as (sess, _):
+            ws_uuid = await self._resolve_ws_uuid(sess, workspace_id_or_slug)
             return str(ws_uuid) if ws_uuid else str(workspace_id_or_slug)
 
     @staticmethod
@@ -268,6 +290,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         created_by: str,
         slug: Optional[str] = None,
         description: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
         """Create a new workspace and automatically enroll the creator as an Admin member."""
         workspace_id = uuid.uuid4()
@@ -275,12 +298,12 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         base_slug = self._slugify(slug or clean_name)
         now = datetime.now(timezone.utc)
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             # Ensure slug uniqueness
             target_slug = base_slug
             counter = 1
             while True:
-                slug_check = await session.execute(
+                slug_check = await sess.execute(
                     select(Workspace.id).where(Workspace.slug == target_slug)
                 )
                 if not slug_check.scalar_one_or_none():
@@ -297,14 +320,14 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 created_at=now,
                 updated_at=now,
             )
-            session.add(new_ws)
-            await session.flush()
+            sess.add(new_ws)
+            await sess.flush()
 
             # Lookup creator user info if creator is a UUID
             creator_user = None
             try:
                 creator_uid = uuid.UUID(str(created_by).strip())
-                user_res = await session.execute(
+                user_res = await sess.execute(
                     select(User).where(User.id == creator_uid)
                 )
                 creator_user = user_res.scalars().first()
@@ -341,17 +364,20 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                     invited_by=str(created_by),
                     invited_at=now,
                 )
-            session.add(member)
-            await session.commit()
+            sess.add(member)
+            if should_commit:
+                await sess.commit()
 
-        ws_dict = await self.get_workspace(str(workspace_id))
+        ws_dict = await self.get_workspace(str(workspace_id), session=session)
         if ws_dict:
             ws_dict["role"] = "admin"
             ws_dict["member_role"] = "admin"
             ws_dict["member_status"] = "active"
         return ws_dict  # type: ignore
 
-    async def get_workspace(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+    async def get_workspace(
+        self, workspace_id: str, session: Optional[AsyncSession] = None
+    ) -> Optional[Dict[str, Any]]:
         """Retrieve workspace by UUID."""
         if not workspace_id:
             return None
@@ -360,9 +386,9 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         except (ValueError, AttributeError):
             return None
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = select(Workspace).where(Workspace.id == wid)
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             ws = result.scalars().first()
             if not ws:
                 return None
@@ -376,15 +402,17 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 "updated_at": ws.updated_at,
             })
 
-    async def get_workspace_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
+    async def get_workspace_by_slug(
+        self, slug: str, session: Optional[AsyncSession] = None
+    ) -> Optional[Dict[str, Any]]:
         """Retrieve workspace by unique URL slug."""
         if not slug:
             return None
         clean_slug = slug.strip().lower()
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = select(Workspace).where(func.lower(Workspace.slug) == clean_slug)
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             ws = result.scalars().first()
             if not ws:
                 return None
@@ -402,9 +430,10 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         self,
         user_id: str,
         email: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> List[Dict[str, Any]]:
         """List all workspaces where a user is enrolled, including their workspace-scoped role."""
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = (
                 select(Workspace, WorkspaceMember)
                 .join(WorkspaceMember, Workspace.id == WorkspaceMember.workspace_id)
@@ -427,7 +456,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 return []
 
             stmt = stmt.where(or_(*conditions))
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             rows = result.all()
 
         results: List[Dict[str, Any]] = []
@@ -448,9 +477,11 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             )
         return results
 
-    async def list_all_workspaces(self) -> List[Dict[str, Any]]:
+    async def list_all_workspaces(
+        self, session: Optional[AsyncSession] = None
+    ) -> List[Dict[str, Any]]:
         """List all workspaces with member counts."""
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = (
                 select(
                     Workspace,
@@ -462,7 +493,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 .group_by(Workspace.id)
                 .order_by(Workspace.created_at.asc())
             )
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             rows = result.all()
 
         results: List[Dict[str, Any]] = []
@@ -485,6 +516,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         self,
         workspace_id: str,
         updates: Dict[str, Any],
+        session: Optional[AsyncSession] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update workspace name, slug, or description."""
         if not workspace_id:
@@ -502,10 +534,10 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             desc = updates["description"]
             filtered["description"] = desc.strip() if desc else None
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             if "slug" in updates and updates["slug"]:
                 clean_slug = self._slugify(updates["slug"])
-                collision = await session.execute(
+                collision = await sess.execute(
                     select(Workspace.id).where(
                         Workspace.slug == clean_slug, Workspace.id != wid
                     )
@@ -517,31 +549,35 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 filtered["slug"] = clean_slug
 
             if not filtered:
-                return await self.get_workspace(workspace_id)
+                return await self.get_workspace(workspace_id, session=sess)
 
             stmt = (
                 update(Workspace)
                 .where(Workspace.id == wid)
                 .values(**filtered, updated_at=func.now())
             )
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             if (result.rowcount or 0) == 0:
                 return None
 
-        return await self.get_workspace(workspace_id)
+        return await self.get_workspace(workspace_id, session=session)
 
-    async def delete_workspace(self, workspace_id: str) -> bool:
+    async def delete_workspace(
+        self, workspace_id: str, session: Optional[AsyncSession] = None
+    ) -> bool:
         """Delete a workspace and cascade delete its members and tasks."""
         if not workspace_id:
             return False
-        async with self.session_factory() as session:
-            wid = await self._resolve_ws_uuid(session, workspace_id)
+        async with self._use_session(session) as (sess, should_commit):
+            wid = await self._resolve_ws_uuid(sess, workspace_id)
             if not wid:
                 return False
             stmt = delete(Workspace).where(Workspace.id == wid)
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             return (result.rowcount or 0) > 0
 
     # =========================================================================
@@ -558,6 +594,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         department: str = "General",
         status: str = "active",
         invited_by: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
         """Directly add or link an active member to a workspace using ON CONFLICT DO UPDATE."""
         member_id = uuid.uuid4()
@@ -565,8 +602,8 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         now = datetime.now(timezone.utc)
         safe_name = name.strip() if name else clean_email.split("@")[0]
 
-        async with self.session_factory() as session:
-            ws_uuid = await self._resolve_ws_uuid(session, workspace_id)
+        async with self._use_session(session) as (sess, should_commit):
+            ws_uuid = await self._resolve_ws_uuid(sess, workspace_id)
             if not ws_uuid:
                 raise ValueError(f"Workspace '{workspace_id}' does not exist.")
 
@@ -601,10 +638,11 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                     "status": stmt.excluded.status,
                 },
             )
-            await session.execute(stmt)
-            await session.commit()
+            await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
 
-        return await self.get_member(str(ws_uuid), email=clean_email)  # type: ignore
+        return await self.get_member(str(ws_uuid), email=clean_email, session=session)  # type: ignore
 
     async def invite_member(
         self,
@@ -615,6 +653,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         department: str = "General",
         invited_by: str = "Admin",
         expires_days: int = 7,
+        session: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
         """Issue a cryptographic single-use invitation to join a workspace using ON CONFLICT DO UPDATE."""
         member_id = uuid.uuid4()
@@ -625,19 +664,19 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         clean_email = email.strip().lower()
         safe_name = (name or clean_email.split("@")[0]).strip()
 
-        async with self.session_factory() as session:
-            ws_uuid = await self._resolve_ws_uuid(session, workspace_id)
+        async with self._use_session(session) as (sess, should_commit):
+            ws_uuid = await self._resolve_ws_uuid(sess, workspace_id)
             if not ws_uuid:
                 raise ValueError(f"Workspace '{workspace_id}' does not exist.")
 
-            ws_row = await session.execute(
+            ws_row = await sess.execute(
                 select(Workspace).where(Workspace.id == ws_uuid)
             )
             ws = ws_row.scalars().first()
             if not ws:
                 raise ValueError(f"Workspace '{workspace_id}' does not exist.")
 
-            user_res = await session.execute(
+            user_res = await sess.execute(
                 select(User.id).where(func.lower(User.email) == clean_email)
             )
             user_id = user_res.scalar_one_or_none()
@@ -669,8 +708,9 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                     "invited_at": stmt.excluded.invited_at,
                 },
             )
-            await session.execute(stmt)
-            await session.commit()
+            await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
 
             ws_name = ws.name
 
@@ -695,6 +735,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         user_id: Optional[str] = None,
         email: Optional[str] = None,
         identifier: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> Optional[Dict[str, Any]]:
         """Retrieve a member record within a workspace scope by user_id, email, username, or membership ID."""
         initial_keys = []
@@ -708,8 +749,8 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         if not initial_keys:
             return None
 
-        async with self.session_factory() as session:
-            ws_uuid = await self._resolve_ws_uuid(session, workspace_id)
+        async with self._use_session(session) as (sess, _):
+            ws_uuid = await self._resolve_ws_uuid(sess, workspace_id)
             if not ws_uuid:
                 return None
 
@@ -719,11 +760,11 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             for k in initial_keys:
                 try:
                     uid = uuid.UUID(k)
-                    user_lookup = await session.execute(
+                    user_lookup = await sess.execute(
                         select(User).where(User.id == uid)
                     )
                 except (ValueError, AttributeError):
-                    user_lookup = await session.execute(
+                    user_lookup = await sess.execute(
                         select(User).where(
                             or_(
                                 func.lower(User.username) == k.lower(),
@@ -758,7 +799,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 WorkspaceMember.workspace_id == ws_uuid,
                 or_(*conditions),
             )
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             wm = result.scalars().first()
             if not wm:
                 return None
@@ -789,10 +830,11 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         self,
         workspace_id: str,
         status: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> List[Dict[str, Any]]:
         """List all members and invitations for a workspace with live user profile resolution."""
-        async with self.session_factory() as session:
-            ws_uuid = await self._resolve_ws_uuid(session, workspace_id)
+        async with self._use_session(session) as (sess, _):
+            ws_uuid = await self._resolve_ws_uuid(sess, workspace_id)
             if not ws_uuid:
                 return []
 
@@ -814,7 +856,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             if status:
                 stmt = stmt.where(WorkspaceMember.status == status.strip())
 
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             rows = result.all()
 
         members: List[Dict[str, Any]] = []
@@ -858,7 +900,9 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             })
         return members
 
-    async def get_invitation_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+    async def get_invitation_by_token(
+        self, token: str, session: Optional[AsyncSession] = None
+    ) -> Optional[Dict[str, Any]]:
         """Resolve and validate an active invitation token across all workspaces."""
         clean_token = (token or "").strip()
         if not clean_token:
@@ -866,7 +910,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
 
         lookup_hash = self._hash_token(clean_token)
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = (
                 select(WorkspaceMember, Workspace)
                 .join(
@@ -880,7 +924,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                     WorkspaceMember.status == "invited",
                 )
             )
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             row = result.first()
             if not row:
                 return None
@@ -927,26 +971,27 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         token: str,
         user_id: Optional[str] = None,
         name: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> Optional[Dict[str, Any]]:
         """Atomically consume invitation token, activate workspace clearance, and link user ID."""
         clean_token = (token or "").strip()
         if not clean_token:
             return None
 
-        invite = await self.get_invitation_by_token(clean_token)
+        invite = await self.get_invitation_by_token(clean_token, session=session)
         if not invite or invite.get("is_expired"):
             return None
 
         lookup_hash = self._hash_token(clean_token)
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             resolved_name = name
             parsed_uid = None
             if user_id:
                 try:
                     parsed_uid = uuid.UUID(str(user_id).strip())
                     if not resolved_name:
-                        u_res = await session.execute(
+                        u_res = await sess.execute(
                             select(User).where(User.id == parsed_uid)
                         )
                         u = u_res.scalars().first()
@@ -975,13 +1020,14 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                     name=func.coalesce(resolved_name, WorkspaceMember.name),
                 )
             )
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             if (result.rowcount or 0) == 0:
                 return None
 
         return await self.get_member(
-            invite["workspace_id"], user_id=user_id, email=invite["email"]
+            invite["workspace_id"], user_id=user_id, email=invite["email"], session=session
         )
 
     async def update_member_role(
@@ -989,6 +1035,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
         workspace_id: str,
         user_id_or_email: str,
         new_role: str,
+        session: Optional[AsyncSession] = None,
     ) -> bool:
         """Update a member's role within a workspace."""
         if new_role not in ("admin", "developer", "editor", "viewer"):
@@ -1001,8 +1048,8 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             return False
         clean_ident = unquote(raw_ident).strip()
 
-        async with self.session_factory() as session:
-            ws_uuid = await self._resolve_ws_uuid(session, workspace_id)
+        async with self._use_session(session) as (sess, should_commit):
+            ws_uuid = await self._resolve_ws_uuid(sess, workspace_id)
             if not ws_uuid:
                 return False
 
@@ -1015,7 +1062,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 conditions.append(WorkspaceMember.id == kid)
                 conditions.append(WorkspaceMember.user_id == kid)
             except (ValueError, AttributeError):
-                user_res = await session.execute(
+                user_res = await sess.execute(
                     select(User.id).where(
                         or_(
                             func.lower(User.username) == clean_ident.lower(),
@@ -1035,14 +1082,16 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 )
                 .values(role=new_role)
             )
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             return (result.rowcount or 0) > 0
 
     async def remove_member(
         self,
         workspace_id: str,
         user_id_or_email: str,
+        session: Optional[AsyncSession] = None,
     ) -> bool:
         """Remove a member from a workspace or revoke their invitation."""
         raw_ident = (user_id_or_email or "").strip()
@@ -1050,8 +1099,8 @@ class WorkspaceRepository(abstractWorkspaceRepository):
             return False
         clean_ident = unquote(raw_ident).strip()
 
-        async with self.session_factory() as session:
-            ws_uuid = await self._resolve_ws_uuid(session, workspace_id)
+        async with self._use_session(session) as (sess, should_commit):
+            ws_uuid = await self._resolve_ws_uuid(sess, workspace_id)
             if not ws_uuid:
                 return False
 
@@ -1064,7 +1113,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 conditions.append(WorkspaceMember.id == kid)
                 conditions.append(WorkspaceMember.user_id == kid)
             except (ValueError, AttributeError):
-                user_res = await session.execute(
+                user_res = await sess.execute(
                     select(User.id).where(
                         or_(
                             func.lower(User.username) == clean_ident.lower(),
@@ -1080,15 +1129,18 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                 WorkspaceMember.workspace_id == ws_uuid,
                 or_(*conditions),
             )
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             deleted = (result.rowcount or 0) > 0
-            await session.commit()
+            if should_commit:
+                await sess.commit()
             return deleted
 
-    async def count_members(self, workspace_id: str) -> Dict[str, int]:
+    async def count_members(
+        self, workspace_id: str, session: Optional[AsyncSession] = None
+    ) -> Dict[str, int]:
         """Return member count breakdown by role and status for a workspace."""
-        async with self.session_factory() as session:
-            ws_uuid = await self._resolve_ws_uuid(session, workspace_id)
+        async with self._use_session(session) as (sess, _):
+            ws_uuid = await self._resolve_ws_uuid(sess, workspace_id)
             if not ws_uuid:
                 return {
                     "total": 0,
@@ -1117,7 +1169,7 @@ class WorkspaceRepository(abstractWorkspaceRepository):
                     case((WorkspaceMember.role == "viewer", 1), else_=0)
                 ).label("viewers"),
             ).where(WorkspaceMember.workspace_id == ws_uuid)
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             row = result.first()
             if not row:
                 return {

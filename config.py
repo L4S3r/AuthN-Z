@@ -52,6 +52,9 @@ class AuthNZSettings(BaseSettings):
 
     # Client Web Application & URLs
     FRONTEND_URL: str = Field(default="http://localhost:3000", description="Client web application URL for redirects and email links")
+    COOKIE_DOMAIN: Optional[str] = Field(default=None, description="Base domain for auth cookies (e.g. .example.com). If None, auto-detects based on request host.")
+    COOKIE_SECURE: Optional[bool] = Field(default=None, description="Force secure TLS cookies. If None, matches request scheme.")
+    TRUSTED_PROXY_HEADERS: bool = Field(default=False, description="If True, derive host/scheme from X-Forwarded-Host / X-Forwarded-Proto headers behind a trusted proxy.")
     CORS_ALLOWED_ORIGINS: List[str] = Field(
         default=[
             "https://auth-api.l4s3r.site",
@@ -170,6 +173,11 @@ class AuthNZSettings(BaseSettings):
         db_name = self.POSTGRES_DB
         auth_part = f"{user}:{password}@" if password else f"{user}@"
         return f"postgresql+asyncpg://{auth_part}{host}:{port}/{db_name}"
+
+    def get_redis_url(self) -> str:
+        """Resolve Redis connection URL."""
+        auth_part = f":{self.REDIS_PASSWORD}@" if self.REDIS_PASSWORD else ""
+        return f"redis://{auth_part}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
 
 
 # Singleton configuration instance

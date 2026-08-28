@@ -99,7 +99,15 @@ async def list_audit_logs(
             stmt = stmt.where(AuditLog.severity == severity.strip().upper())
 
         if event_type:
-            stmt = stmt.where(AuditLog.event_type.ilike(f"%{event_type.strip()}%"))
+            raw_event_type = event_type.strip()
+            escaped_event_type = (
+                raw_event_type.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            stmt = stmt.where(
+                AuditLog.event_type.ilike(f"%{escaped_event_type}%", escape="\\")
+            )
 
         if subject_id:
             stmt = stmt.where(AuditLog.subject_id == subject_id.strip())

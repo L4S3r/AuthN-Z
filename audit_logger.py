@@ -6,6 +6,7 @@ authentication, authorization, and multi-tenant workspace events using async SQL
 """
 
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import logging
@@ -28,11 +29,13 @@ class abstractAuditLogger(ABC):
     async def record_auth_success(
         self,
         subject_id: str,
-        method: str,
+        method: str = "password",
         ip_address: Optional[str] = None,
         user_agent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         workspace_id: Optional[str] = None,
+        auth_method: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> None:
         """Record a successful authentication event."""
         pass
@@ -46,6 +49,7 @@ class abstractAuditLogger(ABC):
         user_agent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         workspace_id: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> None:
         """Record a failed authentication attempt."""
         pass
@@ -59,6 +63,7 @@ class abstractAuditLogger(ABC):
         reason: str,
         metadata: Optional[Dict[str, Any]] = None,
         workspace_id: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> None:
         """Record an authorization denial (403 Forbidden event)."""
         pass
@@ -70,6 +75,7 @@ class abstractAuditLogger(ABC):
         severity: str,
         details: Dict[str, Any],
         workspace_id: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> None:
         """Record general security events (e.g., privilege escalation, invitations, workspace CRUD)."""
         pass
@@ -77,10 +83,11 @@ class abstractAuditLogger(ABC):
     @abstractmethod
     async def query_events(
         self,
-        filter_criteria: Dict[str, Any],
+        filter_criteria: Optional[Dict[str, Any]] = None,
         limit: int = 100,
         offset: int = 0,
         include_global: bool = False,
+        session: Optional[AsyncSession] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve historical audit log records matching specific filtering criteria."""
         pass
@@ -106,6 +113,15 @@ class AuditLogger(abstractAuditLogger):
     @session_factory.setter
     def session_factory(self, val: async_sessionmaker[AsyncSession]):
         self._custom_session_factory = val
+
+    @asynccontextmanager
+    async def _use_session(self, session: Optional[AsyncSession] = None):
+        """Context manager yielding caller-provided session without auto-committing, or self-owned session with auto-commit."""
+        if session is not None:
+            yield session, False
+        else:
+            async with self.session_factory() as new_session:
+                yield new_session, True
 
     async def _resolve_workspace_uuid(
         self, session: AsyncSession, ws_input: Optional[str]
@@ -166,13 +182,14 @@ class AuditLogger(abstractAuditLogger):
         user_agent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         workspace_id: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> None:
         """Insert a structured audit record into PostgreSQL."""
         meta = dict(metadata or {})
         ws_raw = workspace_id or meta.get("workspace_id")
 
-        async with self.session_factory() as session:
-            ws_uid = await self._resolve_workspace_uuid(session, ws_raw)
+        async with self._use_session(session) as (sess, should_commit):
+            ws_uid = await self._resolve_workspace_uuid(sess, ws_raw)
 
             log_entry = AuditLog(
                 id=uuid.uuid4(),
@@ -188,8 +205,9 @@ class AuditLogger(abstractAuditLogger):
                 metadata_=meta,
                 timestamp=datetime.now(timezone.utc),
             )
-            session.add(log_entry)
-            await session.commit()
+            sess.add(log_entry)
+            if should_commit:
+                await sess.commit()
 
     async def record_auth_success(
         self,
@@ -200,6 +218,7 @@ class AuditLogger(abstractAuditLogger):
         metadata: Optional[Dict[str, Any]] = None,
         workspace_id: Optional[str] = None,
         auth_method: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> None:
         """Record a successful authentication event."""
         effective_method = auth_method or method or "password"
@@ -215,6 +234,7 @@ class AuditLogger(abstractAuditLogger):
             user_agent=user_agent,
             metadata=extra_meta,
             workspace_id=workspace_id,
+            session=session,
         )
 
     async def record_auth_failure(
@@ -225,6 +245,7 @@ class AuditLogger(abstractAuditLogger):
         user_agent: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         workspace_id: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> None:
         """Record a failed authentication attempt."""
         await self._insert_event(
@@ -238,6 +259,7 @@ class AuditLogger(abstractAuditLogger):
             user_agent=user_agent,
             metadata=metadata or {},
             workspace_id=workspace_id,
+            session=session,
         )
 
     async def record_access_denial(
@@ -248,6 +270,7 @@ class AuditLogger(abstractAuditLogger):
         reason: str,
         metadata: Optional[Dict[str, Any]] = None,
         workspace_id: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> None:
         """Record an authorization denial (403 Forbidden event)."""
         await self._insert_event(
@@ -259,6 +282,7 @@ class AuditLogger(abstractAuditLogger):
             reason=reason,
             metadata=metadata or {},
             workspace_id=workspace_id,
+            session=session,
         )
 
     async def record_security_event(
@@ -267,6 +291,7 @@ class AuditLogger(abstractAuditLogger):
         severity: str,
         details: Dict[str, Any],
         workspace_id: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> None:
         """Record general security events (e.g., account lockouts, privilege changes, password changes)."""
         ws_id = workspace_id or details.get("workspace_id")
@@ -281,6 +306,7 @@ class AuditLogger(abstractAuditLogger):
             user_agent=details.get("user_agent"),
             metadata=details,
             workspace_id=ws_id,
+            session=session,
         )
 
     async def query_events(
@@ -289,19 +315,20 @@ class AuditLogger(abstractAuditLogger):
         limit: int = 100,
         offset: int = 0,
         include_global: bool = False,
+        session: Optional[AsyncSession] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve historical audit log records matching specific filtering criteria."""
         criteria = dict(filter_criteria or {})
         inc_global = include_global or criteria.pop("include_global", False)
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = select(AuditLog).order_by(AuditLog.timestamp.desc())
 
             conditions = []
             if "workspace_id" in criteria:
                 ws_filter = criteria.pop("workspace_id")
                 if ws_filter is not None:
-                    ws_uid = await self._resolve_workspace_uuid(session, ws_filter)
+                    ws_uid = await self._resolve_workspace_uuid(sess, ws_filter)
                     if inc_global:
                         conditions.append(
                             or_(
@@ -313,8 +340,14 @@ class AuditLogger(abstractAuditLogger):
                         conditions.append(AuditLog.workspace_id == ws_uid)
 
             if "event_type" in criteria and criteria["event_type"]:
+                raw_event_type = str(criteria["event_type"]).strip()
+                escaped_event_type = (
+                    raw_event_type.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
                 conditions.append(
-                    AuditLog.event_type.ilike(f"%{criteria['event_type'].strip()}%")
+                    AuditLog.event_type.ilike(f"%{escaped_event_type}%", escape="\\")
                 )
 
             if "severity" in criteria and criteria["severity"]:
@@ -342,7 +375,7 @@ class AuditLogger(abstractAuditLogger):
                 stmt = stmt.where(*conditions)
 
             stmt = stmt.limit(limit).offset(offset)
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             logs = result.scalars().all()
 
         return [self._format_log(log) for log in logs]

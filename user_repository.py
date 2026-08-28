@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import secrets
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 import uuid
 
@@ -31,32 +32,32 @@ class abstractUserRepository(ABC):
     """Abstract interface defining persistence and retrieval operations for user identities and profile state."""
 
     @abstractmethod
-    async def get_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+    async def get_by_id(self, user_id: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
         """Retrieve a user record by its unique system identifier."""
         ...
 
     @abstractmethod
-    async def get_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
+    async def get_by_identifier(self, identifier: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
         """Look up a user record by a unique login identifier such as username or email address."""
         ...
 
     @abstractmethod
-    async def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def create_user(self, user_data: Dict[str, Any], session: Optional[AsyncSession] = None) -> Dict[str, Any]:
         """Persist a new user record into the data store."""
         ...
 
     @abstractmethod
-    async def update_user(self, user_id: str, updates: Dict[str, Any]) -> bool:
+    async def update_user(self, user_id: str, updates: Dict[str, Any], session: Optional[AsyncSession] = None) -> bool:
         """Update specific fields of an existing user record."""
         ...
 
     @abstractmethod
-    async def delete_user(self, user_id: str) -> bool:
+    async def delete_user(self, user_id: str, session: Optional[AsyncSession] = None) -> bool:
         """Remove a user record from the data store."""
         ...
 
     @abstractmethod
-    async def set_status(self, user_id: str, is_active: bool) -> bool:
+    async def set_status(self, user_id: str, is_active: bool, session: Optional[AsyncSession] = None) -> bool:
         """Activate, suspend, or lock a user account."""
         ...
 
@@ -65,22 +66,23 @@ class abstractUserRepository(ABC):
         self,
         is_active: Optional[bool] = None,
         role: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> List[Dict[str, Any]]:
         """List all users with optional status and role filtering."""
         ...
 
     @abstractmethod
-    async def get_roles(self, user_id: str) -> List[str]:
+    async def get_roles(self, user_id: str, session: Optional[AsyncSession] = None) -> List[str]:
         """Retrieve all role strings assigned to a user."""
         ...
 
     @abstractmethod
-    async def add_role(self, user_id: str, role: str) -> bool:
+    async def add_role(self, user_id: str, role: str, session: Optional[AsyncSession] = None) -> bool:
         """Add a role to a user if not already present."""
         ...
 
     @abstractmethod
-    async def remove_role(self, user_id: str, role: str) -> bool:
+    async def remove_role(self, user_id: str, role: str, session: Optional[AsyncSession] = None) -> bool:
         """Remove a role from a user."""
         ...
 
@@ -90,18 +92,19 @@ class abstractUserRepository(ABC):
         user_id: str,
         ip_address: Optional[str] = None,
         expires_in_minutes: int = 15,
+        session: Optional[AsyncSession] = None,
     ) -> str:
         """Issue and record a high-entropy password reset token for a user."""
         ...
 
     @abstractmethod
-    async def verify_password_reset_token(self, raw_token: str) -> Optional[Dict[str, Any]]:
+    async def verify_password_reset_token(self, raw_token: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
         """Verify token hash against stored active, unexpired, and unused reset records."""
         ...
 
     @abstractmethod
     async def consume_password_reset_token(
-        self, raw_token: str, new_hashed_password: str
+        self, raw_token: str, new_hashed_password: str, session: Optional[AsyncSession] = None
     ) -> Optional[str]:
         """Atomically mark token as consumed and update the user's hashed password."""
         ...
@@ -130,6 +133,15 @@ class UserRepository(abstractUserRepository):
     def session_factory(self, val: async_sessionmaker[AsyncSession]):
         self._custom_session_factory = val
 
+    @asynccontextmanager
+    async def _use_session(self, session: Optional[AsyncSession] = None):
+        """Context manager yielding caller-provided session without auto-committing, or self-owned session with auto-commit."""
+        if session is not None:
+            yield session, False
+        else:
+            async with self.session_factory() as new_session:
+                yield new_session, True
+
     @staticmethod
     def _format_user(user: Any) -> Dict[str, Any]:
         """Format SQLAlchemy User model instance to dictionary matching previous repository shape."""
@@ -152,7 +164,7 @@ class UserRepository(abstractUserRepository):
             "metadata": meta,
         }
 
-    async def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def create_user(self, user_data: Dict[str, Any], session: Optional[AsyncSession] = None) -> Dict[str, Any]:
         """Safely insert a new user with UUID primary key and JSONB attributes."""
         user_id_raw = user_data.get("id")
         if user_id_raw:
@@ -197,14 +209,15 @@ class UserRepository(abstractUserRepository):
         )
 
         try:
-            async with self.session_factory() as session:
-                session.add(new_user)
-                await session.commit()
-            return await self.get_by_id(str(user_id))  # type: ignore
+            async with self._use_session(session) as (sess, should_commit):
+                sess.add(new_user)
+                if should_commit:
+                    await sess.commit()
+            return await self.get_by_id(str(user_id), session=session)  # type: ignore
         except IntegrityError as e:
             raise ValueError(f"User with this username or email address already exists: {e}")
 
-    async def get_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+    async def get_by_id(self, user_id: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
         """Fetch a user record by UUID."""
         if not user_id:
             return None
@@ -213,30 +226,30 @@ class UserRepository(abstractUserRepository):
         except (ValueError, AttributeError):
             return None
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = select(self.user_model).where(self.user_model.id == uid)
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             user = result.scalars().first()
             return self._format_user(user) if user else None
 
-    async def get_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
+    async def get_by_identifier(self, identifier: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
         """Lookup a user by case-insensitive username or email."""
         clean_id = (identifier or "").strip().lower()
         if not clean_id:
             return None
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = select(self.user_model).where(
                 or_(
                     func.lower(self.user_model.username) == clean_id,
                     func.lower(self.user_model.email) == clean_id,
                 )
             )
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             user = result.scalars().first()
             return self._format_user(user) if user else None
 
-    async def update_user(self, user_id: str, updates: Dict[str, Any]) -> bool:
+    async def update_user(self, user_id: str, updates: Dict[str, Any], session: Optional[AsyncSession] = None) -> bool:
         """Atomically update user fields."""
         if not user_id:
             return False
@@ -277,15 +290,16 @@ class UserRepository(abstractUserRepository):
             return False
 
         try:
-            async with self.session_factory() as session:
+            async with self._use_session(session) as (sess, should_commit):
                 stmt = update(self.user_model).where(self.user_model.id == uid).values(**filtered_updates)
-                result = await session.execute(stmt)
-                await session.commit()
+                result = await sess.execute(stmt)
+                if should_commit:
+                    await sess.commit()
                 return (result.rowcount or 0) > 0
         except IntegrityError as e:
             raise ValueError(f"Update failed due to unique constraint: {e}")
 
-    async def delete_user(self, user_id: str) -> bool:
+    async def delete_user(self, user_id: str, session: Optional[AsyncSession] = None) -> bool:
         """Permanently delete a user record."""
         if not user_id:
             return False
@@ -294,13 +308,14 @@ class UserRepository(abstractUserRepository):
         except (ValueError, AttributeError):
             return False
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             stmt = delete(self.user_model).where(self.user_model.id == uid)
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             return (result.rowcount or 0) > 0
 
-    async def set_status(self, user_id: str, is_active: bool) -> bool:
+    async def set_status(self, user_id: str, is_active: bool, session: Optional[AsyncSession] = None) -> bool:
         """Activate or suspend a user account."""
         if not user_id:
             return False
@@ -309,23 +324,25 @@ class UserRepository(abstractUserRepository):
         except (ValueError, AttributeError):
             return False
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             stmt = update(self.user_model).where(self.user_model.id == uid).values(is_active=bool(is_active))
-            result = await session.execute(stmt)
-            await session.commit()
+            result = await sess.execute(stmt)
+            if should_commit:
+                await sess.commit()
             return (result.rowcount or 0) > 0
 
     async def list_users(
         self,
         is_active: Optional[bool] = None,
         role: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
     ) -> List[Dict[str, Any]]:
         """List all users with optional status and role filtering."""
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = select(self.user_model).order_by(self.user_model.created_at.asc())
             if is_active is not None:
                 stmt = stmt.where(self.user_model.is_active == bool(is_active))
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             users = result.scalars().all()
 
         results: List[Dict[str, Any]] = []
@@ -338,9 +355,9 @@ class UserRepository(abstractUserRepository):
             results.append(data)
         return results
 
-    async def get_roles(self, user_id: str) -> List[str]:
+    async def get_roles(self, user_id: str, session: Optional[AsyncSession] = None) -> List[str]:
         """Retrieve all role strings assigned to a user."""
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(user_id, session=session)
         if not user:
             return []
         raw_roles = user.get("roles", [])
@@ -351,30 +368,30 @@ class UserRepository(abstractUserRepository):
                 return []
         return list(raw_roles) if isinstance(raw_roles, list) else []
 
-    async def add_role(self, user_id: str, role: str) -> bool:
+    async def add_role(self, user_id: str, role: str, session: Optional[AsyncSession] = None) -> bool:
         """Add a role to a user if not already present."""
         clean_role = role.strip().lower()
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(user_id, session=session)
         if not user:
             return False
 
-        roles = await self.get_roles(user_id)
+        roles = await self.get_roles(user_id, session=session)
         if clean_role not in roles:
             roles.append(clean_role)
-            return await self.update_user(user_id, {"roles": roles})
+            return await self.update_user(user_id, {"roles": roles}, session=session)
         return True
 
-    async def remove_role(self, user_id: str, role: str) -> bool:
+    async def remove_role(self, user_id: str, role: str, session: Optional[AsyncSession] = None) -> bool:
         """Remove a role from a user."""
         clean_role = role.strip().lower()
-        user = await self.get_by_id(user_id)
+        user = await self.get_by_id(user_id, session=session)
         if not user:
             return False
 
-        roles = await self.get_roles(user_id)
+        roles = await self.get_roles(user_id, session=session)
         if clean_role in roles:
             roles = [r for r in roles if r != clean_role]
-            return await self.update_user(user_id, {"roles": roles})
+            return await self.update_user(user_id, {"roles": roles}, session=session)
         return True
 
     @staticmethod
@@ -387,6 +404,7 @@ class UserRepository(abstractUserRepository):
         user_id: str,
         ip_address: Optional[str] = None,
         expires_in_minutes: int = 15,
+        session: Optional[AsyncSession] = None,
     ) -> str:
         """Issue and record a high-entropy password reset token, invalidating prior tokens for the user."""
         try:
@@ -400,9 +418,9 @@ class UserRepository(abstractUserRepository):
         expires_at = now + timedelta(minutes=expires_in_minutes)
         token_id = uuid.uuid4()
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             # Invalidate any previously unused reset tokens for this user
-            await session.execute(
+            await sess.execute(
                 update(PasswordResetToken)
                 .where(
                     PasswordResetToken.user_id == uid,
@@ -420,12 +438,13 @@ class UserRepository(abstractUserRepository):
                 used_at=None,
                 ip_address=ip_address or "",
             )
-            session.add(new_token)
-            await session.commit()
+            sess.add(new_token)
+            if should_commit:
+                await sess.commit()
 
         return raw_token
 
-    async def verify_password_reset_token(self, raw_token: str) -> Optional[Dict[str, Any]]:
+    async def verify_password_reset_token(self, raw_token: str, session: Optional[AsyncSession] = None) -> Optional[Dict[str, Any]]:
         """Verify token hash against stored active, unexpired, and unused reset records."""
         clean_token = (raw_token or "").strip()
         if not clean_token:
@@ -434,7 +453,7 @@ class UserRepository(abstractUserRepository):
         token_hash = self._hash_reset_token(clean_token)
         now_utc = datetime.now(timezone.utc)
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, _):
             stmt = (
                 select(PasswordResetToken, self.user_model)
                 .join(self.user_model, PasswordResetToken.user_id == self.user_model.id)
@@ -443,7 +462,7 @@ class UserRepository(abstractUserRepository):
                     PasswordResetToken.used_at.is_(None),
                 )
             )
-            result = await session.execute(stmt)
+            result = await sess.execute(stmt)
             row = result.first()
             if not row:
                 return None
@@ -474,10 +493,10 @@ class UserRepository(abstractUserRepository):
             }
 
     async def consume_password_reset_token(
-        self, raw_token: str, new_hashed_password: str
+        self, raw_token: str, new_hashed_password: str, session: Optional[AsyncSession] = None
     ) -> Optional[str]:
         """Atomically mark token as consumed and update the user's hashed password."""
-        verified = await self.verify_password_reset_token(raw_token)
+        verified = await self.verify_password_reset_token(raw_token, session=session)
         if not verified:
             return None
 
@@ -491,7 +510,7 @@ class UserRepository(abstractUserRepository):
         except (ValueError, AttributeError):
             return None
 
-        async with self.session_factory() as session:
+        async with self._use_session(session) as (sess, should_commit):
             # Atomically consume token
             stmt = (
                 update(PasswordResetToken)
@@ -501,18 +520,20 @@ class UserRepository(abstractUserRepository):
                 )
                 .values(used_at=now)
             )
-            res = await session.execute(stmt)
+            res = await sess.execute(stmt)
             if (res.rowcount or 0) == 0:
-                await session.rollback()
+                if should_commit:
+                    await sess.rollback()
                 return None
 
             # Update password
-            await session.execute(
+            await sess.execute(
                 update(self.user_model)
                 .where(self.user_model.id == uid)
                 .values(hashed_password=new_hashed_password)
             )
-            await session.commit()
+            if should_commit:
+                await sess.commit()
             return str(user_id)
 
 

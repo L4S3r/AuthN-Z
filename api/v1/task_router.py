@@ -8,6 +8,7 @@ and deletion with multi-assignee email notifications and real-time WebSocket bro
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import logging
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from api.dependencies import (
@@ -33,9 +34,11 @@ async def get_tasks(
     status: Optional[str] = None,
     priority: Optional[str] = None,
     assignee_email: Optional[str] = None,
+    limit: Optional[int] = Query(None, ge=1, le=200, description="Max records to return per page"),
+    offset: int = Query(0, ge=0, description="Offset index for pagination"),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Retrieve workspace sprint tasks with strict tenant workspace membership verification."""
+    """Retrieve workspace sprint tasks with strict tenant workspace membership verification and DB pagination."""
     user_id = current_user["user_id"]
     is_superadmin = await perm_eval.has_role(user_id, "superadmin")
 
@@ -54,21 +57,28 @@ async def get_tasks(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied: You are not an active member of this workspace.",
             )
-        tasks = await task_repo.list_tasks(
+        repo_res = await task_repo.list_tasks(
             workspace_id=ws_id,
             status=status,
             priority=priority,
             assignee_email=assignee_email,
+            limit=limit,
+            offset=offset,
         )
+        tasks = repo_res["tasks"]
+        total_count = repo_res["total"]
     else:
-        all_tasks = await task_repo.list_tasks(
-            workspace_id=None,
-            status=status,
-            priority=priority,
-            assignee_email=assignee_email,
-        )
         if is_superadmin:
-            tasks = all_tasks
+            repo_res = await task_repo.list_tasks(
+                workspace_id=None,
+                status=status,
+                priority=priority,
+                assignee_email=assignee_email,
+                limit=limit,
+                offset=offset,
+            )
+            tasks = repo_res["tasks"]
+            total_count = repo_res["total"]
         else:
             user = await user_repo.get_by_id(user_id)
             user_workspaces = await ws_repo.list_workspaces_for_user(
@@ -79,9 +89,36 @@ async def get_tasks(
                 str(w["id"]) for w in user_workspaces
                 if w.get("member_status") == "active" or w.get("role") or w.get("member_role")
             }
-            tasks = [t for t in all_tasks if str(t.get("workspace_id")) in allowed_ws_ids]
+            if not allowed_ws_ids:
+                return {
+                    "status": "SUCCESS",
+                    "count": 0,
+                    "total": 0,
+                    "limit": limit if limit is not None else 0,
+                    "offset": offset,
+                    "tasks": [],
+                }
 
-    return {"status": "SUCCESS", "count": len(tasks), "tasks": tasks}
+            ws_uuids = [uuid.UUID(wid) for wid in sorted(allowed_ws_ids)]
+            repo_res = await task_repo.list_tasks(
+                workspace_ids=ws_uuids,
+                status=status,
+                priority=priority,
+                assignee_email=assignee_email,
+                limit=limit,
+                offset=offset,
+            )
+            tasks = repo_res["tasks"]
+            total_count = repo_res["total"]
+
+    return {
+        "status": "SUCCESS",
+        "count": len(tasks),
+        "total": total_count,
+        "limit": limit if limit is not None else total_count,
+        "offset": offset,
+        "tasks": tasks,
+    }
 
 
 @router.get("/tasks/{task_id}")

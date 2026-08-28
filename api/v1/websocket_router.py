@@ -5,6 +5,7 @@ Manages real-time WebSocket connection lifecycle, workspace broadcast channels,
 user notification subscriptions, and Redis pub/sub message synchronization.
 """
 
+import asyncio
 from datetime import datetime, timezone
 import json
 import logging
@@ -12,9 +13,15 @@ from typing import Any, Dict, Optional, Set
 import urllib.parse
 import uuid
 
+try:
+    import redis.asyncio as aioredis
+except ImportError:
+    aioredis = None
+
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from workspace_models import Notification
 from database import get_session_factory
+from config import settings
 from api.dependencies import (
     sess_store,
     token_svc,
@@ -27,14 +34,18 @@ logger = logging.getLogger("auth_nz.websocket")
 
 router = APIRouter(tags=["Realtime WebSockets"])
 
+# Unique process/node ID generated at startup to prevent pub/sub loopback echoes
+NODE_ID = str(uuid.uuid4())
+
 
 class ConnectionManager:
     """Manages active WebSocket connections grouped by workspace and user channels."""
 
-    def __init__(self, redis_client: Optional[Any] = None):
+    def __init__(self, redis_client: Optional[Any] = None, node_id: Optional[str] = None):
         self.active_workspace_connections: Dict[str, Set[WebSocket]] = {}
         self.active_user_connections: Dict[str, Set[WebSocket]] = {}
         self.redis_client = redis_client
+        self.node_id = node_id or NODE_ID
 
     async def connect(self, websocket: WebSocket, workspace_id: str, user_id: str):
         await websocket.accept()
@@ -58,7 +69,7 @@ class ConnectionManager:
                 self.active_user_connections.pop(user_id, None)
 
     async def broadcast_to_workspace(self, workspace_id: str, message: Dict[str, Any]):
-        """Broadcast a real-time event to all connected workspace participants."""
+        """Broadcast a real-time event to all connected workspace participants on this node and publish to Redis."""
         sockets = list(self.active_workspace_connections.get(workspace_id, set()))
         dead_sockets = []
         for ws in sockets:
@@ -74,12 +85,13 @@ class ConnectionManager:
         if self.redis_client is not None:
             try:
                 channel = f"ws:workspace:{workspace_id}"
-                self.redis_client.publish(channel, json.dumps(message))
+                envelope = {**message, "_origin_node_id": self.node_id}
+                self.redis_client.publish(channel, json.dumps(envelope))
             except Exception as exc:
                 logger.warning("Failed to publish WebSocket message to Redis channel: %s", exc)
 
     async def send_to_user(self, user_id: str, message: Dict[str, Any]):
-        """Send a real-time event directly to a specific user across their connected devices."""
+        """Send a real-time event directly to a specific user across their connected devices on this node and publish to Redis."""
         sockets = list(self.active_user_connections.get(user_id, set()))
         dead_sockets = []
         for ws in sockets:
@@ -95,13 +107,121 @@ class ConnectionManager:
         if self.redis_client is not None:
             try:
                 channel = f"ws:user:{user_id}"
-                self.redis_client.publish(channel, json.dumps(message))
+                envelope = {**message, "_origin_node_id": self.node_id}
+                self.redis_client.publish(channel, json.dumps(envelope))
             except Exception as exc:
                 logger.warning("Failed to publish user notification to Redis channel: %s", exc)
 
 
 # Singleton connection manager
-ws_manager = ConnectionManager(redis_client=getattr(sess_store, "r", None))
+ws_manager = ConnectionManager(redis_client=getattr(sess_store, "r", None), node_id=NODE_ID)
+
+_pubsub_task: Optional[asyncio.Task] = None
+_pubsub_client: Optional[Any] = None
+
+
+async def redis_ws_pubsub_listener(manager: ConnectionManager, redis_url: Optional[str] = None):
+    """Background listener consuming multi-pod WebSocket messages from Redis and forwarding to local sockets."""
+    global _pubsub_client
+    if aioredis is None:
+        logger.info("redis.asyncio not installed; distributed WebSocket sync listener disabled.")
+        return
+
+    target_url = redis_url or settings.get_redis_url()
+
+    while True:
+        try:
+            _pubsub_client = aioredis.from_url(
+                target_url,
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
+            pubsub = _pubsub_client.pubsub()
+            await pubsub.psubscribe("ws:workspace:*", "ws:user:*")
+            logger.info("Distributed WebSocket Redis Pub/Sub listener active (Node ID: %s)", manager.node_id)
+
+            async for msg in pubsub.listen():
+                if not msg or msg.get("type") != "pmessage":
+                    continue
+
+                channel = str(msg.get("channel", ""))
+                raw_data = msg.get("data")
+                if not raw_data or not isinstance(raw_data, str):
+                    continue
+
+                try:
+                    payload = json.loads(raw_data)
+                except Exception:
+                    continue
+
+                # Skip rebroadcasting if this node published the message (loopback suppression)
+                if payload.get("_origin_node_id") == manager.node_id:
+                    continue
+
+                # Strip internal routing metadata before pushing to frontend WebSocket clients
+                clean_payload = {k: v for k, v in payload.items() if k != "_origin_node_id"}
+
+                if channel.startswith("ws:workspace:"):
+                    ws_id = channel.split("ws:workspace:", 1)[1]
+                    sockets = list(manager.active_workspace_connections.get(ws_id, set()))
+                    for ws in sockets:
+                        try:
+                            await ws.send_json(clean_payload)
+                        except Exception:
+                            pass
+                elif channel.startswith("ws:user:"):
+                    uid = channel.split("ws:user:", 1)[1]
+                    sockets = list(manager.active_user_connections.get(uid, set()))
+                    for ws in sockets:
+                        try:
+                            await ws.send_json(clean_payload)
+                        except Exception:
+                            pass
+
+        except asyncio.CancelledError:
+            logger.info("Redis Pub/Sub listener cancelled for graceful shutdown.")
+            break
+        except Exception as exc:
+            logger.warning("Redis Pub/Sub listener connection lost (%s). Retrying in 5s...", exc)
+            await asyncio.sleep(5)
+        finally:
+            if _pubsub_client:
+                try:
+                    await _pubsub_client.aclose()
+                except Exception:
+                    pass
+
+
+def start_redis_pubsub_listener(manager: Optional[ConnectionManager] = None) -> Optional[asyncio.Task]:
+    """Start the background Redis pub/sub listener task inside the running event loop."""
+    global _pubsub_task
+    mgr = manager or ws_manager
+    if _pubsub_task is None or _pubsub_task.done():
+        try:
+            loop = asyncio.get_running_loop()
+            _pubsub_task = loop.create_task(redis_ws_pubsub_listener(mgr))
+            return _pubsub_task
+        except RuntimeError:
+            logger.warning("No running event loop to start Redis Pub/Sub listener.")
+    return _pubsub_task
+
+
+async def stop_redis_pubsub_listener() -> None:
+    """Stop the background Redis pub/sub listener task cleanly."""
+    global _pubsub_task, _pubsub_client
+    if _pubsub_task and not _pubsub_task.done():
+        _pubsub_task.cancel()
+        try:
+            await _pubsub_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _pubsub_task = None
+    if _pubsub_client:
+        try:
+            await _pubsub_client.aclose()
+        except Exception:
+            pass
+        _pubsub_client = None
 
 
 async def create_and_push_notification(
