@@ -119,47 +119,68 @@ async def resolve_or_create_oauth_user(
             except Exception as exc:
                 logger.warning("Failed to sync oauth display name to workspace members: %s", exc)
     else:
-        raw_preferred = profile.get("username")
-        if not raw_preferred and display_name:
-            raw_preferred = display_name.strip().replace(" ", "_")
-        if not raw_preferred:
-            raw_preferred = email.split("@")[0]
+        # Check if host application registered a BYOU OAuth provisioning hook
+        from api.dependencies import oauth_provision_hook
+        hook_handled = False
+        if oauth_provision_hook is not None:
+            import inspect
+            hook_res = oauth_provision_hook(profile, client_ip)
+            if inspect.isawaitable(hook_res):
+                hook_res = await hook_res
+            if hook_res:
+                if isinstance(hook_res, dict) and "id" in hook_res:
+                    user = hook_res
+                    hook_handled = True
+                else:
+                    # Hook handled registration request or returned custom status dict (e.g., PENDING_APPROVAL)
+                    return hook_res
+            else:
+                user = await user_repo.get_by_identifier(email)
+                if user:
+                    hook_handled = True
 
-        base_username = str(raw_preferred).strip().lower()
-        clean_username = "".join(c for c in base_username if c.isalnum() or c in ("_", "-"))
-        if len(clean_username) < 3:
-            clean_username = f"user_{secrets.token_hex(4)}"
+        if not user:
+            raw_preferred = profile.get("username")
+            if not raw_preferred and display_name:
+                raw_preferred = display_name.strip().replace(" ", "_")
+            if not raw_preferred:
+                raw_preferred = email.split("@")[0]
 
-        if await user_repo.get_by_identifier(clean_username):
-            clean_username = f"{clean_username}_{secrets.token_hex(3)}"
+            base_username = str(raw_preferred).strip().lower()
+            clean_username = "".join(c for c in base_username if c.isalnum() or c in ("_", "-"))
+            if len(clean_username) < 3:
+                clean_username = f"user_{secrets.token_hex(4)}"
 
-        dummy_password = secrets.token_urlsafe(32)
-        hashed_pw = hasher.hash(dummy_password)
+            if await user_repo.get_by_identifier(clean_username):
+                clean_username = f"{clean_username}_{secrets.token_hex(3)}"
 
-        user = await user_repo.create_user({
-            "username": clean_username,
-            "email": email,
-            "hashed_password": hashed_pw,
-            "roles": ["viewer"],
-            "metadata": {
-                "name": display_name or clean_username,
-                "department": "General",
-                "clearance": 1,
-                "oauth_providers": {provider: provider_uid},
-                "avatar_url": avatar_url,
-            },
-        })
+            dummy_password = secrets.token_urlsafe(32)
+            hashed_pw = hasher.hash(dummy_password)
 
-        await audit_log.record_security_event(
-            event_name="USER_OAUTH_PROVISIONED",
-            severity="INFO",
-            details={
-                "user_id": user["id"],
+            user = await user_repo.create_user({
+                "username": clean_username,
                 "email": email,
-                "provider": provider,
-                "ip_address": client_ip,
-            },
-        )
+                "hashed_password": hashed_pw,
+                "roles": ["viewer"],
+                "metadata": {
+                    "name": display_name or clean_username,
+                    "department": "General",
+                    "clearance": 1,
+                    "oauth_providers": {provider: provider_uid},
+                    "avatar_url": avatar_url,
+                },
+            })
+
+            await audit_log.record_security_event(
+                event_name="USER_OAUTH_PROVISIONED",
+                severity="INFO",
+                details={
+                    "user_id": user["id"],
+                    "email": email,
+                    "provider": provider,
+                    "ip_address": client_ip,
+                },
+            )
 
     user_meta = user.get("metadata", {})
     if isinstance(user_meta, str):
@@ -390,6 +411,19 @@ async def oauth_callback(
         if request and token:
             set_auth_cookies(redirect_resp, request, token, refresh_token)
         return redirect_resp
+
+    if isinstance(res_dict, dict) and res_dict.get("status") == "PENDING_APPROVAL":
+        target_app = (
+            state_data.get("target_app_url")
+            or os.getenv("WEBAUTHN_ORIGIN")
+            or "https://falqyn.l4s3r.site"
+        )
+        msg = res_dict.get("detail", "Registration request pending Superadmin approval.")
+        import urllib.parse
+        encoded_msg = urllib.parse.quote(msg)
+        redirect_url = f"{target_app.rstrip('/')}/?pending_approval=true&message={encoded_msg}"
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=redirect_url, status_code=302)
 
     return res_dict
 

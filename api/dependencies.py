@@ -53,6 +53,7 @@ mfa_prov = concreteMFAProvider()
 audit_log = AuditLogger()
 device_trust_svc = DeviceTrustService()
 oauth_mgr = OAuthManager(redis_client=getattr(sess_store, "r", None))
+oauth_provision_hook: Optional[Any] = None
 task_repo = TaskRepository()
 email_svc = EmailService(audit_logger=audit_log)
 webauthn_svc = WebAuthnService(redis_client=getattr(sess_store, "r", None))

@@ -173,7 +173,15 @@ def test_submodule_package_exports():
     assert hasattr(auth_nz, "mfa_router")
     assert hasattr(auth_nz, "webauthn_router")
     assert hasattr(auth_nz, "task_router")
-    assert auth_nz.__version__ == "1.0.4"
+    assert auth_nz.__version__ == "1.1.3"
+
+
+def test_byou_oauth_provision_hook_registration():
+    """Verify that configure_authnz accepts and registers host oauth_provision_hook."""
+    dummy_hook = lambda profile, ip: {"status": "PENDING_APPROVAL", "detail": "Test pending"}
+    auth_nz.configure_authnz(oauth_provision_hook=dummy_hook)
+    import api.dependencies as deps
+    assert deps.oauth_provision_hook == dummy_hook
 
 
 def test_default_api_router_backwards_compatibility():

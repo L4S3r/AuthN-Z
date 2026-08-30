@@ -48,6 +48,7 @@ def configure_authnz(
     password_hash_algorithm: Optional[str] = None,
     access_token_expire_minutes: Optional[int] = None,
     refresh_token_expire_days: Optional[int] = None,
+    oauth_provision_hook: Optional[Callable[[Dict[str, Any], str], Any]] = None,
 ) -> None:
     """
     Global configuration helper for Auth N&Z.
@@ -101,6 +102,9 @@ def configure_authnz(
         deps.ws_repo = workspace_repository
         deps.perm_eval.workspace_repo = workspace_repository
 
+    if oauth_provision_hook is not None:
+        deps.oauth_provision_hook = oauth_provision_hook
+
     logger.info("Auth N&Z configured successfully for host application.")
 
 
@@ -119,6 +123,7 @@ class AuthNZ:
         redis_client: Optional[Any] = None,
         password_hash_algorithm: Optional[str] = None,
         user_repository: Optional[abstractUserRepository] = None,
+        oauth_provision_hook: Optional[Callable[[Dict[str, Any], str], Any]] = None,
     ):
         configure_authnz(
             user_model=user_model,
@@ -127,6 +132,7 @@ class AuthNZ:
             redis_client=redis_client,
             password_hash_algorithm=password_hash_algorithm,
             user_repository=user_repository,
+            oauth_provision_hook=oauth_provision_hook,
         )
         self.user_model = user_model
         self.session_factory = session_factory
