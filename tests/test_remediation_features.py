@@ -512,3 +512,54 @@ async def test_oauth_default_redirect_construction(monkeypatch):
         assert custom_redirect in unquoted2
 
 
+@pytest.mark.asyncio
+async def test_oauth_callback_302_redirect_and_cookies(monkeypatch):
+    """Verify oauth_callback returns an HTTP 302 redirect to frontend with access_token and set-cookie headers."""
+    from unittest.mock import AsyncMock, MagicMock
+    from oauth_provider import GoogleOAuth2Provider
+    from api.dependencies import oauth_mgr
+    import api.v1.oauth_router as oauth_router_mod
+
+    google_provider = GoogleOAuth2Provider("dummy_client_id", "dummy_client_secret")
+    google_provider.exchange_code = AsyncMock(return_value={
+        "provider": "google",
+        "provider_user_id": "123456789",
+        "email": "oauth_redirect_test_user@example.com",
+        "email_verified": True,
+        "name": "OAuth Test User",
+    })
+    oauth_mgr.register_provider("google", google_provider)
+
+    mock_resolve = AsyncMock(return_value={
+        "status": "SUCCESS",
+        "user_id": "11111111-2222-3333-4444-555555555555",
+        "access_token": "mock_jwt_access_token",
+        "refresh_token": "mock_jwt_refresh_token",
+        "user": {
+            "id": "11111111-2222-3333-4444-555555555555",
+            "metadata": {"department": "General"},
+        },
+    })
+    monkeypatch.setattr(oauth_router_mod, "resolve_or_create_oauth_user", mock_resolve)
+
+    state = "test_redirect_state"
+    oauth_mgr.save_state(state, {
+        "provider": "google",
+        "code_verifier": "test_verifier",
+        "redirect_uri": "http://falqyn.l4s3r.site/api/v1/auth/oauth/google/callback",
+        "target_app_url": "https://falqyn.l4s3r.site",
+    })
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test", follow_redirects=False) as client:
+        res = await client.get(f"/auth/oauth/google/callback?code=test_code&state={state}")
+        assert res.status_code == 302, f"Expected 302 redirect, got {res.status_code}: {res.text}"
+        assert "location" in res.headers
+        location = res.headers["location"]
+        assert "https://falqyn.l4s3r.site" in location
+        assert "access_token=mock_jwt_access_token" in location
+        assert "is_new_user=true" in location
+        assert "set-cookie" in res.headers or "access_token" in str(res.headers)
+
+
+

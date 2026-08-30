@@ -363,13 +363,35 @@ async def oauth_callback(
             detail=f"OAuth code exchange failed: {str(exc)}",
         )
 
-    return await resolve_or_create_oauth_user(
+    res_dict = await resolve_or_create_oauth_user(
         profile,
         client_ip=client_ip,
         request=request,
         response=response,
         user_agent=user_agent,
     )
+
+    if isinstance(res_dict, dict) and res_dict.get("access_token"):
+        target_app = (
+            state_data.get("target_app_url")
+            or os.getenv("WEBAUTHN_ORIGIN")
+            or "https://falqyn.l4s3r.site"
+        )
+        token = res_dict["access_token"]
+        refresh_token = res_dict.get("refresh_token")
+        is_new_user = (
+            res_dict.get("status") == "SUCCESS"
+            and res_dict.get("user", {}).get("metadata", {}).get("department") == "General"
+        )
+
+        redirect_url = f"{target_app.rstrip('/')}/?access_token={token}&is_new_user={str(is_new_user).lower()}"
+        from fastapi.responses import RedirectResponse
+        redirect_resp = RedirectResponse(url=redirect_url, status_code=302)
+        if request and token:
+            set_auth_cookies(redirect_resp, request, token, refresh_token)
+        return redirect_resp
+
+    return res_dict
 
 
 @router.post("/auth/oauth/{provider}/exchange")

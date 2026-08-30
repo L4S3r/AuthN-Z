@@ -4,7 +4,7 @@ Auth N&Z - Package Module (auth_nz/__init__.py)
 Exports the full public IAM SDK, Adapter Framework, Models, and Routers.
 """
 
-__version__ = "1.0.4"
+__version__ = "1.1.2"
 
 # Models & Mixins
 from models import (
