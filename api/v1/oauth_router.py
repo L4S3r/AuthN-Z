@@ -8,6 +8,7 @@ exchange, account linking, automated JIT user provisioning, and MFA integration.
 from typing import Any, Dict, Optional
 import json
 import logging
+import os
 import secrets
 import uuid
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -287,7 +288,8 @@ async def oauth_login(
             detail=f"OAuth provider '{provider}' is not configured on this server.",
         )
 
-    default_redirect = f"{str(request.base_url).rstrip('/')}/auth/oauth/{provider}/callback"
+    env_redirect = os.getenv(f"{provider.upper()}_REDIRECT_URI")
+    default_redirect = env_redirect or f"{str(request.base_url).rstrip('/')}/api/v1/auth/oauth/{provider}/callback"
     final_redirect = redirect_uri or default_redirect
 
     code_verifier, code_challenge = generate_pkce_pair()
@@ -387,7 +389,8 @@ async def oauth_exchange_code(
 
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "")
-    default_redirect = f"{str(request.base_url).rstrip('/')}/auth/oauth/{provider}/callback"
+    env_redirect = os.getenv(f"{provider.upper()}_REDIRECT_URI")
+    default_redirect = env_redirect or f"{str(request.base_url).rstrip('/')}/api/v1/auth/oauth/{provider}/callback"
     redirect_uri = req.redirect_uri or default_redirect
 
     try:

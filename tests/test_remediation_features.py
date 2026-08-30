@@ -479,3 +479,36 @@ async def test_audit_logger_event_type_wildcard_escaping():
     assert "AUTH\\_FAILED" in compiled_sql or "AUTH\\\\_FAILED" in compiled_sql
     assert "ESCAPE" in compiled_sql
 
+
+@pytest.mark.asyncio
+async def test_oauth_default_redirect_construction(monkeypatch):
+    """Verify default_redirect in oauth_login includes /api/v1 prefix and respects per-provider env var override."""
+    from oauth_provider import GoogleOAuth2Provider
+    from api.dependencies import oauth_mgr
+
+    google_provider = GoogleOAuth2Provider("dummy_client_id", "dummy_client_secret")
+    oauth_mgr.register_provider("google", google_provider)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. Default redirect (no env var override)
+        import urllib.parse
+        monkeypatch.delenv("GOOGLE_REDIRECT_URI", raising=False)
+        res1 = await client.get("/auth/oauth/google/login")
+        assert res1.status_code == 200, res1.text
+        data1 = res1.json()
+        assert data1["status"] == "SUCCESS"
+        unquoted1 = urllib.parse.unquote(data1["authorization_url"])
+        assert "/api/v1/auth/oauth/google/callback" in unquoted1
+
+        # 2. Env var override
+        custom_redirect = "https://custom.app.com/api/v1/auth/oauth/google/callback"
+        monkeypatch.setenv("GOOGLE_REDIRECT_URI", custom_redirect)
+        res2 = await client.get("/auth/oauth/google/login")
+        assert res2.status_code == 200, res2.text
+        data2 = res2.json()
+        assert data2["status"] == "SUCCESS"
+        unquoted2 = urllib.parse.unquote(data2["authorization_url"])
+        assert custom_redirect in unquoted2
+
+

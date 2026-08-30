@@ -342,13 +342,29 @@ python promote_admin.py -i admin@example.com --super --clearance 5
 
 ---
 
+## Mini-Server & VPS Production Optimization
+
+Auth N&Z and TaskTracker are engineered to run seamlessly on bare-metal mini-servers and low-RAM VPS instances (1–2 vCPU, 3–4 GB RAM) natively via **systemd** without Docker overhead:
+
+* **Disk Exhaustion Protection:** Native `logrotate` and `systemd-journald` log capping (`SystemMaxUse=300M`) plus weekly automated audit log trimming.
+* **OOM-Killer Safety Net:** Systemd cgroups v2 resource capping (`MemoryMax=512M`, `MemoryHigh=384M`), 2–4 GB swapfile with `swappiness=10`, and Redis overcommit tuning.
+* **Database Connection Pooling:** Async SQLAlchemy bounded pools (`pool_size=10, max_overflow=5, pool_pre_ping=True`) saving ~100 MB RAM.
+* **Automated Encrypted Backups:** Daily zero-disk `pg_dump` streams to Cloudflare R2 / AWS S3 via native systemd timers.
+* **Reverse Proxy Edge Hardening:** Native Caddy / Nginx recipes for TLS 1.3, Brotli/Gzip compression, and persistent WebSocket streams.
+* **Decoupled Vercel Edge Frontend:** Frontend (`tasks.l4s3r.site`) hosted on Vercel with global Edge CDN caching, leaving 100% of mini-server RAM for FastAPI, PostgreSQL, and Redis (<600MB total idle RAM).
+
+> For server-level infrastructure hardening, see the [Mini-Server & VPS Production Quality-of-Life (QoL) Runbook](FUTURE_DEVELOPMENT.md#8-mini-server--vps-production-quality-of-life-qol-runbook).  
+> For TaskTracker application-level optimizations, see [Phase 6: TaskTracker Production & QoL Hardening](FUTURE_IMPROVEMENTS.md#phase-6-tasktracker-application-production--qol-hardening-tasksl4s3rsite).
+
+---
+
 ## 🧪 Running the Test Suite
 
 Execute the comprehensive offline test suite:
 ```bash
 pytest
 ```
-*Result: 44 passed, 1 skipped (live PostgreSQL integration guard), 100% success.*
+*Result: 62 passed, 1 skipped (live PostgreSQL integration guard), 100% success.*
 
 ---
 

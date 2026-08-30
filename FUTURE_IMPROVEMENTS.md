@@ -284,6 +284,89 @@ dependencies = [
 
 ---
 
+## Phase 6: TaskTracker Application Production & QoL Hardening (`tasks.l4s3r.site`)
+
+### Objective
+Optimize and harden the live reference consumer application (**TaskTracker** hosted at `tasks.l4s3r.site`) for minimal resource utilization, high availability, sub-millisecond query execution, and seamless user experience on a single-node mini-server / VPS.
+
+---
+
+### 6.1 Vercel Edge Hosting & Decoupled Frontend Optimization
+* **Topology:** The frontend application (`tasks.l4s3r.site`) runs on **Vercel**, benefiting from global Edge CDN asset distribution, zero-config SSL, automatic preview deployments, and serverless rendering with 0 MB server RAM overhead on the mini-server.
+* **Edge Caching & Headers:**
+  - Automatic immutable caching for `/_next/static/*` across Vercel’s global Edge Network.
+  - Client queries communicate with the mini-server API (`api.l4s3r.site`) and establish direct browser-to-server WebSocket channels (`wss://api.l4s3r.site/ws/...`).
+* **Subdomain Authentication Bridge:**
+  - Cookies (`access_token`, `refresh_token`, `csrf_token`, `trusted_device`) are issued with `Domain=.l4s3r.site; SameSite=Lax; Secure=true`, allowing Vercel client requests to authenticate seamlessly without manual token header injection in SSR requests.
+
+---
+
+### 6.2 Composite Database Indexing for High-Volume Workspaces
+* **The Problem:** As workspaces accumulate thousands of tasks and notifications, unindexed queries on `(workspace_id, status)` or `(user_id, is_read)` trigger slow sequential table scans.
+* **The Solution:**
+  - Add composite B-Tree indexes via Alembic migration:
+    ```sql
+    -- Fast sprint board filtering and pagination
+    CREATE INDEX IF NOT EXISTS idx_tasks_ws_status_created 
+    ON tasks (workspace_id, status, created_at DESC);
+
+    -- Fast unread notification badge lookups
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_unread 
+    ON notifications (user_id, is_read, created_at DESC);
+
+    -- Fast task assignee searches
+    CREATE INDEX IF NOT EXISTS idx_tasks_assignee 
+    ON tasks USING gin (assignee_emails);
+    ```
+
+---
+
+### 6.3 Resilient WebSocket Auto-Reconnection & Re-Syncing
+* **The Problem:** When client devices sleep, switch Wi-Fi networks, or experience transient network packet loss, WebSockets drop silently, leaving Kanban boards with stale states.
+* **The Solution:**
+  - Implement exponential backoff with jitter and automatic cache revalidation on reconnect in `useWorkspaceSocket`:
+    ```typescript
+    const reconnectDelay = Math.min(1000 * Math.pow(2, retryCount) + Math.random() * 500, 30000);
+    
+    ws.onopen = () => {
+      // Reconnected successfully: Invalidate board query to pull any missed cards
+      queryClient.invalidateQueries({ queryKey: queryKeys.tasks(workspaceId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.notifications });
+    };
+    ```
+
+---
+
+### 6.4 Soft Deletion, Sprint Archival & 30-Day Trash Bin
+* **The Problem:** Hard-deleting tasks causes permanent data loss on accidental clicks, and old completed tasks clutter active sprint queries.
+* **The Solution:**
+  - Add `is_archived: bool` and `deleted_at: datetime | None` to the `Task` model.
+  - Active sprint board queries automatically filter `where(Task.is_archived == False, Task.deleted_at == None)`.
+  - Provide a "Trash / Archived Tasks" view with single-click restore within 30 days before background vacuum pruning.
+
+---
+
+### 6.5 Static Asset Edge Caching & CDN Optimization
+* **The Problem:** Requests for immutable JS/CSS bundles and avatars hit the Node.js server repeatedly, consuming CPU cycles.
+* **The Solution:**
+  - Configure reverse proxy (Caddy / Nginx) with immutable cache headers for `/_next/static/*`:
+    ```nginx
+    location /_next/static/ {
+        proxy_pass http://localhost:3000;
+        proxy_cache_valid 200 365d;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+    ```
+
+---
+
+### 6.6 Task Activity Timeline & Audit Feed
+* **The Problem:** Team members lack visibility into who changed task priorities, moved columns, or reassigned tickets.
+* **The Solution:**
+  - Persist lightweight timeline audit entries (`TaskActivity(task_id, actor_id, action, from_state, to_state, timestamp)`) displayed inside the Task Detail Modal.
+
+---
+
 ## Summary Action Matrix & Implementation Status
 
 | Task / Feature | Phase | Priority | Status | Verified Deliverables |
@@ -302,6 +385,7 @@ dependencies = [
 | **Kubernetes Deep Health Probes (`/health/*`)** | Phase 4 | **P1** | ✅ **COMPLETED** | `api/v1/health_router.py` (live, ready, health) |
 | **Client-Side Query & Server-Side Metadata Caching** | Phase 4 | **P2** | ✅ **COMPLETED** | `UserProfileCache`, `ETag / 304`, `tests/test_phase4_caching.py` |
 | **Interactive Administration CLI (`cli.py`)** | Phase 5 | **P2** | ✅ **COMPLETED** | `cli.py` (`authnz` console script) |
+| **TaskTracker Production Hardening & QoL Blueprint** | Phase 6 | **P2** | 📋 **PLANNED** | Section 6 (`output: standalone`, indexes, WS backoff) |
 
 ---
 *Roadmap fully executed and verified across 62 passing unit and integration tests with 100% test success rate.*
