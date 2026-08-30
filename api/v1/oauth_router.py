@@ -313,6 +313,23 @@ async def oauth_login(
     default_redirect = env_redirect or f"{str(request.base_url).rstrip('/')}/api/v1/auth/oauth/{provider}/callback"
     final_redirect = redirect_uri or default_redirect
 
+    referer = request.headers.get("referer", "").strip()
+    referer_origin = None
+    if referer:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(referer)
+        if parsed.scheme and parsed.netloc:
+            referer_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    computed_target_app = (
+        target_app_url
+        or request.headers.get("origin")
+        or referer_origin
+        or os.getenv("FRONTEND_URL")
+        or os.getenv("WEBAUTHN_ORIGIN")
+        or "https://falqyn.l4s3r.site"
+    )
+
     code_verifier, code_challenge = generate_pkce_pair()
     state = generate_oauth_state()
 
@@ -322,7 +339,7 @@ async def oauth_login(
             "provider": provider,
             "code_verifier": code_verifier,
             "redirect_uri": final_redirect,
-            "target_app_url": target_app_url,
+            "target_app_url": computed_target_app,
         },
         ttl_seconds=600,
     )
@@ -392,12 +409,15 @@ async def oauth_callback(
         user_agent=user_agent,
     )
 
+    computed_fallback = (
+        request.headers.get("origin")
+        or os.getenv("FRONTEND_URL")
+        or os.getenv("WEBAUTHN_ORIGIN")
+        or "https://falqyn.l4s3r.site"
+    )
+
     if isinstance(res_dict, dict) and res_dict.get("access_token"):
-        target_app = (
-            state_data.get("target_app_url")
-            or os.getenv("WEBAUTHN_ORIGIN")
-            or "https://falqyn.l4s3r.site"
-        )
+        target_app = state_data.get("target_app_url") or computed_fallback
         token = res_dict["access_token"]
         refresh_token = res_dict.get("refresh_token")
         is_new_user = (
@@ -413,11 +433,7 @@ async def oauth_callback(
         return redirect_resp
 
     if isinstance(res_dict, dict) and res_dict.get("status") == "PENDING_APPROVAL":
-        target_app = (
-            state_data.get("target_app_url")
-            or os.getenv("WEBAUTHN_ORIGIN")
-            or "https://falqyn.l4s3r.site"
-        )
+        target_app = state_data.get("target_app_url") or computed_fallback
         msg = res_dict.get("detail", "Registration request pending Superadmin approval.")
         import urllib.parse
         encoded_msg = urllib.parse.quote(msg)
