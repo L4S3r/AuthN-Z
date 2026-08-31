@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
+from auth_nz import __version__
 from database import get_engine
 from models import Base
 from exceptions import register_exception_handlers
@@ -167,7 +168,7 @@ app = FastAPI(
         "- Authorization (AuthZ): Hierarchical RBAC and Attribute-Based Access Control (ABAC) Policy Engine.\n"
         "- Telemetry: Structured Security Audit Trail and Query Interface."
     ),
-    version="1.0.0",
+    version=__version__,
     docs_url=docs_url,
     redoc_url=redoc_url,
     openapi_url=openapi_url,
@@ -250,7 +251,7 @@ async def root_health_check() -> Dict[str, str]:
     return {
         "status": "HEALTHY",
         "service": "Auth N&Z Gateway",
-        "version": "1.0.0",
+        "version": __version__,
         "environment": settings.ENVIRONMENT,
         "message": "Authentication and Authorization Gateway is operating normally.",
     }

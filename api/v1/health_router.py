@@ -15,6 +15,7 @@ from fastapi import APIRouter, Response, status
 from sqlalchemy import text
 
 from config import settings
+from auth_nz import __version__
 from database import get_session_factory
 from metrics import metrics_collector
 from api.dependencies import sess_store
@@ -99,7 +100,7 @@ async def comprehensive_health() -> Dict[str, Any]:
     return {
         "status": "HEALTHY",
         "service": "Auth N&Z Gateway",
-        "version": "1.0.0",
+        "version": __version__,
         "environment": settings.ENVIRONMENT,
         "timestamp": time.time(),
         "password_hashing": {

@@ -16,7 +16,7 @@ Core Capabilities:
 """
 
 # Version
-__version__ = "1.1.2"
+from auth_nz import __version__
 
 # Models & Mixins
 from models import (

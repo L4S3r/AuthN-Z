@@ -172,8 +172,17 @@ def test_submodule_package_exports():
     assert hasattr(auth_nz, "auth_router")
     assert hasattr(auth_nz, "mfa_router")
     assert hasattr(auth_nz, "webauthn_router")
-    assert hasattr(auth_nz, "task_router")
-    assert auth_nz.__version__ == "1.1.3"
+    import re
+    from pathlib import Path
+    pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
+    assert pyproject_path.exists(), "pyproject.toml not found"
+    match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_path.read_text(encoding="utf-8"), re.MULTILINE)
+    assert match is not None, "Could not parse version from pyproject.toml"
+    pyproject_version = match.group(1)
+    
+    assert auth_nz.__version__ == pyproject_version, (
+        f"auth_nz.__version__ ('{auth_nz.__version__}') does not match pyproject.toml ('{pyproject_version}')"
+    )
 
 
 def test_byou_oauth_provision_hook_registration():

@@ -144,3 +144,27 @@ def test_example_task_tracker_app_routes():
     assert "/app/tasks/{task_id}" in paths
     assert "/auth/login" in paths
     assert "/workspaces" in paths
+
+
+def test_automated_version_consistency_across_codebase():
+    """Verify that versioning is automatically synchronized from pyproject.toml across all package modules and gateway servers."""
+    import re
+    from pathlib import Path
+    import __init__ as root_module
+    from server import app as gateway_app
+
+    pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
+    assert pyproject_path.exists(), "pyproject.toml not found"
+    match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_path.read_text(encoding="utf-8"), re.MULTILINE)
+    assert match is not None, "Could not parse version from pyproject.toml"
+    pyproject_version = match.group(1)
+
+    # 1. auth_nz package __version__
+    assert auth_nz.__version__ == pyproject_version, f"auth_nz.__version__ ({auth_nz.__version__}) != pyproject.toml ({pyproject_version})"
+    
+    # 2. Root module __version__
+    assert root_module.__version__ == pyproject_version, f"root __version__ ({root_module.__version__}) != pyproject.toml ({pyproject_version})"
+
+    # 3. FastAPI Gateway app version
+    assert gateway_app.version == pyproject_version, f"FastAPI app.version ({gateway_app.version}) != pyproject.toml ({pyproject_version})"
+
