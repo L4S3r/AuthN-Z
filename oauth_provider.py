@@ -242,6 +242,109 @@ class GitHubOAuth2Provider(abstractOAuth2Provider):
 
 
 # =============================================================================
+# Microsoft Entra ID (Azure AD) OAuth2 Provider
+# =============================================================================
+class MicrosoftOAuth2Provider(abstractOAuth2Provider):
+    """Microsoft Entra ID (Azure AD) OAuth2 / OpenID Connect Provider using identity platform v2.0."""
+
+    USERINFO_ENDPOINT = "https://graph.microsoft.com/v1.0/me"
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        tenant_id: Optional[str] = None,
+    ):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.tenant_id = tenant_id or "common"
+
+    @property
+    def auth_endpoint(self) -> str:
+        return f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/authorize"
+
+    @property
+    def token_endpoint(self) -> str:
+        return f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+
+    def get_authorization_url(
+        self,
+        redirect_uri: str,
+        state: str,
+        code_challenge: Optional[str] = None,
+    ) -> str:
+        params = {
+            "client_id": self.client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": "openid profile email User.Read",
+            "state": state,
+            "response_mode": "query",
+        }
+        if code_challenge:
+            params["code_challenge"] = code_challenge
+            params["code_challenge_method"] = "S256"
+
+        return f"{self.auth_endpoint}?{urllib.parse.urlencode(params)}"
+
+    async def exchange_code(
+        self,
+        code: str,
+        redirect_uri: str,
+        code_verifier: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        data = {
+            "code": code,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+            "scope": "openid profile email User.Read",
+        }
+        if code_verifier:
+            data["code_verifier"] = code_verifier
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            token_resp = await client.post(self.token_endpoint, data=data)
+            if token_resp.status_code != 200:
+                logger.error("Microsoft token exchange failed: %s", token_resp.text)
+                raise ValueError(f"Microsoft token exchange failed: {token_resp.text}")
+
+            tokens = token_resp.json()
+            access_token = tokens.get("access_token")
+            if not access_token:
+                raise ValueError(f"Microsoft did not return access_token: {tokens}")
+
+            userinfo_resp = await client.get(
+                self.USERINFO_ENDPOINT,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if userinfo_resp.status_code != 200:
+                logger.error("Microsoft Graph userinfo request failed: %s", userinfo_resp.text)
+                raise ValueError("Failed to fetch Microsoft user profile.")
+
+            info = userinfo_resp.json()
+            email = info.get("mail") or info.get("userPrincipalName")
+            full_name = info.get("displayName")
+
+            preferred_username = (
+                info.get("preferred_username")
+                or (full_name.strip().replace(" ", "_").lower() if full_name else None)
+                or (email.split("@")[0] if email else None)
+            )
+
+            return {
+                "provider": "microsoft",
+                "provider_user_id": info.get("id"),
+                "email": email,
+                "email_verified": True,
+                "name": full_name,
+                "username": preferred_username,
+                "picture": info.get("picture"),
+            }
+
+
+# =============================================================================
 # OAuth Manager & State Coordinator
 # =============================================================================
 class OAuthManager:
@@ -263,6 +366,16 @@ class OAuthManager:
         github_secret = os.getenv("GITHUB_CLIENT_SECRET")
         if github_id and github_secret:
             self.providers["github"] = GitHubOAuth2Provider(github_id, github_secret)
+
+        ms_id = os.getenv("MICROSOFT_CLIENT_ID")
+        ms_secret = os.getenv("MICROSOFT_CLIENT_SECRET")
+        ms_tenant = os.getenv("MICROSOFT_TENANT_ID", "common")
+        if ms_id and ms_secret:
+            self.providers["microsoft"] = MicrosoftOAuth2Provider(
+                client_id=ms_id,
+                client_secret=ms_secret,
+                tenant_id=ms_tenant,
+            )
 
     def register_provider(self, name: str, provider: abstractOAuth2Provider) -> None:
         self.providers[name.lower()] = provider

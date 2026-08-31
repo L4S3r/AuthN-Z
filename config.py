@@ -70,12 +70,20 @@ class AuthNZSettings(BaseSettings):
         ],
         description="Allowed CORS origin URLs",
     )
+    ALLOWED_FRONTEND_ORIGINS: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of allowed frontend origins for OAuth redirects",
+    )
 
     # Social Login / OAuth2 & OIDC Providers
     GOOGLE_CLIENT_ID: Optional[str] = Field(default=None, description="Google OAuth 2.0 Client ID")
     GOOGLE_CLIENT_SECRET: Optional[str] = Field(default=None, description="Google OAuth 2.0 Client Secret")
     GITHUB_CLIENT_ID: Optional[str] = Field(default=None, description="GitHub OAuth App Client ID")
     GITHUB_CLIENT_SECRET: Optional[str] = Field(default=None, description="GitHub OAuth App Client Secret")
+    MICROSOFT_CLIENT_ID: Optional[str] = Field(default=None, description="Microsoft Entra ID OAuth Client ID")
+    MICROSOFT_CLIENT_SECRET: Optional[str] = Field(default=None, description="Microsoft Entra ID OAuth Client Secret")
+    MICROSOFT_TENANT_ID: str = Field(default="common", description="Microsoft Entra ID Tenant ID (default 'common')")
+    MICROSOFT_REDIRECT_URI: Optional[str] = Field(default=None, description="Optional Microsoft OAuth redirect URI override")
 
     # Transactional Email (SMTP)
     SMTP_HOST: Optional[str] = Field(default=None, description="SMTP server hostname")

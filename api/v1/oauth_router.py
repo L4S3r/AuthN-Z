@@ -36,6 +36,66 @@ logger = logging.getLogger("auth_nz.oauth_router")
 router = APIRouter(tags=["OAuth2 / Social Login"])
 
 
+def _normalize_origin(candidate: Optional[str]) -> Optional[str]:
+    """Normalize a candidate URL or origin string to 'scheme://netloc' with no trailing slash."""
+    if not candidate or not isinstance(candidate, str):
+        return None
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+    try:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(candidate)
+        if parsed.scheme and parsed.netloc and parsed.scheme.lower() in ("http", "https"):
+            return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+    except Exception:
+        pass
+    return None
+
+
+def get_allowed_frontend_origins() -> set[str]:
+    """Parse ALLOWED_FRONTEND_ORIGINS environment variable or setting into a set of normalized origins."""
+    from config import settings
+    raw = os.getenv("ALLOWED_FRONTEND_ORIGINS")
+    if raw is None:
+        raw = getattr(settings, "ALLOWED_FRONTEND_ORIGINS", None)
+    if not raw or not isinstance(raw, str):
+        return set()
+
+    origins = set()
+    for item in raw.split(","):
+        norm = _normalize_origin(item)
+        if norm:
+            origins.add(norm)
+    return origins
+
+
+def _resolve_trusted_origin(candidate: Optional[str]) -> Optional[str]:
+    """
+    Validate a client-supplied origin or target URL candidate against ALLOWED_FRONTEND_ORIGINS.
+    Returns candidate (with no trailing slash) if its normalized scheme+netloc exact-matches the allowlist.
+    Returns None if allowlist is unset/empty (logging a warning) or if candidate is not allowlisted.
+    """
+    if not candidate or not isinstance(candidate, str):
+        return None
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+
+    allowed_set = get_allowed_frontend_origins()
+    if not allowed_set:
+        logger.warning(
+            "ALLOWED_FRONTEND_ORIGINS is unset or empty; rejecting client-supplied candidate '%s'.",
+            candidate,
+        )
+        return None
+
+    cand_norm = _normalize_origin(candidate)
+    if cand_norm and cand_norm in allowed_set:
+        return candidate.rstrip("/")
+    return None
+
+
 async def resolve_or_create_oauth_user(
     profile: Dict[str, Any],
     client_ip: str,
@@ -317,14 +377,21 @@ async def oauth_login(
     referer_origin = None
     if referer:
         import urllib.parse
-        parsed = urllib.parse.urlparse(referer)
-        if parsed.scheme and parsed.netloc:
-            referer_origin = f"{parsed.scheme}://{parsed.netloc}"
+        try:
+            parsed = urllib.parse.urlparse(referer)
+            if parsed.scheme and parsed.netloc:
+                referer_origin = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            referer_origin = None
+
+    client_target = (
+        _resolve_trusted_origin(target_app_url)
+        or _resolve_trusted_origin(request.headers.get("origin"))
+        or _resolve_trusted_origin(referer_origin)
+    )
 
     computed_target_app = (
-        target_app_url
-        or request.headers.get("origin")
-        or referer_origin
+        client_target
         or os.getenv("FRONTEND_URL")
         or os.getenv("WEBAUTHN_ORIGIN")
         or "https://falqyn.l4s3r.site"
@@ -410,7 +477,7 @@ async def oauth_callback(
     )
 
     computed_fallback = (
-        request.headers.get("origin")
+        _resolve_trusted_origin(request.headers.get("origin"))
         or os.getenv("FRONTEND_URL")
         or os.getenv("WEBAUTHN_ORIGIN")
         or "https://falqyn.l4s3r.site"

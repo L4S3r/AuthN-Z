@@ -9,11 +9,6 @@ from pathlib import Path
 
 def _resolve_version() -> str:
     try:
-        from importlib.metadata import version as _pkg_version
-        return _pkg_version("l4s3r-authnz")
-    except Exception:
-        pass
-    try:
         pyproject_file = Path(__file__).parent.parent / "pyproject.toml"
         if pyproject_file.exists():
             match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_file.read_text(encoding="utf-8"), re.MULTILINE)
@@ -21,7 +16,12 @@ def _resolve_version() -> str:
                 return match.group(1)
     except Exception:
         pass
-    return "1.1.4"
+    try:
+        from importlib.metadata import version as _pkg_version
+        return _pkg_version("l4s3r-authnz")
+    except Exception:
+        pass
+    return "1.2.0"
 
 __version__ = _resolve_version()
 

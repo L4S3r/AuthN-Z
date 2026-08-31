@@ -562,4 +562,321 @@ async def test_oauth_callback_302_redirect_and_cookies(monkeypatch):
         assert "set-cookie" in res.headers or "access_token" in str(res.headers)
 
 
+@pytest.mark.asyncio
+async def test_allowed_frontend_origins_accepted_end_to_end(monkeypatch):
+    """Verify allowlisted origin is accepted in oauth_login and oauth_callback end-to-end."""
+    from oauth_provider import GoogleOAuth2Provider
+    from api.dependencies import oauth_mgr
+    import api.v1.oauth_router as oauth_router_mod
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("ALLOWED_FRONTEND_ORIGINS", "https://app.example.com,http://localhost:3000")
+
+    google_provider = GoogleOAuth2Provider("dummy_client_id", "dummy_client_secret")
+    google_provider.exchange_code = AsyncMock(return_value={
+        "provider": "google",
+        "provider_user_id": "999888777",
+        "email": "allowlist_user@example.com",
+        "email_verified": True,
+        "name": "Allowlist User",
+    })
+    oauth_mgr.register_provider("google", google_provider)
+
+    mock_resolve = AsyncMock(return_value={
+        "status": "SUCCESS",
+        "user_id": "11111111-2222-3333-4444-555555555555",
+        "access_token": "mock_jwt_allowlist_token",
+        "refresh_token": "mock_jwt_refresh_token",
+        "user": {
+            "id": "11111111-2222-3333-4444-555555555555",
+            "metadata": {"department": "General"},
+        },
+    })
+    monkeypatch.setattr(oauth_router_mod, "resolve_or_create_oauth_user", mock_resolve)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test", follow_redirects=False) as client:
+        # 1. Login with target_app_url = https://app.example.com
+        res = await client.get("/auth/oauth/google/login?target_app_url=https://app.example.com")
+        assert res.status_code == 200
+        data = res.json()
+        state = data["state"]
+
+        state_data = oauth_mgr.consume_state(state)
+        assert state_data is not None
+        assert state_data["target_app_url"] == "https://app.example.com"
+
+        # Save back state for callback test
+        oauth_mgr.save_state(state, state_data)
+
+        # 2. Callback redirect goes to https://app.example.com
+        res_cb = await client.get(f"/auth/oauth/google/callback?code=test_code&state={state}")
+        assert res_cb.status_code == 302
+        assert res_cb.headers["location"].startswith("https://app.example.com/?access_token=")
+
+
+@pytest.mark.asyncio
+async def test_non_allowlisted_origin_rejected_and_falls_back(monkeypatch):
+    """Verify non-allowlisted target_app_url/Origin/Referer are rejected and fall back to server default."""
+    from oauth_provider import GoogleOAuth2Provider
+    from api.dependencies import oauth_mgr
+
+    monkeypatch.setenv("ALLOWED_FRONTEND_ORIGINS", "https://trusted.example.com")
+    monkeypatch.setenv("FRONTEND_URL", "https://falqyn.l4s3r.site")
+
+    google_provider = GoogleOAuth2Provider("dummy_client_id", "dummy_client_secret")
+    oauth_mgr.register_provider("google", google_provider)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Malicious target_app_url
+        res = await client.get(
+            "/auth/oauth/google/login?target_app_url=https://attacker.com",
+            headers={"origin": "https://attacker-origin.com", "referer": "https://attacker-referer.com/exploit"}
+        )
+        assert res.status_code == 200
+        data = res.json()
+        state = data["state"]
+
+        state_data = oauth_mgr.consume_state(state)
+        assert state_data is not None
+        assert "attacker" not in state_data["target_app_url"]
+        assert state_data["target_app_url"] == "https://falqyn.l4s3r.site"
+
+
+@pytest.mark.asyncio
+async def test_unset_allowlist_fails_safe_with_logged_warning(monkeypatch, caplog):
+    """Verify that when ALLOWED_FRONTEND_ORIGINS is unset/empty, client candidates are rejected and a warning is logged."""
+    import logging
+    from oauth_provider import GoogleOAuth2Provider
+    from api.dependencies import oauth_mgr
+
+    monkeypatch.delenv("ALLOWED_FRONTEND_ORIGINS", raising=False)
+    monkeypatch.setenv("FRONTEND_URL", "https://falqyn.l4s3r.site")
+
+    google_provider = GoogleOAuth2Provider("dummy_client_id", "dummy_client_secret")
+    oauth_mgr.register_provider("google", google_provider)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with caplog.at_level(logging.WARNING, logger="auth_nz.oauth_router"):
+            res = await client.get("/auth/oauth/google/login?target_app_url=https://app.example.com")
+            assert res.status_code == 200
+            data = res.json()
+            state = data["state"]
+
+            state_data = oauth_mgr.consume_state(state)
+            assert state_data["target_app_url"] == "https://falqyn.l4s3r.site"
+            assert "ALLOWED_FRONTEND_ORIGINS is unset or empty" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_malformed_referer_does_not_bypass_check(monkeypatch):
+    """Verify malformed Referer headers do not bypass origin allowlist checks."""
+    from oauth_provider import GoogleOAuth2Provider
+    from api.dependencies import oauth_mgr
+
+    monkeypatch.setenv("ALLOWED_FRONTEND_ORIGINS", "https://app.example.com")
+    monkeypatch.setenv("FRONTEND_URL", "https://falqyn.l4s3r.site")
+
+    google_provider = GoogleOAuth2Provider("dummy_client_id", "dummy_client_secret")
+    oauth_mgr.register_provider("google", google_provider)
+
+    malformed_referers = [
+        "not_a_valid_url",
+        "://attacker.com",
+        "javascript:alert(1)",
+        "https://app.example.com@attacker.com",
+        "https://app.example.com.attacker.com",
+    ]
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for bad_ref in malformed_referers:
+            res = await client.get("/auth/oauth/google/login", headers={"referer": bad_ref})
+            assert res.status_code == 200
+            data = res.json()
+            state_data = oauth_mgr.consume_state(data["state"])
+            assert state_data["target_app_url"] == "https://falqyn.l4s3r.site"
+
+
+@pytest.mark.asyncio
+async def test_microsoft_oauth_login_redirect_construction(monkeypatch):
+    """Verify Microsoft Entra ID OAuth login redirect construction and per-provider env override."""
+    from oauth_provider import MicrosoftOAuth2Provider
+    from api.dependencies import oauth_mgr
+
+    ms_provider = MicrosoftOAuth2Provider(
+        client_id="dummy_ms_client_id",
+        client_secret="dummy_ms_secret",
+        tenant_id="custom-tenant-id",
+    )
+    oauth_mgr.register_provider("microsoft", ms_provider)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. Default redirect URI
+        import urllib.parse
+        monkeypatch.delenv("MICROSOFT_REDIRECT_URI", raising=False)
+        res1 = await client.get("/auth/oauth/microsoft/login")
+        assert res1.status_code == 200, res1.text
+        data1 = res1.json()
+        assert data1["status"] == "SUCCESS"
+        assert data1["provider"] == "microsoft"
+        auth_url1 = data1["authorization_url"]
+        assert "login.microsoftonline.com/custom-tenant-id/oauth2/v2.0/authorize" in auth_url1
+        unquoted1 = urllib.parse.unquote(auth_url1)
+        assert "/api/v1/auth/oauth/microsoft/callback" in unquoted1
+        assert "User.Read" in unquoted1
+
+        # 2. Env var override (MICROSOFT_REDIRECT_URI)
+        custom_redirect = "https://custom.app.com/api/v1/auth/oauth/microsoft/callback"
+        monkeypatch.setenv("MICROSOFT_REDIRECT_URI", custom_redirect)
+        res2 = await client.get("/auth/oauth/microsoft/login")
+        assert res2.status_code == 200
+        data2 = res2.json()
+        unquoted2 = urllib.parse.unquote(data2["authorization_url"])
+        assert custom_redirect in unquoted2
+
+
+@pytest.mark.asyncio
+async def test_microsoft_oauth_callback_token_exchange(monkeypatch):
+    """Verify Microsoft OAuth callback exchanges code and returns 302 redirect with tokens."""
+    from unittest.mock import AsyncMock
+    from oauth_provider import MicrosoftOAuth2Provider
+    from api.dependencies import oauth_mgr
+    import api.v1.oauth_router as oauth_router_mod
+
+    monkeypatch.setenv("ALLOWED_FRONTEND_ORIGINS", "https://falqyn.l4s3r.site")
+
+    ms_provider = MicrosoftOAuth2Provider("dummy_ms_client_id", "dummy_ms_secret")
+    ms_provider.exchange_code = AsyncMock(return_value={
+        "provider": "microsoft",
+        "provider_user_id": "ms-user-id-12345",
+        "email": "ms_user@example.com",
+        "email_verified": True,
+        "name": "Microsoft Test User",
+        "username": "ms_user",
+        "picture": None,
+    })
+    oauth_mgr.register_provider("microsoft", ms_provider)
+
+    mock_resolve = AsyncMock(return_value={
+        "status": "SUCCESS",
+        "user_id": "22222222-3333-4444-5555-666666666666",
+        "access_token": "mock_ms_jwt_access_token",
+        "refresh_token": "mock_ms_jwt_refresh_token",
+        "user": {
+            "id": "22222222-3333-4444-5555-666666666666",
+            "metadata": {"department": "General"},
+        },
+    })
+    monkeypatch.setattr(oauth_router_mod, "resolve_or_create_oauth_user", mock_resolve)
+
+    state = "ms_test_state"
+    oauth_mgr.save_state(state, {
+        "provider": "microsoft",
+        "code_verifier": "ms_test_verifier",
+        "redirect_uri": "http://falqyn.l4s3r.site/api/v1/auth/oauth/microsoft/callback",
+        "target_app_url": "https://falqyn.l4s3r.site",
+    })
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test", follow_redirects=False) as client:
+        res = await client.get(f"/auth/oauth/microsoft/callback?code=ms_code&state={state}")
+        assert res.status_code == 302
+        location = res.headers["location"]
+        assert "https://falqyn.l4s3r.site" in location
+        assert "access_token=mock_ms_jwt_access_token" in location
+        assert "is_new_user=true" in location
+
+
+@pytest.mark.asyncio
+async def test_microsoft_oauth_new_user_provisioning_path(monkeypatch):
+    """Verify Microsoft user profile shape maps onto resolve_or_create_oauth_user for JIT provisioning."""
+    from unittest.mock import AsyncMock
+    from api.v1.oauth_router import resolve_or_create_oauth_user, user_repo, audit_log
+    import api.dependencies as deps
+
+    monkeypatch.setattr(deps, "oauth_provision_hook", None)
+    monkeypatch.setattr(audit_log, "record_security_event", AsyncMock())
+    monkeypatch.setattr(audit_log, "record_auth_success", AsyncMock())
+
+    ms_profile = {
+        "provider": "microsoft",
+        "provider_user_id": "ms-graph-id-777",
+        "email": "ms_provision_test@example.com",
+        "email_verified": True,
+        "name": "Jane Doe Microsoft",
+        "username": "janedoe_ms",
+        "picture": None,
+    }
+
+    mock_create = AsyncMock(return_value={
+        "id": "77777777-8888-9999-0000-111122223333",
+        "username": "janedoe_ms",
+        "email": "ms_provision_test@example.com",
+        "roles": ["viewer"],
+        "metadata": {
+            "name": "Jane Doe Microsoft",
+            "department": "General",
+            "oauth_providers": {"microsoft": "ms-graph-id-777"},
+        },
+    })
+
+    monkeypatch.setattr(user_repo, "get_by_identifier", AsyncMock(return_value=None))
+    monkeypatch.setattr(user_repo, "create_user", mock_create)
+
+    result = await resolve_or_create_oauth_user(ms_profile, client_ip="127.0.0.1")
+    assert result["status"] == "SUCCESS"
+    assert result["email"] == ms_profile["email"]
+    assert result["access_token"] is not None
+    assert result["refresh_token"] is not None
+    assert result["user"]["metadata"]["oauth_providers"]["microsoft"] == "ms-graph-id-777"
+
+
+@pytest.mark.asyncio
+async def test_microsoft_oauth_pending_approval_path(monkeypatch):
+    """Verify Microsoft OAuth callback handles PENDING_APPROVAL status from BYOU oauth_provision_hook."""
+    from unittest.mock import AsyncMock
+    from oauth_provider import MicrosoftOAuth2Provider
+    from api.dependencies import oauth_mgr
+    import api.v1.oauth_router as oauth_router_mod
+
+    monkeypatch.setenv("ALLOWED_FRONTEND_ORIGINS", "https://falqyn.l4s3r.site")
+
+    ms_provider = MicrosoftOAuth2Provider("dummy_ms_client_id", "dummy_ms_secret")
+    ms_provider.exchange_code = AsyncMock(return_value={
+        "provider": "microsoft",
+        "provider_user_id": "ms-user-id-pending",
+        "email": "ms_pending@example.com",
+        "email_verified": True,
+        "name": "Pending User",
+    })
+    oauth_mgr.register_provider("microsoft", ms_provider)
+
+    mock_resolve = AsyncMock(return_value={
+        "status": "PENDING_APPROVAL",
+        "detail": "Account awaiting admin approval.",
+    })
+    monkeypatch.setattr(oauth_router_mod, "resolve_or_create_oauth_user", mock_resolve)
+
+    state = "ms_pending_state"
+    oauth_mgr.save_state(state, {
+        "provider": "microsoft",
+        "code_verifier": "ms_verifier",
+        "redirect_uri": "http://falqyn.l4s3r.site/api/v1/auth/oauth/microsoft/callback",
+        "target_app_url": "https://falqyn.l4s3r.site",
+    })
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test", follow_redirects=False) as client:
+        res = await client.get(f"/auth/oauth/microsoft/callback?code=ms_code&state={state}")
+        assert res.status_code == 302
+        location = res.headers["location"]
+        assert "pending_approval=true" in location
+        assert "Account%20awaiting%20admin%20approval." in location
+
+
+
 
